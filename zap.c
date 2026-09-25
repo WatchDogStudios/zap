@@ -2,7 +2,7 @@
  *   zap c [-e] [-l depth] [-b block_kb] [-t threads] [-D dict] in out   pack (depth 0 = fast, default 64; -e entropy mode)
  *   zap d [-t threads] [-D dict] in out                            unpack
  *   zap train [-s dict_bytes] out samples...                       train a packet dictionary (default 16384)
- *   zap tex [-f bc1|bc3|bc4|bc5|bc7] [-r rdo] w h in.rgba out.dds  GPU block-compress raw RGBA8 to DDS
+ *   zap tex [-f bc1|bc3|bc4|bc5|bc7] [-r rdo] [-m] [-S] w h in.rgba out.dds  GPU block-compress raw RGBA8 to DDS (-m mips, -S sRGB)
  *   zap venc [-q quality] [-k keyint] [-F fps] w h in.yuv out.zv   encode raw I420 video
  *   zap vdec in.zv out.yuv                                         decode to raw I420
  */
@@ -47,7 +47,7 @@ static int usage(void) {
     fprintf(stderr, "zap c [-e] [-l depth] [-b block_kb] [-t threads] [-D dict] in out\n"
                     "zap d [-t threads] [-D dict] in out\n"
                     "zap train [-s bytes] out samples...\n"
-                    "zap tex [-f bc1|bc3|bc4|bc5|bc7] [-r rdo] w h in.rgba out.dds\n"
+                    "zap tex [-f bc1|bc3|bc4|bc5|bc7] [-r rdo] [-m] [-S] w h in.rgba out.dds\n"
                     "zap venc [-q quality] [-k keyint] [-F fps] w h in.yuv out.zv\n"
                     "zap vdec in.zv out.yuv\n");
     return 1;
@@ -100,23 +100,38 @@ static int vdec(const char *in, const char *outp) {
     return 0;
 }
 
-static int tex(int w, int h, const char *fmt, float rdo, const char *in, const char *outp) {
+/* mips: full chain (linear-light filtering when srgb). srgb also picks the *_SRGB DXGI format (BC1/BC3/BC7). */
+static int tex(int w, int h, const char *fmt, float rdo, int mips, int srgb, const char *in, const char *outp) {
     static const char *NAMES[] = { "bc1", "bc3", "bc4", "bc5", "bc7" }, *CC[] = { "DXT1", "DXT5", "BC4U", "BC5U", "DX10" };
+    static const uint32_t DXGI[5] = { 71, 77, 80, 83, 98 }; /* BC1..BC7 UNORM; +1 = _SRGB for BC1, BC3, BC7 */
     int f = 0;
     while (f < 5 && strcmp(fmt, NAMES[f])) f++;
     if (f == 5 || w < 1 || h < 1) return usage();
-    size_t n, bn = zap_bc_size(w, h, (zap_bc_format)f), hn = f == ZAP_BC7 ? 148 : 128;
+    if (f == ZAP_BC4 || f == ZAP_BC5) srgb = 0; /* channel data, never sRGB */
+    int levels = mips ? zap_mip_levels(w, h) : 1, dx10 = f == ZAP_BC7 || srgb;
+    size_t n, hn = dx10 ? 148 : 128, total = 0;
+    for (int l = 0, lw = w, lh = h; l < levels; l++, lw = lw > 1 ? lw / 2 : 1, lh = lh > 1 ? lh / 2 : 1) total += zap_bc_size(lw, lh, (zap_bc_format)f);
     uint8_t *img = load(in, &n), hdr[148] = { 'D', 'D', 'S', ' ' };
     if (n < (size_t)w * h * 4) { fprintf(stderr, "%s: expected %dx%d RGBA8\n", in, w, h); return 1; }
-    uint8_t *bc = malloc(bn);
-    zap_bc_encode(img, w, h, (size_t)w * 4, (zap_bc_format)f, rdo, bc);
-    zap__w32(hdr + 4, 124); zap__w32(hdr + 8, 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000);
-    zap__w32(hdr + 12, (uint32_t)h); zap__w32(hdr + 16, (uint32_t)w); zap__w32(hdr + 20, (uint32_t)bn);
-    zap__w32(hdr + 76, 32); zap__w32(hdr + 80, 0x4); memcpy(hdr + 84, CC[f], 4); zap__w32(hdr + 108, 0x1000);
-    zap__w32(hdr + 128, 98); zap__w32(hdr + 132, 3); zap__w32(hdr + 140, 1); /* DX10 header: BC7_UNORM, 2D, 1 element */
+    uint8_t *bc = malloc(total), *next = malloc((size_t)(w > 1 ? w / 2 : 1) * (size_t)(h > 1 ? h / 2 : 1) * 4 + 4), *p = bc;
+    for (int l = 0, lw = w, lh = h; l < levels; l++) {
+        zap_bc_encode(img, lw, lh, (size_t)lw * 4, (zap_bc_format)f, rdo, p);
+        p += zap_bc_size(lw, lh, (zap_bc_format)f);
+        if (l + 1 < levels) {
+            zap_mip_next(img, lw, lh, (size_t)lw * 4, srgb, next, (size_t)(lw > 1 ? lw / 2 : 1) * 4);
+            lw = lw > 1 ? lw / 2 : 1; lh = lh > 1 ? lh / 2 : 1;
+            memcpy(img, next, (size_t)lw * lh * 4);
+        }
+    }
+    zap__w32(hdr + 4, 124); zap__w32(hdr + 8, 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000 | (mips ? 0x20000 : 0));
+    zap__w32(hdr + 12, (uint32_t)h); zap__w32(hdr + 16, (uint32_t)w); zap__w32(hdr + 20, (uint32_t)zap_bc_size(w, h, (zap_bc_format)f));
+    zap__w32(hdr + 28, (uint32_t)levels);
+    zap__w32(hdr + 76, 32); zap__w32(hdr + 80, 0x4); memcpy(hdr + 84, dx10 ? "DX10" : CC[f], 4);
+    zap__w32(hdr + 108, 0x1000 | (mips ? 0x400008 : 0)); /* TEXTURE (+ COMPLEX | MIPMAP) */
+    zap__w32(hdr + 128, DXGI[f] + (uint32_t)(srgb != 0)); zap__w32(hdr + 132, 3); zap__w32(hdr + 140, 1); /* DX10: format, 2D, 1 element */
     FILE *fo = create(outp);
-    if (fwrite(hdr, 1, hn, fo) != hn || fwrite(bc, 1, bn, fo) != bn || fclose(fo)) { perror(outp); return 1; }
-    printf("%dx%d %s -> %zu bytes\n", w, h, NAMES[f], bn + hn);
+    if (fwrite(hdr, 1, hn, fo) != hn || fwrite(bc, 1, total, fo) != total || fclose(fo)) { perror(outp); return 1; }
+    printf("%dx%d %s%s, %d level%s -> %zu bytes\n", w, h, NAMES[f], srgb ? " sRGB" : "", levels, levels > 1 ? "s" : "", total + hn);
     return 0;
 }
 
@@ -126,9 +141,12 @@ int main(int argc, char **argv) {
     int depth = 64, threads = 8, quality = 70, keyint = 60, fps = 30, i = 2;
     size_t bs = 4 << 20, dsize = 16384;
     float rdo = 0;
-    int entropy = 0;
+    int entropy = 0, mips = 0, srgb = 0;
     for (; i + 1 < argc && argv[i][0] == '-'; i += 2) {
-        if (argv[i][1] == 'e') { entropy = 1; i--; continue; } /* flag without a value */
+        if (argv[i][1] == 'e' || argv[i][1] == 'm' || argv[i][1] == 'S') { /* flags without a value */
+            if (argv[i][1] == 'e') entropy = 1; else if (argv[i][1] == 'm') mips = 1; else srgb = 1;
+            i--; continue;
+        }
         switch (argv[i][1]) {
         case 'l': depth = atoi(argv[i + 1]); break;
         case 'b': bs = (size_t)atoi(argv[i + 1]) << 10; break;
@@ -143,7 +161,7 @@ int main(int argc, char **argv) {
         default: return usage();
         }
     }
-    if (!strcmp(mode, "tex")) return i + 4 == argc ? tex(atoi(argv[i]), atoi(argv[i + 1]), fmt, rdo, argv[i + 2], argv[i + 3]) : usage();
+    if (!strcmp(mode, "tex")) return i + 4 == argc ? tex(atoi(argv[i]), atoi(argv[i + 1]), fmt, rdo, mips, srgb, argv[i + 2], argv[i + 3]) : usage();
     if (!strcmp(mode, "venc"))
         return i + 4 == argc ? venc(atoi(argv[i]), atoi(argv[i + 1]), quality, keyint, fps, depth > 16 ? 16 : depth, argv[i + 2], argv[i + 3]) : usage();
     if (!strcmp(mode, "vdec")) return i + 2 == argc ? vdec(argv[i], argv[i + 1]) : usage();

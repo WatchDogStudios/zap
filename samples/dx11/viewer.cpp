@@ -4,7 +4,7 @@
 //                                   BC3, BC7, each with RDO) with quality / size / speed stats. Video tab: any file
 //                                   Media Foundation can decode (MP4, MOV, MKV, ...) is transcoded live through zap;
 //                                   split view source vs zap with bitrate, PSNR and decode-time stats.
-//   zap_viewer --verify             GPU conformance: decode every BC format on the GPU and diff against zap's decoder
+//   zap_viewer --verify             GPU conformance: decode every BC format (BC1-BC7, BC6H) on the GPU and diff against zap
 //   zap_viewer --shot out [image] [--video file]   render out_texture(_zoom|_diff).png and out_video.png, then exit
 //
 // Mouse: wheel zoom, right-drag pan, left-drag moves the split line. Drag & drop files onto the window.
@@ -244,6 +244,42 @@ static int verify() {
         char what[64];
         snprintf(what, sizeof what, m == 8 ? "BC7 decoder, reserved mode" : "BC7 decoder, random mode %d", m);
         fails += compare(what, 0, 15);
+    }
+    { // BC6H (unsigned half floats): zap's mode-11 encoder output, then random mode-11 blocks; exact match expected
+        D3D11_TEXTURE2D_DESC hd = {};
+        hd.Width = W; hd.Height = H; hd.MipLevels = 1; hd.ArraySize = 1; hd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; hd.SampleDesc.Count = 1;
+        hd.BindFlags = D3D11_BIND_RENDER_TARGET;
+        ComPtr<ID3D11Texture2D> hrt, hst;
+        ComPtr<ID3D11RenderTargetView> hrtv;
+        CHECK(g.dev->CreateTexture2D(&hd, nullptr, &hrt));
+        CHECK(g.dev->CreateRenderTargetView(hrt.Get(), nullptr, &hrtv));
+        hd.BindFlags = 0; hd.Usage = D3D11_USAGE_STAGING; hd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        CHECK(g.dev->CreateTexture2D(&hd, nullptr, &hst));
+        std::vector<float> hdr(W * H * 4);
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            float *p = &hdr[(y * W + x) * 4];
+            p[0] = 0.02f * (float)(1 << (x / 20)); p[1] = (float)((x * y) % 97) * 0.37f; p[2] = ((x / 13 + y / 17) & 1) ? 4000.0f * y / H : 0.001f * x; p[3] = 1;
+        }
+        std::vector<uint16_t> zh(W * H * 4), gh(W * H * 4);
+        std::vector<uint8_t> b6(zap_bc_size(W, H, ZAP_BC7));
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass == 0) zap_bc6h_encode(hdr.data(), W, H, W * 4, b6.data());
+            else { for (auto &x : b6) x = (uint8_t)rand(); for (size_t b = 0; b < b6.size(); b += 16) b6[b] = (uint8_t)((b6[b] & 0xE0) | 3); }
+            zap_bc6h_decode(b6.data(), W, H, zh.data(), W * 4);
+            auto tex6 = make_tex(g.dev.Get(), DXGI_FORMAT_BC6H_UF16, W, H, b6.data(), bc_pitch(W, ZAP_BC7));
+            ID3D11ShaderResourceView *srv = tex6.Get();
+            float cb[12] = { 1, 1, 0, 0 };
+            draw(g, g.ps_load.Get(), &srv, 1, cb, W, H, hrtv.Get(), g.point.Get());
+            g.ctx->CopyResource(hst.Get(), hrt.Get());
+            D3D11_MAPPED_SUBRESOURCE m;
+            CHECK(g.ctx->Map(hst.Get(), 0, D3D11_MAP_READ, 0, &m));
+            for (int y = 0; y < H; y++) memcpy(&gh[y * W * 4], (uint8_t *)m.pData + y * m.RowPitch, W * 8);
+            g.ctx->Unmap(hst.Get(), 0);
+            int maxd = 0; size_t bad = 0;
+            for (int i = 0; i < W * H * 4; i++) { int d = abs((int)gh[i] - (int)zh[i]); if (d > maxd) maxd = d; bad += d != 0; }
+            printf("  %-26s max |gpu - zap| = %3d half ulp  %s\n", pass ? "BC6H decoder, random mode 11" : "BC6H encoder (mode 11)", maxd, bad ? "FAIL" : "ok");
+            fails += bad ? 1 : 0;
+        }
     }
     printf(fails ? "FAILED (%d)\n" : "all formats match the GPU\n", fails);
     return fails ? 1 : 0;

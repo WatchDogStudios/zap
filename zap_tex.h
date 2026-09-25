@@ -12,8 +12,12 @@
  * Pipeline for shipping:  encode(rdo) -> split -> zap_compress_hc  ...  zap_decompress -> merge -> upload
  *
  * Formats: BC1 = RGB (alpha ignored), BC3 = RGBA, BC4 = R, BC5 = RG (normal maps), BC7 = RGBA high quality.
- * BC7: the decoder handles all 8 modes; the encoder uses mode 6 (smooth / alpha) and mode 1 (2 partitions,
- * opaque edges). BC7 RDO reuses whole blocks, or the endpoint / index bytes of recent mode-6 blocks.
+ * BC7: the decoder handles all 8 modes; the encoder uses mode 6 (smooth / alpha), mode 5 (independent alpha,
+ * channel rotation) and mode 1 (2 partitions, opaque edges). BC7 RDO reuses whole blocks, or the endpoint /
+ * index bytes of recent mode-6 blocks.
+ *
+ *   zap_bc6h_encode(rgba_float, w, h, stride, out) / zap_bc6h_decode   HDR (BC6H unsigned, mode 11)
+ *   zap_mip_levels(w, h), zap_mip_next(src, w, h, stride, srgb, dst, dst_stride), zap_mip_next_f(...)   mipmaps
  * Decoded BC4 is (r,0,0,255) and BC5 is (r,g,0,255), like GPU sampling.
  * Any width/height; partial edge blocks replicate the edge pixels.
  */
@@ -587,6 +591,97 @@ static inline int zap__bc7_m6(const uint8_t px[16][4], uint8_t out[16]) {
     return err;
 }
 
+/* mode 5: one subset, channel rotation, RGB 7 bits + A 8 bits (no p-bits), separate 2-bit color and alpha
+   indices. Best for blocks whose alpha (or one color channel, via rotation) varies independently. */
+static inline int zap__bc7_fit2(const uint8_t r[16][4], int c0, int nc, const int *e0, const int *e1, int idx[16]) {
+    int pal[4][4], err = 0;
+    for (int j = 0; j < 4; j++) for (int c = 0; c < nc; c++) pal[j][c] = ((64 - ZAP__BC7W2[j]) * e0[c] + ZAP__BC7W2[j] * e1[c] + 32) >> 6;
+    for (int i = 0; i < 16; i++) {
+        int bi = 0, be = 1 << 30;
+        for (int j = 0; j < 4; j++) {
+            int d = 0;
+            for (int c = 0; c < nc; c++) { int x = r[i][c0 + c] - pal[j][c]; d += x * x; }
+            if (d < be) { be = d; bi = j; }
+        }
+        idx[i] = bi; err += be;
+    }
+    return err;
+}
+
+/* quantize endpoint channels to n bits (no p-bit): q = stored value, e = expanded 8-bit value */
+static inline void zap__bc7_qn(const float *v, int nc, int n, int *q, int *e) {
+    int mx = (1 << n) - 1;
+    for (int c = 0; c < nc; c++) {
+        int g = (int)(v[c] * (float)mx / 255.0f + 0.5f), bq = 0, bd = 1 << 30;
+        for (int t = g - 1; t <= g + 1; t++) {
+            int tq = t < 0 ? 0 : t > mx ? mx : t, x = zap__bc7x(tq, n);
+            int d = (int)((float)x - v[c] < 0 ? v[c] - (float)x : (float)x - v[c]);
+            if (d < bd) { bd = d; bq = tq; }
+        }
+        q[c] = bq; e[c] = zap__bc7x(bq, n);
+    }
+}
+
+/* least-squares endpoints for fixed 2-bit indices on channels [c0, c0 + nc) */
+static inline int zap__bc7_ls2(const uint8_t r[16][4], int c0, int nc, const int idx[16], float lo[4], float hi[4]) {
+    float aa = 0, ab = 0, bb = 0, ax[4] = { 0, 0, 0, 0 }, bx[4] = { 0, 0, 0, 0 };
+    for (int i = 0; i < 16; i++) {
+        float w = ZAP__BC7W2[idx[i]] / 64.0f, v = 1 - w;
+        aa += v * v; ab += v * w; bb += w * w;
+        for (int c = 0; c < nc; c++) { ax[c] += v * r[i][c0 + c]; bx[c] += w * r[i][c0 + c]; }
+    }
+    float det = aa * bb - ab * ab;
+    if (det < 1e-6f && det > -1e-6f) return 0;
+    for (int c = 0; c < nc; c++) {
+        lo[c] = (ax[c] * bb - bx[c] * ab) / det; hi[c] = (bx[c] * aa - ax[c] * ab) / det;
+        lo[c] = lo[c] < 0 ? 0 : lo[c] > 255 ? 255 : lo[c]; hi[c] = hi[c] < 0 ? 0 : hi[c] > 255 ? 255 : hi[c];
+    }
+    return 1;
+}
+
+/* fit one part (color: 3 channels at 7 bits, or alpha: 1 channel at 8 bits) from a start, then refine */
+static inline int zap__bc7_part5(const uint8_t r[16][4], int c0, int nc, int n, float lo[4], float hi[4], int q[2][3], int idx[16]) {
+    int e0[3], e1[3], ti[16], tq[2][3], te0[3], te1[3];
+    zap__bc7_qn(lo, nc, n, q[0], e0); zap__bc7_qn(hi, nc, n, q[1], e1);
+    int err = zap__bc7_fit2(r, c0, nc, e0, e1, idx);
+    for (int it = 0; it < 2 && err > 0; it++) {
+        float nlo[4], nhi[4];
+        if (!zap__bc7_ls2(r, c0, nc, idx, nlo, nhi)) break;
+        zap__bc7_qn(nlo, nc, n, tq[0], te0); zap__bc7_qn(nhi, nc, n, tq[1], te1);
+        int e = zap__bc7_fit2(r, c0, nc, te0, te1, ti);
+        if (e >= err) break;
+        err = e; memcpy(q, tq, sizeof tq); memcpy(idx, ti, sizeof ti);
+    }
+    return err;
+}
+
+static inline int zap__bc7_m5(const uint8_t px[16][4], uint8_t out[16]) {
+    int best = 1 << 30, brot = 0, bcq[2][3] = { { 0 } }, baq[2][3] = { { 0 } }, bci[16] = { 0 }, bai[16] = { 0 };
+    for (int rot = 0; rot < 4; rot++) {
+        uint8_t r[16][4];
+        int sel[16], cq[2][3], aq[2][3], ci[16], ai[16];
+        memcpy(r, px, sizeof r);
+        for (int i = 0; i < 16; i++) { sel[i] = i; if (rot) { uint8_t t = r[i][3]; r[i][3] = r[i][rot - 1]; r[i][rot - 1] = t; } }
+        float lo[4], hi[4], alo[4] = { 255 }, ahi[4] = { 0 };
+        zap__bc7_pca((const uint8_t(*)[4])r, sel, 16, 3, lo, hi);
+        int err = zap__bc7_part5((const uint8_t(*)[4])r, 0, 3, 7, lo, hi, cq, ci);
+        for (int i = 0; i < 16; i++) { if (r[i][3] < alo[0]) alo[0] = r[i][3]; if (r[i][3] > ahi[0]) ahi[0] = r[i][3]; }
+        err += zap__bc7_part5((const uint8_t(*)[4])r, 3, 1, 8, alo, ahi, aq, ai);
+        if (err < best) { best = err; brot = rot; memcpy(bcq, cq, sizeof cq); memcpy(baq, aq, sizeof aq); memcpy(bci, ci, sizeof ci); memcpy(bai, ai, sizeof ai); }
+    }
+    if (bci[0] & 2) { for (int c = 0; c < 3; c++) { int t = bcq[0][c]; bcq[0][c] = bcq[1][c]; bcq[1][c] = t; } for (int i = 0; i < 16; i++) bci[i] = 3 - bci[i]; }
+    if (bai[0] & 2) { int t = baq[0][0]; baq[0][0] = baq[1][0]; baq[1][0] = t; for (int i = 0; i < 16; i++) bai[i] = 3 - bai[i]; }
+    int pos = 0;
+    memset(out, 0, 16);
+    zap__putbits(out, &pos, 1 << 5, 6);
+    zap__putbits(out, &pos, (unsigned)brot, 2);
+    for (int c = 0; c < 3; c++) for (int e = 0; e < 2; e++) zap__putbits(out, &pos, (unsigned)bcq[e][c], 7);
+    for (int e = 0; e < 2; e++) zap__putbits(out, &pos, (unsigned)baq[e][0], 8);
+    for (int i = 0; i < 16; i++) zap__putbits(out, &pos, (unsigned)bci[i], i ? 2 : 1);
+    for (int i = 0; i < 16; i++) zap__putbits(out, &pos, (unsigned)bai[i], i ? 2 : 1);
+    return best;
+}
+
 /* mode 1: two subsets, RGB 6 bits + shared p-bit per subset, 3-bit indices. Opaque blocks only. */
 static inline int zap__bc7_m1(const uint8_t px[16][4], int part, uint8_t out[16]) {
     int sel[2][16], cnt[2] = { 0, 0 }, q[2][2][4], pb[2][2], idx[2][16], err = 0, full[16];
@@ -619,11 +714,16 @@ static inline int zap__bc7_err(const uint8_t px[16][4], const uint8_t *blk) {
     return err;
 }
 
-/* best of mode 6 and (for opaque blocks) mode 1 over all 64 partitions */
+/* best of mode 6, mode 5 and (for opaque blocks) mode 1 over all 64 partitions */
 static inline int zap__bc7_encode(const uint8_t px[16][4], uint8_t out[16]) {
     int err = zap__bc7_m6(px, out), opaque = 1;
     for (int i = 0; i < 16; i++) opaque &= px[i][3] == 255;
-    if (!opaque || err <= 16 * 4) return err; /* smooth block: mode 6 is already near-exact */
+    if (err <= 16 * 4) return err; /* smooth block: mode 6 is already near-exact */
+    uint8_t m5[16];
+    zap__bc7_m5(px, m5);
+    int e5 = zap__bc7_err(px, m5); /* actual decoded error */
+    if (e5 < err) { memcpy(out, m5, 16); err = e5; }
+    if (!opaque) return err;
     int bp = -1, be = err;
     for (int part = 0; part < 64; part++) { int e = zap__bc7_m1(px, part, NULL); if (e < be) { be = e; bp = part; } }
     if (bp >= 0) {
@@ -664,6 +764,279 @@ static inline void zap__bc7_rdo(const uint8_t px[16][4], float lambda, uint8_t *
         rs->dist[0] = bd[0]; rs->dist[1] = bd[1];
     }
     memcpy(base + cur * 16, best, 16);
+}
+
+/* ---------------- BC6H: HDR, unsigned half floats. Mode 11 only: one region, 10-bit endpoints (no delta
+ * transform), 4-bit indices. The decoder reads mode 11 (what the encoder writes); other modes decode to 0. */
+
+static inline uint16_t zap__f2h(float f) { /* float -> unsigned half bits, clamped to [0, 65504] */
+    uint32_t x;
+    if (!(f > 0)) return 0; /* negatives and NaN */
+    memcpy(&x, &f, 4);
+    if (x >= 0x477FE000u) return 0x7BFF;
+    if (x < 0x38800000u) return (uint16_t)(f * 16777216.0f + 0.5f); /* half subnormal: f * 2^24 */
+    return (uint16_t)(((x - 0x38000000u) + 0x1000u) >> 13);        /* rebias, round mantissa to 10 bits */
+}
+static inline float zap__h2f(uint16_t h) {
+    uint32_t e = (h >> 10) & 31, m = h & 1023u, x;
+    float f;
+    if (e == 0) return (float)m * (1.0f / 16777216.0f);
+    x = ((e + 112u) << 23) | (m << 13);
+    memcpy(&f, &x, 4);
+    return f;
+}
+
+static inline int zap__bc6_unq(int e) { return e == 0 ? 0 : e == 1023 ? 0xFFFF : ((e << 16) + 0x8000) >> 10; }
+static inline int zap__bc6_fin(int u) { return (u * 31) >> 6; }
+
+/* nearest 10-bit endpoint for a pre-finish value u */
+static inline int zap__bc6_q(float u) {
+    int g = (int)((u - 32.0f) / 64.0f + 0.5f), best = 0;
+    float bd = 1e30f;
+    for (int t = g - 1; t <= g + 1; t++) {
+        int e = t < 0 ? 0 : t > 1023 ? 1023 : t;
+        float d = (float)zap__bc6_unq(e) - u;
+        d = d < 0 ? -d : d;
+        if (d < bd) { bd = d; best = e; }
+    }
+    return best;
+}
+
+/* squared error in half-bit (roughly log) space for endpoints e[2][3]; writes best 4-bit indices */
+static inline double zap__bc6_fit(const uint16_t t[16][3], const int e[2][3], int idx[16]) {
+    int pal[16][3];
+    double err = 0;
+    for (int j = 0; j < 16; j++)
+        for (int c = 0; c < 3; c++)
+            pal[j][c] = zap__bc6_fin(((64 - ZAP__BC7W4[j]) * zap__bc6_unq(e[0][c]) + ZAP__BC7W4[j] * zap__bc6_unq(e[1][c]) + 32) >> 6);
+    for (int i = 0; i < 16; i++) {
+        double be = 1e300;
+        int bi = 0;
+        for (int j = 0; j < 16; j++) {
+            double d = 0;
+            for (int c = 0; c < 3; c++) { double x = (double)t[i][c] - pal[j][c]; d += x * x; }
+            if (d < be) { be = d; bi = j; }
+        }
+        idx[i] = bi; err += be;
+    }
+    return err;
+}
+
+static inline double zap__bc6_block(const uint16_t t[16][3], uint8_t out[16]) {
+    float U[16][3], mean[3] = { 0, 0, 0 }, cov[6] = { 0, 0, 0, 0, 0, 0 }, ax[3] = { 1, 1, 1 };
+    for (int i = 0; i < 16; i++) for (int c = 0; c < 3; c++) { U[i][c] = t[i][c] * 64.0f / 31.0f; mean[c] += U[i][c] / 16.0f; }
+    for (int i = 0; i < 16; i++) {
+        float r = U[i][0] - mean[0], g = U[i][1] - mean[1], b = U[i][2] - mean[2];
+        cov[0] += r * r; cov[1] += r * g; cov[2] += r * b; cov[3] += g * g; cov[4] += g * b; cov[5] += b * b;
+    }
+    for (int it = 0; it < 6; it++) {
+        float x = cov[0] * ax[0] + cov[1] * ax[1] + cov[2] * ax[2], y = cov[1] * ax[0] + cov[3] * ax[1] + cov[4] * ax[2];
+        float z = cov[2] * ax[0] + cov[4] * ax[1] + cov[5] * ax[2], m = x < 0 ? -x : x;
+        if ((y < 0 ? -y : y) > m) m = y < 0 ? -y : y;
+        if ((z < 0 ? -z : z) > m) m = z < 0 ? -z : z;
+        if (m < 1e-6f) break;
+        ax[0] = x / m; ax[1] = y / m; ax[2] = z / m;
+    }
+    float n2 = ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2], tl = 1e30f, th = -1e30f, bl[3] = { 1e30f, 1e30f, 1e30f }, bh[3] = { 0, 0, 0 };
+    for (int i = 0; i < 16; i++) {
+        float d = (U[i][0] - mean[0]) * ax[0] + (U[i][1] - mean[1]) * ax[1] + (U[i][2] - mean[2]) * ax[2];
+        if (d < tl) tl = d;
+        if (d > th) th = d;
+        for (int c = 0; c < 3; c++) { if (U[i][c] < bl[c]) bl[c] = U[i][c]; if (U[i][c] > bh[c]) bh[c] = U[i][c]; }
+    }
+    double best = 1e300;
+    int be[2][3] = { { 0 } }, bidx[16] = { 0 };
+    for (int start = 0; start < 2; start++) { /* principal axis, and the per-channel bounding box */
+        int e[2][3], idx[16];
+        for (int c = 0; c < 3; c++) {
+            float lo = start ? bl[c] : mean[c] + ax[c] * tl / n2, hi = start ? bh[c] : mean[c] + ax[c] * th / n2;
+            e[0][c] = zap__bc6_q(lo); e[1][c] = zap__bc6_q(hi);
+        }
+        double err = zap__bc6_fit(t, (const int(*)[3])e, idx);
+        for (int it = 0; it < 3 && err > 0; it++) { /* least squares on the pre-finish values */
+            float aa = 0, ab = 0, bb = 0, xa[3] = { 0, 0, 0 }, xb[3] = { 0, 0, 0 };
+            for (int i = 0; i < 16; i++) {
+                float w = ZAP__BC7W4[idx[i]] / 64.0f, v = 1 - w;
+                aa += v * v; ab += v * w; bb += w * w;
+                for (int c = 0; c < 3; c++) { xa[c] += v * U[i][c]; xb[c] += w * U[i][c]; }
+            }
+            float det = aa * bb - ab * ab;
+            if (det < 1e-6f && det > -1e-6f) break;
+            int ne[2][3], ni[16];
+            for (int c = 0; c < 3; c++) { ne[0][c] = zap__bc6_q((xa[c] * bb - xb[c] * ab) / det); ne[1][c] = zap__bc6_q((xb[c] * aa - xa[c] * ab) / det); }
+            double e2 = zap__bc6_fit(t, (const int(*)[3])ne, ni);
+            if (e2 >= err) break;
+            err = e2; memcpy(e, ne, sizeof ne); memcpy(idx, ni, sizeof ni);
+        }
+        if (err < best) { best = err; memcpy(be, e, sizeof e); memcpy(bidx, idx, sizeof idx); }
+    }
+    if (bidx[0] & 8) { /* anchor index needs MSB 0 */
+        for (int c = 0; c < 3; c++) { int x = be[0][c]; be[0][c] = be[1][c]; be[1][c] = x; }
+        for (int i = 0; i < 16; i++) bidx[i] = 15 - bidx[i];
+    }
+    int pos = 0;
+    memset(out, 0, 16);
+    zap__putbits(out, &pos, 3, 5); /* mode 11 */
+    for (int k = 0; k < 2; k++) for (int c = 0; c < 3; c++) zap__putbits(out, &pos, (unsigned)be[k][c], 10);
+    for (int i = 0; i < 16; i++) zap__putbits(out, &pos, (unsigned)bidx[i], i ? 4 : 3);
+    return best;
+}
+
+static inline void zap__bc6_dec(const uint8_t *b, uint16_t px[16][4]) {
+    int pos = 0, e[2][3];
+    memset(px, 0, 16 * 4 * sizeof(uint16_t));
+    if (zap__bits(b, &pos, 5) != 3) return; /* not mode 11 */
+    for (int k = 0; k < 2; k++) for (int c = 0; c < 3; c++) e[k][c] = zap__bc6_unq((int)zap__bits(b, &pos, 10));
+    for (int i = 0; i < 16; i++) {
+        int w = ZAP__BC7W4[zap__bits(b, &pos, i ? 4 : 3)];
+        for (int c = 0; c < 3; c++) px[i][c] = (uint16_t)zap__bc6_fin(((64 - w) * e[0][c] + w * e[1][c] + 32) >> 6);
+        px[i][3] = 0x3C00; /* 1.0 */
+    }
+}
+
+/* rgba: 4 floats per pixel, stride in floats per row; alpha ignored, negatives clamp to 0. out: zap_bc_size(w, h, ZAP_BC7) */
+static inline void zap_bc6h_encode(const float *rgba, int w, int h, size_t stride, void *out_) {
+    uint8_t *out = (uint8_t *)out_;
+    int bw = (w + 3) / 4, bh = (h + 3) / 4;
+    for (int by = 0; by < bh; by++)
+        for (int bx = 0; bx < bw; bx++) {
+            uint16_t t[16][3];
+            for (int i = 0; i < 16; i++) {
+                int x = bx * 4 + (i & 3), y = by * 4 + (i >> 2);
+                if (x >= w) x = w - 1;
+                if (y >= h) y = h - 1;
+                for (int c = 0; c < 3; c++) t[i][c] = zap__f2h(rgba[(size_t)y * stride + (size_t)x * 4 + c]);
+            }
+            zap__bc6_block((const uint16_t(*)[3])t, out + ((size_t)by * (size_t)bw + (size_t)bx) * 16);
+        }
+}
+
+/* to RGBA half-float bits (alpha 1.0), stride in uint16 per row */
+static inline void zap_bc6h_decode(const void *bc_, int w, int h, uint16_t *rgba, size_t stride) {
+    const uint8_t *bc = (const uint8_t *)bc_;
+    int bw = (w + 3) / 4, bh = (h + 3) / 4;
+    for (int by = 0; by < bh; by++)
+        for (int bx = 0; bx < bw; bx++) {
+            uint16_t px[16][4];
+            zap__bc6_dec(bc + ((size_t)by * (size_t)bw + (size_t)bx) * 16, px);
+            for (int i = 0; i < 16; i++) {
+                int x = bx * 4 + (i & 3), y = by * 4 + (i >> 2);
+                if (x < w && y < h) memcpy(rgba + (size_t)y * stride + (size_t)x * 4, px[i], 8);
+            }
+        }
+}
+
+/* ---------------- mipmaps: 2x2 box filter; sRGB data is averaged in linear light. Odd sizes drop the last
+ * row/column (ponytail: box filter; a Kaiser/Lanczos filter would keep more detail in the smaller mips). */
+static const float ZAP__SRGB_LIN[256] = {
+    0.0f, 0.000303526984f, 0.000607053967f, 0.000910580951f, 0.00121410793f, 0.00151763492f, 0.0018211619f, 0.00212468888f,
+    0.00242821587f, 0.00273174285f, 0.00303526984f, 0.00334653576f, 0.00367650732f, 0.00402471702f, 0.00439144204f, 0.00477695348f,
+    0.0051815167f, 0.00560539162f, 0.00604883302f, 0.00651209079f, 0.00699541019f, 0.00749903204f, 0.00802319299f, 0.00856812562f,
+    0.0091340587f, 0.00972121732f, 0.010329823f, 0.010960094f, 0.0116122452f, 0.0122864884f, 0.0129830323f, 0.013702083f,
+    0.0144438436f, 0.0152085144f, 0.0159962934f, 0.0168073758f, 0.0176419545f, 0.0185002201f, 0.019382361f, 0.0202885631f,
+    0.0212190104f, 0.0221738848f, 0.0231533662f, 0.0241576324f, 0.0251868596f, 0.0262412219f, 0.0273208916f, 0.0284260395f,
+    0.0295568344f, 0.0307134437f, 0.0318960331f, 0.0331047666f, 0.0343398068f, 0.0356013149f, 0.0368894504f, 0.0382043716f,
+    0.0395462353f, 0.0409151969f, 0.0423114106f, 0.0437350293f, 0.0451862044f, 0.0466650863f, 0.0481718242f, 0.049706566f,
+    0.0512694584f, 0.052860647f, 0.0544802764f, 0.05612849f, 0.0578054302f, 0.0595112382f, 0.0612460542f, 0.0630100177f,
+    0.0648032667f, 0.0666259386f, 0.0684781698f, 0.0703600957f, 0.0722718507f, 0.0742135684f, 0.0761853815f, 0.0781874218f,
+    0.0802198203f, 0.0822827071f, 0.0843762115f, 0.086500462f, 0.0886555863f, 0.0908417112f, 0.0930589628f, 0.0953074666f,
+    0.0975873471f, 0.0998987282f, 0.102241733f, 0.104616484f, 0.107023103f, 0.109461711f, 0.111932428f, 0.114435374f,
+    0.116970668f, 0.119538428f, 0.122138772f, 0.124771818f, 0.12743768f, 0.130136477f, 0.132868322f, 0.13563333f,
+    0.138431615f, 0.141263291f, 0.144128471f, 0.147027266f, 0.14995979f, 0.152926152f, 0.155926464f, 0.158960835f,
+    0.162029376f, 0.165132195f, 0.1682694f, 0.171441101f, 0.174647404f, 0.177888416f, 0.181164244f, 0.184474995f,
+    0.187820772f, 0.191201683f, 0.19461783f, 0.19806932f, 0.201556254f, 0.205078736f, 0.20863687f, 0.212230757f,
+    0.2158605f, 0.2195262f, 0.223227957f, 0.226965874f, 0.230740049f, 0.234550582f, 0.238397574f, 0.242281122f,
+    0.246201327f, 0.250158285f, 0.254152094f, 0.258182853f, 0.262250658f, 0.266355605f, 0.270497791f, 0.274677312f,
+    0.278894263f, 0.28314874f, 0.287440838f, 0.29177065f, 0.296138271f, 0.300543794f, 0.304987314f, 0.309468923f,
+    0.313988713f, 0.318546778f, 0.323143209f, 0.327778098f, 0.332451536f, 0.337163615f, 0.341914425f, 0.346704056f,
+    0.3515326f, 0.356400144f, 0.36130678f, 0.366252596f, 0.37123768f, 0.376262123f, 0.381326011f, 0.386429434f,
+    0.391572478f, 0.396755231f, 0.40197778f, 0.407240212f, 0.412542613f, 0.417885071f, 0.42326767f, 0.428690497f,
+    0.434153636f, 0.439657174f, 0.445201195f, 0.450785783f, 0.456411023f, 0.462077f, 0.467783796f, 0.473531496f,
+    0.479320183f, 0.48514994f, 0.49102085f, 0.496932995f, 0.502886458f, 0.508881321f, 0.514917665f, 0.520995573f,
+    0.527115126f, 0.533276404f, 0.539479489f, 0.545724461f, 0.552011402f, 0.55834039f, 0.564711506f, 0.571124829f,
+    0.57758044f, 0.584078418f, 0.590618841f, 0.597201788f, 0.603827339f, 0.610495571f, 0.617206562f, 0.623960392f,
+    0.630757136f, 0.637596874f, 0.644479682f, 0.651405637f, 0.658374817f, 0.665387298f, 0.672443157f, 0.67954247f,
+    0.686685312f, 0.693871761f, 0.701101892f, 0.70837578f, 0.715693501f, 0.723055129f, 0.73046074f, 0.737910409f,
+    0.74540421f, 0.752942217f, 0.760524505f, 0.768151147f, 0.775822218f, 0.783537792f, 0.79129794f, 0.799102738f,
+    0.806952258f, 0.814846572f, 0.822785754f, 0.830769877f, 0.838799012f, 0.846873232f, 0.854992608f, 0.863157213f,
+    0.871367119f, 0.879622397f, 0.887923118f, 0.896269353f, 0.904661174f, 0.913098652f, 0.921581856f, 0.930110858f,
+    0.938685728f, 0.947306537f, 0.955973353f, 0.964686248f, 0.97344529f, 0.98225055f, 0.991102097f, 1.0f
+};
+static const float ZAP__SRGB_THR[255] = {
+    0.000151763492f, 0.000455290475f, 0.000758817459f, 0.00106234444f, 0.00136587143f, 0.00166939841f, 0.00197292539f, 0.00227645238f,
+    0.00257997936f, 0.00288350634f, 0.0031883009f, 0.00350925935f, 0.00384831493f, 0.00420574803f, 0.00458183274f, 0.00497683725f,
+    0.00539102416f, 0.00582465078f, 0.00627796943f, 0.00675122763f, 0.00724466842f, 0.0077585305f, 0.00829304845f, 0.00884845295f,
+    0.00942497089f, 0.0100228256f, 0.0106422369f, 0.0112834213f, 0.0119465921f, 0.0126319598f, 0.0133397316f, 0.014070112f,
+    0.0148233028f, 0.0155995031f, 0.0163989095f, 0.0172217161f, 0.0180681146f, 0.0189382945f, 0.0198324428f, 0.0207507446f,
+    0.0216933829f, 0.0226605384f, 0.0236523902f, 0.024669115f, 0.0257108881f, 0.0267778826f, 0.0278702702f, 0.0289882206f,
+    0.0301319019f, 0.0313014806f, 0.0324971216f, 0.0337189882f, 0.0349672424f, 0.0362420443f, 0.037543553f, 0.0388719259f,
+    0.0402273192f, 0.0416098877f, 0.0430197848f, 0.0444571628f, 0.0459221727f, 0.047414964f, 0.0489356854f, 0.0504844842f,
+    0.0520615066f, 0.0536668976f, 0.0553008013f, 0.0569633604f, 0.0586547169f, 0.0603750115f, 0.0621243839f, 0.0639029729f,
+    0.0657109163f, 0.0675483509f, 0.0694154125f, 0.0713122362f, 0.0732389559f, 0.0751957047f, 0.077182615f, 0.0791998181f,
+    0.0812474446f, 0.0833256241f, 0.0854344855f, 0.087574157f, 0.0897447658f, 0.0919464383f, 0.0941793004f, 0.096443477f,
+    0.0987390924f, 0.10106627f, 0.103425133f, 0.105815802f, 0.108238401f, 0.110693048f, 0.113179865f, 0.11569897f,
+    0.118250482f, 0.12083452f, 0.1234512f, 0.12610064f, 0.128782955f, 0.131498261f, 0.134246673f, 0.137028306f,
+    0.139843272f, 0.142691686f, 0.14557366f, 0.148489305f, 0.151438734f, 0.154422057f, 0.157439385f, 0.160490827f,
+    0.163576493f, 0.166696492f, 0.169850932f, 0.17303992f, 0.176263564f, 0.179521971f, 0.182815248f, 0.186143498f,
+    0.189506829f, 0.192905345f, 0.196339151f, 0.19980835f, 0.203313045f, 0.20685334f, 0.210429338f, 0.21404114f,
+    0.217688849f, 0.221372565f, 0.225092389f, 0.228848422f, 0.232640764f, 0.236469515f, 0.240334772f, 0.244236636f,
+    0.248175205f, 0.252150577f, 0.256162849f, 0.260212118f, 0.264298482f, 0.268422037f, 0.272582879f, 0.276781103f,
+    0.281016805f, 0.285290081f, 0.289601024f, 0.293949728f, 0.298336289f, 0.302760799f, 0.307223352f, 0.31172404f,
+    0.316262956f, 0.320840192f, 0.325455841f, 0.330109993f, 0.33480274f, 0.339534173f, 0.344304382f, 0.349113458f,
+    0.353961491f, 0.35884857f, 0.363774785f, 0.368740224f, 0.373744977f, 0.378789131f, 0.383872775f, 0.388995998f,
+    0.394158885f, 0.399361525f, 0.404604005f, 0.409886411f, 0.41520883f, 0.420571347f, 0.42597405f, 0.431417022f,
+    0.43690035f, 0.442424119f, 0.447988412f, 0.453593316f, 0.459238914f, 0.46492529f, 0.470652528f, 0.476420711f,
+    0.482229923f, 0.488080246f, 0.493971763f, 0.499904557f, 0.505878709f, 0.511894303f, 0.517951419f, 0.524050139f,
+    0.530190544f, 0.536372716f, 0.542596734f, 0.54886268f, 0.555170635f, 0.561520677f, 0.567912887f, 0.574347344f,
+    0.580824128f, 0.587343319f, 0.593904994f, 0.600509233f, 0.607156115f, 0.613845717f, 0.620578117f, 0.627353395f,
+    0.634171626f, 0.641032889f, 0.647937261f, 0.654884819f, 0.66187564f, 0.668909801f, 0.675987377f, 0.683108445f,
+    0.690273081f, 0.697481362f, 0.704733362f, 0.712029156f, 0.719368822f, 0.726752432f, 0.734180063f, 0.741651788f,
+    0.749167683f, 0.756727821f, 0.764332277f, 0.771981125f, 0.779674438f, 0.787412289f, 0.795194753f, 0.803021903f,
+    0.810893811f, 0.81881055f, 0.826772194f, 0.834778813f, 0.842830482f, 0.850927271f, 0.859069253f, 0.867256499f,
+    0.875489082f, 0.883767073f, 0.892090542f, 0.900459561f, 0.908874202f, 0.917334534f, 0.925840628f, 0.934392556f,
+    0.942990386f, 0.95163419f, 0.960324036f, 0.969059996f, 0.977842139f, 0.986670534f, 0.99554525f
+}; /* linear value where sRGB k rounds up to k + 1 */
+
+static inline uint8_t zap__lin2srgb(float v) {
+    int lo = 0, hi = 255; /* first k with v < threshold[k] */
+    while (lo < hi) { int mid = (lo + hi) >> 1; if (v < ZAP__SRGB_THR[mid]) hi = mid; else lo = mid + 1; }
+    return (uint8_t)lo;
+}
+
+static inline int zap_mip_levels(int w, int h) {
+    int n = 1;
+    while (w > 1 || h > 1) { w = w > 1 ? w / 2 : 1; h = h > 1 ? h / 2 : 1; n++; }
+    return n;
+}
+
+/* RGBA8 level -> next level (max(1, w/2) x max(1, h/2)). srgb: RGB is sRGB-encoded (alpha is always linear). */
+static inline void zap_mip_next(const uint8_t *src, int w, int h, size_t stride, int srgb, uint8_t *dst, size_t dst_stride) {
+    int nw = w > 1 ? w / 2 : 1, nh = h > 1 ? h / 2 : 1;
+    for (int y = 0; y < nh; y++)
+        for (int x = 0; x < nw; x++) {
+            int x0 = 2 * x, x1 = 2 * x + 1 < w ? 2 * x + 1 : w - 1, y0 = 2 * y, y1 = 2 * y + 1 < h ? 2 * y + 1 : h - 1;
+            if (x0 >= w) x0 = w - 1;
+            if (y0 >= h) y0 = h - 1;
+            const uint8_t *p[4] = { src + (size_t)y0 * stride + (size_t)x0 * 4, src + (size_t)y0 * stride + (size_t)x1 * 4,
+                                    src + (size_t)y1 * stride + (size_t)x0 * 4, src + (size_t)y1 * stride + (size_t)x1 * 4 };
+            uint8_t *o = dst + (size_t)y * dst_stride + (size_t)x * 4;
+            for (int c = 0; c < 4; c++) {
+                if (srgb && c < 3) o[c] = zap__lin2srgb((ZAP__SRGB_LIN[p[0][c]] + ZAP__SRGB_LIN[p[1][c]] + ZAP__SRGB_LIN[p[2][c]] + ZAP__SRGB_LIN[p[3][c]]) * 0.25f);
+                else o[c] = (uint8_t)((p[0][c] + p[1][c] + p[2][c] + p[3][c] + 2) >> 2);
+            }
+        }
+}
+
+/* float RGBA level (linear) -> next level; strides in floats per row */
+static inline void zap_mip_next_f(const float *src, int w, int h, size_t stride, float *dst, size_t dst_stride) {
+    int nw = w > 1 ? w / 2 : 1, nh = h > 1 ? h / 2 : 1;
+    for (int y = 0; y < nh; y++)
+        for (int x = 0; x < nw; x++) {
+            int x0 = 2 * x < w ? 2 * x : w - 1, x1 = 2 * x + 1 < w ? 2 * x + 1 : w - 1, y0 = 2 * y < h ? 2 * y : h - 1, y1 = 2 * y + 1 < h ? 2 * y + 1 : h - 1;
+            for (int c = 0; c < 4; c++)
+                dst[(size_t)y * dst_stride + (size_t)x * 4 + c] = 0.25f * (src[(size_t)y0 * stride + (size_t)x0 * 4 + c] + src[(size_t)y0 * stride + (size_t)x1 * 4 + c] +
+                                                                           src[(size_t)y1 * stride + (size_t)x0 * 4 + c] + src[(size_t)y1 * stride + (size_t)x1 * 4 + c]);
+        }
 }
 
 /* ---------------- public API */

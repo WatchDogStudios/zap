@@ -5,7 +5,7 @@ Single-header C compression for games:
 | Header | What it does |
 |---|---|
 | `zap.h` | Fast LZ77 compressor for **asset packaging** and **network packets**, with an optional Huffman-coded **entropy mode** |
-| `zap_tex.h` | GPU texture block compression (**BC1/BC3/BC4/BC5/BC7**) with rate-distortion optimisation tuned for `zap.h` |
+| `zap_tex.h` | GPU texture block compression (**BC1/BC3/BC4/BC5/BC7**, plus **BC6H** for HDR) with rate-distortion optimisation tuned for `zap.h`, and **mipmap** generation |
 | `zap_video.h` | Simple, fast-decoding **video codec** for cutscenes and UI video (SSE2 decoder) |
 | `samples/dx11` | **zap_viewer**: D3D11 + Dear ImGui app that compares encodings of your own images and videos side by side, with stats |
 
@@ -104,9 +104,26 @@ size_t packed = zap_compress_hc(planes, n, out, cap, hc_state, NULL, 64);
 
 - `rdo` is the rate-distortion trade-off. At 0 every block gets its best encoding. As it rises, blocks increasingly reuse endpoints and indices from recent blocks whenever the extra error is worth the bytes zap saves. The output is still standard BCn, so the GPU and your engine don't change.
 - The formats are BC1 (RGB), BC3 (RGBA), BC4 (single channel), BC5 (two channels, for normal maps) and BC7 (high-quality RGBA).
-- For BC7, the decoder handles all 8 modes. The encoder uses mode 6 (smooth blocks and alpha) and mode 1 with a search over all 64 partitions (opaque edges).
+- For BC7, the decoder handles all 8 modes. The encoder uses three:
+  - mode 6 for smooth blocks and alpha;
+  - mode 5 for independent alpha, trying all four channel rotations;
+  - mode 1, with a search over all 64 partitions, for opaque edges.
 - BC7's RDO reuses whole blocks, or the endpoint or index bytes of recent mode-6 blocks.
 - Blocks are independent, so large images can be encoded in horizontal bands on several threads. `zap_viewer` does this.
+
+**Mipmaps and HDR:**
+
+```c
+/* mip chain: encode each level; sRGB color is averaged in linear light */
+for (int l = 0; l < zap_mip_levels(w, h); l++) {
+    zap_bc_encode(level, w, h, w * 4, ZAP_BC7, 0, out); out += zap_bc_size(w, h, ZAP_BC7);
+    zap_mip_next(level, w, h, w * 4, 1 /* srgb */, next, (w > 1 ? w / 2 : 1) * 4);
+    /* level = next, w /= 2, h /= 2 (min 1) */
+}
+
+/* HDR: float RGBA in, BC6H (DXGI_FORMAT_BC6H_UF16) out, same size as BC7 */
+zap_bc6h_encode(rgba_float, w, h, w * 4 /* floats per row */, out);
+```
 - `zap_bc_decode` converts BCn back to RGBA8 for tools and tests.
 
 ### Video
@@ -134,7 +151,7 @@ if (zap_vdec_frame(dec, packet, n) == 0) {
 zap c [-e] [-l depth] [-b block_kb] [-t threads] [-D dict] in out   # pack   (depth 0 = fast, default 64; -e entropy mode)
 zap d [-t threads] [-D dict] in out                            # unpack
 zap train [-s dict_bytes] dict.bin samples...                  # train a packet dictionary
-zap tex [-f bc1|bc3|bc4|bc5|bc7] [-r rdo] w h in.rgba out.dds  # raw RGBA8 -> DDS
+zap tex [-f bc1|bc3|bc4|bc5|bc7] [-r rdo] [-m] [-S] w h in.rgba out.dds  # raw RGBA8 -> DDS (-m mip chain, -S sRGB)
 zap venc [-q quality] [-k keyint] [-F fps] w h in.yuv out.zv   # raw I420 -> .zv video
 zap vdec in.zv out.yuv                                         # .zv -> raw I420
 ```
@@ -154,7 +171,11 @@ The view is split: drag the line to move it, zoom with the mouse wheel, pan with
 - **Texture tab:** open any image WIC can read (PNG, JPEG, TIFF, BMP, …). Pick a format for each side (original RGBA8, BC1, BC3 or BC7), each with its own RDO slider. The table shows PSNR, GPU memory, size on disk after zap, bits per pixel and encode time for both sides. Re-encodes run in the background on all cores.
 - **Video tab:** open any file Media Foundation can decode (MP4/MOV/MKV/AVI/WMV with H.264, HEVC, VP9 or AV1, if the codec is installed). Each frame is transcoded live through zap: the source is decoded on the left and zap's encode/decode is shown on the right. Live stats and plots cover bitrate for both, zap's PSNR against the source, decode time per frame for both, and zap's encode time. Quality, keyframe interval and stream packing can be changed while it plays.
 
-`--verify` result on an AMD Radeon RX 9060 XT: BC7 is bit-exact for zap's encoder output and for random blocks in all 8 modes plus the reserved mode. BC1–BC5 are within ±2, which is interpolation rounding the D3D spec leaves to the hardware.
+`--verify` result on an AMD Radeon RX 9060 XT:
+
+- **BC7:** bit-exact for zap's encoder output and for random blocks in all 8 modes plus the reserved mode.
+- **BC6H:** bit-exact, in half-float bits, for zap's encoder output and for random mode-11 blocks.
+- **BC1–BC5:** within ±2, which is interpolation rounding the D3D spec leaves to the hardware.
 
 ## API
 
@@ -181,7 +202,12 @@ Memory: `zap_state` is 256 KB, `zap_dict` is 256 KB plus the dictionary data, an
 | `zap_bc_decode(bc, w, h, fmt, rgba, stride)` | BCn to RGBA8. BC4 decodes to `(r,0,0,255)` and BC5 to `(r,g,0,255)`, matching GPU sampling. |
 | `zap_bc_split / zap_bc_merge(in, n, fmt, out)` | Lossless: gathers endpoints and indices into separate planes, so zap finds longer matches. |
 
-The formats are `ZAP_BC1`, `ZAP_BC3`, `ZAP_BC4`, `ZAP_BC5` and `ZAP_BC7`. To load BC7 from DDS, use the `DX10` header with `DXGI_FORMAT_BC7_UNORM` (98). `zap tex` writes that.
+| `zap_bc6h_encode(rgba_float, w, h, stride, out)` / `zap_bc6h_decode(bc, w, h, rgba_half, stride)` | HDR to BC6H (unsigned) and back. Input is 4 floats per pixel, and negatives are clamped to 0. Output size is `zap_bc_size(w, h, ZAP_BC7)`. The decoder writes half-float bits. |
+| `zap_mip_levels(w, h)` | Number of levels in a full mip chain, down to 1×1. |
+| `zap_mip_next(src, w, h, stride, srgb, dst, dst_stride)` | Next mip level of an RGBA8 image with a 2×2 box filter. With `srgb`, color is averaged in linear light (alpha is always linear). |
+| `zap_mip_next_f(src, w, h, stride, dst, dst_stride)` | The same for float (linear or HDR) images. |
+
+The formats are `ZAP_BC1`, `ZAP_BC3`, `ZAP_BC4`, `ZAP_BC5` and `ZAP_BC7`. To load BC7 from DDS, use the `DX10` header with `DXGI_FORMAT_BC7_UNORM` (98). `zap tex` writes that, plus the `_SRGB` formats and a full mip chain with `-S` and `-m`.
 
 | zap_video.h | Use |
 |---|---|
@@ -233,6 +259,12 @@ These are single runs on an AMD Ryzen 7 5800X (8 cores) with clang 18 `-O3 -marc
 - **Decoder check:** ffmpeg's DDS decoder reproduces zap's own BC1/BC3/BC5 decode within ±2 levels (±1 for BC5), which is normal interpolation rounding.
 - **When split helps:** `zap_bc_split` helps BC1/BC3 by 10–22%. On BC5 with RDO off, and on BC7 at high RDO, it makes the file larger, so measure it on your own data.
 - **Choosing a format:** BC7 is the quality choice, at about +5 dB over BC3 on this image. At small file sizes, BC1 with RDO still beats BC7 with RDO on this smooth photo.
+- **BC7 alpha (mode 5):** two synthetic 256×256 RGBA textures, PSNR over all four channels:
+
+  | Texture | BC7 before mode 5 | BC7 with mode 5 | BC3 |
+  |---|---|---|---|
+  | Cutout alpha with detailed color | 40.42 dB | **44.52 dB** | 40.83 dB |
+  | Smooth independent alpha ramp | 48.02 dB | 48.05 dB | 43.78 dB |
 
 **Video:** 1280×720, 150 frames, 30 fps, single thread. The pan clip is a slow zoom and pan across a photo; the second clip is ffmpeg's `testsrc2` pattern. zap uses hc depth 16. The other codecs were encoded with ffmpeg at a matched bitrate and decoded by ffmpeg (`-threads 1`). PSNR is measured on the Y channel by the same code for every codec.
 
@@ -338,9 +370,10 @@ On Windows, CMake builds `zap_viewer` and fetches Dear ImGui v1.92.7 with FetchC
 - **No stored sizes:** the raw block API doesn't record sizes, so store them yourself. Frames do record them.
 - **MSVC:** `ZAP_THREADS` needs MSVC 17.8+ for `<threads.h>`. You can skip it and use `zap_frame_decode_block` from your own threads instead.
 - **Textures:**
-  - There's no BC6H (HDR) or ASTC yet.
-  - The BC7 encoder uses modes 6 and 1 only, so three-subset and separate-alpha modes are decode-only. Alpha-heavy textures would gain from modes 4, 5 and 7.
-  - No mipmap generation.
+  - There's no ASTC yet.
+  - BC6H is unsigned mode 11 only: one region, 10-bit endpoints. The decoder reads only mode 11 (other modes decode to 0), so it can't read BC6H files from other encoders. There's no signed BC6H.
+  - The BC7 encoder uses modes 6, 5 and 1. The three-subset modes (0, 2) and modes 3, 4 and 7 are decode-only.
+  - Mipmaps use a 2×2 box filter, and odd sizes drop the last row or column. A wider filter (Kaiser or Lanczos) would keep more detail, and there's no alpha-weighted (premultiplied) filtering.
   - RDO considers blocks in raster order, so a tiled order would give it more nearby candidates.
   - BC1 is always opaque: it never uses BC1's 1-bit alpha.
 - **Video:**

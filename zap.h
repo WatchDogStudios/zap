@@ -295,7 +295,7 @@ static inline ptrdiff_t zap_decompress(const void *src_, size_t n, void *dst_, s
             op += lit; ip += lit;
             /* branch-free 2/3-byte offset: near/far offsets mix unpredictably in big blocks */
             size_t v = (size_t)ip[0] | ((size_t)ip[1] << 8), far = v >> 15, ml = (tok & 15) + 4;
-            size_t off = (v & 0x7FFF) | (((size_t)ip[2] << 15) & (size_t)0 - far);
+            size_t off = (v & 0x7FFF) | (((size_t)ip[2] << 15) & ((size_t)0 - far));
             ip += 2 + far;
             size_t have = (size_t)(op - ostart);
             if (off >= 16 && off <= have) {

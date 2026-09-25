@@ -42,7 +42,66 @@ static void write_dds(const char *path, const void *bc, size_t n, int w, int h, 
     FILE *o = fopen(path, "wb"); fwrite(hd, 1, f == ZAP_BC7 ? 148 : 128, o); fwrite(bc, 1, n, o); fclose(o);
 }
 
+static void hdr_mip_test(void) {
+    /* half-float conversion: every unsigned half round-trips exactly; float -> half rounds to nearest */
+    for (uint32_t h = 0; h <= 0x7BFF; h++) assert(zap__f2h(zap__h2f((uint16_t)h)) == h);
+    assert(zap__f2h(-1.0f) == 0 && zap__f2h(1e9f) == 0x7BFF && zap__f2h(1.0f) == 0x3C00 && zap__f2h(1.0f + 1.0f / 4096) == 0x3C00);
+
+    /* BC6H: HDR gradients over ~6 stops plus a bright spot; relative error per channel stays small */
+    enum { W = 37, H = 21 };
+    static float img[W * H * 4];
+    static uint16_t dec[W * H * 4];
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        float *p = img + (y * W + x) * 4;
+        p[0] = 0.05f * (float)(1 << (x / 6)); p[1] = 0.5f + y * 0.25f; p[2] = (x == 20 && y == 10) ? 10000.0f : 0.01f * (x + 1); p[3] = 1;
+    }
+    uint8_t *bc = malloc(zap_bc_size(W, H, ZAP_BC7));
+    zap_bc6h_encode(img, W, H, W * 4, bc);
+    zap_bc6h_decode(bc, W, H, dec, W * 4);
+    double rel = 0;
+    for (int i = 0; i < W * H; i++)
+        for (int c = 0; c < 3; c++) {
+            double a = img[i * 4 + c], b = zap__h2f(dec[i * 4 + c]);
+            rel += fabs(a - b) / (a + 0.01);
+        }
+    rel /= W * H * 3;
+    assert(rel < 0.08 && dec[3] == 0x3C00);
+    for (int s = 1; s <= 5; s += 4) { /* tiny / odd sizes */
+        zap_bc6h_encode(img, s, s == 1 ? 1 : 3, W * 4, bc);
+        zap_bc6h_decode(bc, s, s == 1 ? 1 : 3, dec, W * 4);
+    }
+    free(bc);
+
+    /* BC7 mode 5 gets picked when alpha varies independently of color */
+    static uint8_t rgba[64 * 64 * 4], out7[64 * 64 * 4];
+    for (int i = 0; i < 64 * 64; i++) { rgba[i * 4] = (uint8_t)(i % 64 * 4); rgba[i * 4 + 1] = (uint8_t)(i / 64 * 4); rgba[i * 4 + 2] = 90; rgba[i * 4 + 3] = (uint8_t)((255 - i % 64 * 4) ^ (i / 64 * 4)); }
+    uint8_t *b7 = malloc(zap_bc_size(64, 64, ZAP_BC7));
+    zap_bc_encode(rgba, 64, 64, 64 * 4, ZAP_BC7, 0, b7);
+    int m5 = 0;
+    for (int b = 0; b < 256; b++) m5 += (b7[b * 16] & 0x3F) == 0x20;
+    zap_bc_decode(b7, 64, 64, ZAP_BC7, out7, 64 * 4);
+    assert(m5 > 0 && psnr(rgba, out7, 64 * 64, 15) > 30);
+    free(b7);
+
+    /* mipmaps */
+    assert(zap_mip_levels(1, 1) == 1 && zap_mip_levels(256, 128) == 9 && zap_mip_levels(5, 3) == 3);
+    uint8_t bw[2 * 2 * 4] = { 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255 }, m[4];
+    zap_mip_next(bw, 2, 2, 8, 0, m, 4);
+    assert(m[0] == 128 && m[3] == 255);                 /* plain average */
+    zap_mip_next(bw, 2, 2, 8, 1, m, 4);
+    assert(m[0] == 188 && m[1] == 188 && m[3] == 255);  /* linear-light average of black and white */
+    for (int v = 0; v < 256; v++) { uint8_t c4[16], o[4]; memset(c4, v, 16); zap_mip_next(c4, 2, 2, 8, 1, o, 4); assert(o[0] == v); }
+    uint8_t odd[5 * 3 * 4], m2[2 * 4];
+    memset(odd, 77, sizeof odd);
+    zap_mip_next(odd, 5, 3, 5 * 4, 1, m2, 2 * 4);
+    assert(m2[0] == 77 && m2[7] == 77);
+    float fl[2 * 2 * 4] = { 1, 2, 3, 4, 3, 2, 1, 0, 5, 5, 5, 5, 7, 7, 7, 7 }, fo[4];
+    zap_mip_next_f(fl, 2, 2, 8, fo, 4);
+    assert(fo[0] == 4 && fo[3] == 4);
+}
+
 static void selftest(void) {
+    hdr_mip_test();
     enum { W = 67, H = 45 };
     static uint8_t img[W * H * 4], out[W * H * 4];
     srand(3);
