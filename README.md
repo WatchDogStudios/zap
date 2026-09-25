@@ -11,6 +11,24 @@ Single-header C compression for games:
 
 Each header works on its own, except that `zap_video.h` includes `zap.h`. They're C11 and also compile as C++, with no dependencies.
 
+## Showcase
+
+These screenshots come from [`zap_viewer`](#zap_viewer-windows-d3d11--dear-imgui), the bundled D3D11 + Dear ImGui sample. The test content is a Mandelbrot render and a Mandelbrot zoom clip, both generated with ffmpeg's `mandelbrot` source.
+
+**Textures: BC1 (left) vs BC7 (right)**, with PSNR, GPU memory, size on disk after zap, and encode time for each side:
+
+![Texture tab: BC1 vs BC7 split view with stats](docs/images/viewer_texture.png)
+
+| Up close, point-sampled (8×): BC1's 4×4 color steps vs BC7 | Difference ×8: where BC1 loses detail against the original |
+|---|---|
+| ![BC1 vs BC7 zoomed in](docs/images/viewer_texture_zoom.png) | ![Original vs BC1 difference view](docs/images/viewer_texture_diff.png) |
+
+**Video: an H.264 MP4 (left) transcoded live through zap (right)**, with bitrate, PSNR, per-frame decode and encode times, and plots:
+
+![Video tab: H.264 source vs zap live transcode with stats](docs/images/viewer_video.png)
+
+Fractal zooms are close to worst-case content for zap. Here zap needs about 4× the H.264 source's bitrate to reach 44.5 dB. The [video benchmarks](#benchmarks) show where it lands on more typical footage.
+
 **zap.h:**
 
 - **One header, no dependencies.** Drop `zap.h` into your project.
@@ -124,6 +142,7 @@ To get raw input from any image or video, use ffmpeg: `ffmpeg -i in.png -pix_fmt
 ```sh
 zap_viewer [image | video]      # or drag & drop files onto the window
 zap_viewer --verify             # decode every BC format on your GPU and diff it against zap's decoder
+zap_viewer --shot out [image] [--video clip.mp4]   # render the screenshots above to out_*.png
 ```
 
 The view is split: drag the line to move it, zoom with the mouse wheel, pan with the right button. **Difference ×8** shows where the two sides disagree.

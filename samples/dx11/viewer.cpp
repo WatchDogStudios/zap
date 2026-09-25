@@ -5,7 +5,7 @@
 //                                   Media Foundation can decode (MP4, MOV, MKV, ...) is transcoded live through zap;
 //                                   split view source vs zap with bitrate, PSNR and decode-time stats.
 //   zap_viewer --verify             GPU conformance: decode every BC format on the GPU and diff against zap's decoder
-//   zap_viewer --shot out [image] [--video file]   render both tabs to out_texture.png / out_video.png and exit
+//   zap_viewer --shot out [image] [--video file]   render out_texture(_zoom|_diff).png and out_video.png, then exit
 //
 // Mouse: wheel zoom, right-drag pan, left-drag moves the split line. Drag & drop files onto the window.
 #define _CRT_SECURE_NO_WARNINGS
@@ -866,12 +866,18 @@ static void shots(const std::wstring &prefix, bool have_video) {
         std::wstring path = prefix + name;
         printf("%ls: %s\n", path.c_str(), save_png(path, px.data(), A.ww, A.wh) ? "saved" : "FAILED");
     };
+    auto settle = [&] { frame(rtv.Get()); for (auto &j : A.jobs) j.join(); A.jobs.clear(); };
     A.side[0].fmt = 1; A.side[1].fmt = 3; // BC1 | BC7
     A.want_tab = 0;
-    frame(rtv.Get());
-    for (auto &j : A.jobs) j.join();
-    A.jobs.clear();
+    settle();
     grab(L"_texture.png");
+    A.zoom = 8; A.panx = 0.15f; A.pany = -0.3f; // up close on fine detail, point sampled: BC blocks visible
+    grab(L"_texture_zoom.png");
+    A.zoom = 1; A.panx = A.pany = 0;
+    A.side[0].fmt = 0; A.side[1].fmt = 1; A.diff = true; // |original - BC1| x8
+    settle();
+    grab(L"_texture_diff.png");
+    A.diff = false;
     if (have_video) {
         A.want_tab = 1;
         frame(rtv.Get());
