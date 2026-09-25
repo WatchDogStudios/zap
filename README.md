@@ -137,6 +137,7 @@ zap_astc_encode(rgba, w, h, w * 4, out);
 #include "zap_video.h"
 
 zap_video *enc = zap_venc_create(1280, 720, 70 /* quality 1..100 */, 60 /* keyframe interval */, 16 /* hc depth, 0 = fast */);
+zap_venc_threads(enc, 8);   /* optional (needs ZAP_THREADS): same output for any thread count */
 size_t n = zap_venc_frame(enc, y, u, v, 1280, 640, packet, zap_video_bound(enc));   /* one I420 frame -> one packet */
 
 zap_video *dec = zap_vdec_create(1280, 720);
@@ -218,6 +219,7 @@ The formats are `ZAP_BC1`, `ZAP_BC3`, `ZAP_BC4`, `ZAP_BC5` and `ZAP_BC7`. To loa
 | zap_video.h | Use |
 |---|---|
 | `zap_venc_create(w, h, quality, keyint, hc_depth)` | Create an encoder. |
+| `zap_venc_threads(enc, n)` | With `ZAP_THREADS`: encode macroblock rows on `n` threads. The packets are byte-identical for any `n`. |
 | `zap_venc_frame(enc, y, u, v, ystride, uvstride, out, cap)` | Encode one frame. Returns the packet size, or 0 if `cap` is too small; a failed call doesn't advance the encoder. |
 | `zap_vdec_create(w, h)` / `zap_vdec_frame(dec, pkt, n)` | Decode one packet. Returns 0, or -1 if the packet is corrupt. |
 | `zap_video_planes(v, &y, &u, &v, &ystride, &uvstride)` | The last decoded frame. Its planes stay valid until the next frame call. |
@@ -283,23 +285,24 @@ These are single runs on an AMD Ryzen 7 5800X (8 cores) with clang 18 `-O3 -marc
 
   astcenc is 2 dB better and about 5× faster. zap's ASTC exists so the whole pipeline works with no dependencies; for shipping, run astcenc and pack its blocks with zap.
 
-**Video:** 1280×720, 150 frames, 30 fps, single thread. The pan clip is a slow zoom and pan across a photo; the second clip is ffmpeg's `testsrc2` pattern. zap uses hc depth 16. The other codecs were encoded with ffmpeg at a matched bitrate and decoded by ffmpeg (`-threads 1`). PSNR is measured on the Y channel by the same code for every codec.
+**Video:** 1280×720, 150 frames, 30 fps, one thread unless noted. The pan clip is a slow zoom and pan across the Windows 11 wallpaper; the second clip is ffmpeg's `testsrc2` pattern. zap uses quality 70 and hc depth 16. The other codecs were encoded with ffmpeg (two-pass) at zap's bitrate and decoded by ffmpeg (`-threads 1`, `-benchmark`). PSNR is measured by the same code for every codec.
 
 | Clip | Codec | kbit/s | PSNR-Y | Decode fps |
 |---|---|---|---|---|
-| pan | **zap q70 (SSE2)** | 1399 | 53.5 dB | **2720** |
-| pan | zap q70, scalar (`ZAP_NO_SIMD`) | 1399 | 53.5 dB | 1085 |
-| pan | MPEG-4 Part 2 (ffmpeg `mpeg4`) | 1128 | 53.5 dB | 2500 |
-| pan | H.264 (x264 medium) | 1205 | 54.2 dB | 962 |
-| testsrc2 | **zap q70 (SSE2)** | 7628 | 48.6 dB | **1762** |
-| testsrc2 | zap q70, scalar | 7628 | 48.6 dB | 779 |
-| testsrc2 | MPEG-4 Part 2 | 8089 | 47.7 dB | 1948 |
-| testsrc2 | H.264 (x264 medium) | 7886 | 59.3 dB | 341 |
+| pan | **zap q70 (SSE2)** | 3194 | **44.4 dB** | **2124** |
+| pan | zap q70, scalar (`ZAP_NO_SIMD`) | 3194 | 44.4 dB | 850 |
+| pan | MPEG-4 Part 2 (ffmpeg `mpeg4`) | 3143 | 43.3 dB | 2113 |
+| pan | H.264 (x264 medium) | 3148 | 51.0 dB | 402 |
+| testsrc2 | **zap q70 (SSE2)** | 7054 | **48.0 dB** | **2146** |
+| testsrc2 | zap q70, scalar | 7054 | 48.0 dB | 784 |
+| testsrc2 | MPEG-4 Part 2 | 7052 | 46.3 dB | 2113 |
+| testsrc2 | H.264 (x264 medium) | 7170 | 56.2 dB | 410 |
 
-- **Compression:** zap is roughly MPEG-4 Part 2 class. It needed about 24% more bits than MPEG-4 on the pan clip and did slightly better on testsrc2. It is far behind H.264.
-- **Decode speed:** zap's SSE2 decoder is 2.3–2.5× its scalar path. It beats ffmpeg's hand-optimised MPEG-4 decoder on the pan clip, is slightly behind it on testsrc2, and is 3–5× faster than ffmpeg's H.264 decoder.
+- **Compression:** zap now beats MPEG-4 Part 2 at the same bitrate, by 1.0 dB on pan and 1.7 dB on testsrc2. It is still far behind H.264.
+- **Rate-distortion encoder:** the encoder chooses coefficient levels and SKIP/INTER/INTRA per macroblock by distortion + λ·bits, with bit costs learned from the previous frame's streams, and its motion search charges for vector bits. Against the previous encoder that's **−24% bitrate on pan and −13% on testsrc2 at equal PSNR** (BD-rate over qualities 30–95). The format didn't change, so old decoders play the new files, and they decode 15–50% faster because there are fewer coefficients.
+- **Decode speed:** zap's SSE2 decoder is 2.5–2.7× its scalar path. It matches ffmpeg's hand-optimised MPEG-4 decoder and is about 5× faster than ffmpeg's H.264 decoder.
 - **Bit-exact:** the SSE2 inverse transform and motion compensation produce identical output to the scalar code, which is tested on 20,000 random blocks. SSE2 is on by default for x64.
-- **Encode speed:** zap encodes at about 270 fps at 720p.
+- **Encode speed:** about 45–60 fps at 720p on one thread, and 150–290 fps with 8 threads (`zap_venc_threads`). Rows encode independently, so the output doesn't depend on the thread count.
 - **Why use it:** the appeal is a small, dependency-free decoder that's hardened against bad input, not the compression ratio.
 
 ### zap vs LZ4 vs zstd
@@ -402,7 +405,7 @@ On Windows, CMake builds `zap_viewer` and fetches Dear ImGui v1.92.7 with FetchC
   - SIMD is SSE2 only; there's no NEON (ARM) path yet, so ARM uses the scalar code.
   - Motion vectors reach at most 64 pixels.
   - Chroma motion is rounded to half-pixel.
-  - The encoder and decoder are single-threaded.
+  - The decoder is single-threaded (the encoder can use threads).
   - The format is not compatible with any standard codec, so play it with `zap_video.h`.
 - **zap_viewer:** Windows only. Its source decoder is Media Foundation, which may use several threads, so its per-frame source decode time isn't a like-for-like single-core comparison.
 

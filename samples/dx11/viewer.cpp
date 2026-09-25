@@ -616,6 +616,7 @@ static void video_step() {
         static const int depth[3] = { 0, 8, 16 };
         zap_video_destroy(v.enc);
         v.enc = zap_venc_create(v.w, v.h, v.quality, v.keyint, depth[v.packing]);
+        zap_venc_threads(v.enc, (int)std::max(1u, std::thread::hardware_concurrency()));
         v.pkt.resize(zap_video_bound(v.enc));
         v.rebuild = false;
     }

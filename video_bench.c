@@ -1,7 +1,9 @@
 /* video_bench.c - video self-test and benchmark.
  *   video_bench                          self-test (bit-exactness encoder vs decoder, fuzz)
- *   video_bench in.yuv w h [frames]      benchmark on raw I420 (ffmpeg -i x.mp4 -pix_fmt yuv420p -f rawvideo in.yuv)
+ *   video_bench in.yuv w h [frames]      benchmark on raw I420 (ffmpeg -i x.mp4 -pix_fmt yuv420p -f rawvideo in.yuv);
+ *                                        also encodes with 8 threads and checks the output is identical
  */
+#define ZAP_THREADS
 #include "zap_video.h"
 #undef NDEBUG /* the self-tests are asserts: keep them in release builds */
 #include <assert.h>
@@ -90,9 +92,11 @@ static void selftest(void) {
     for (int cfg = 0; cfg < 4; cfg++) {
         int quality = cfg & 1 ? 90 : 40, depth = cfg & 2 ? 8 : 0;
         zap_video *e = zap_venc_create(W, H, quality, 5, depth), *d = zap_vdec_create(W, H), *fz = zap_vdec_create(W, H);
-        assert(e && d && fz);
+        zap_video *et = zap_venc_create(W, H, quality, 5, depth); /* threaded: must produce the same bytes */
+        assert(e && d && fz && et);
+        zap_venc_threads(et, 1 + cfg);
         size_t cap = zap_video_bound(e);
-        uint8_t *pkt = malloc(cap), *bad = malloc(cap);
+        uint8_t *pkt = malloc(cap), *bad = malloc(cap), *pkt2 = malloc(cap);
         double se = 0;
         for (int f = 0; f < F; f++) {
             /* a too-small output buffer fails without advancing the encoder */
@@ -100,6 +104,7 @@ static void selftest(void) {
             assert(zap_venc_frame(e, yb[f], ub[f], vb[f], W, W / 2, pkt, ZAP__VHDR + 8) == 0);
             size_t n = zap_venc_frame(e, yb[f], ub[f], vb[f], W, W / 2, pkt, cap);
             assert(n > 0);
+            assert(zap_venc_frame(et, yb[f], ub[f], vb[f], W, W / 2, pkt2, cap) == n && !memcmp(pkt, pkt2, n));
             assert(zap_vdec_frame(d, pkt, n) == 0);
             same(e, d, W, H);
             const uint8_t *py, *pu, *pv; int ys, cs;
@@ -116,7 +121,8 @@ static void selftest(void) {
             if (f % 5 == 0) { assert(r == 0); same(e, fz, W, H); }
         }
         assert(to_psnr(se, (double)W * H * F) > (quality > 50 ? 36 : 28));
-        free(pkt); free(bad);
+        free(pkt); free(bad); free(pkt2);
+        zap_video_destroy(et);
         zap_video_destroy(e); zap_video_destroy(d); zap_video_destroy(fz);
     }
     assert(!zap_vdec_create(3, 4) && !zap_venc_create(0, 2, 50, 1, 0)); /* odd / empty sizes rejected */
@@ -156,7 +162,7 @@ int main(int argc, char **argv) {
     }
     fclose(fi);
     printf("\n%s  %dx%d, %d frames (bitrate assumes 30 fps)\n", argv[1], w, h, nf);
-    printf("  quality   kbit/s   PSNR-Y  PSNR-YUV   encode fps   decode fps (1 thread)\n");
+    printf("  quality   kbit/s   PSNR-Y  PSNR-YUV   encode fps   8-thread enc fps   decode fps (1 thread)\n");
     int qs[] = { 30, 50, 70, 85, 95 };
     for (int qi = 0; qi < 5; qi++) {
         zap_video *e = zap_venc_create(w, h, qs[qi], 60, 16);
@@ -171,6 +177,19 @@ int main(int argc, char **argv) {
             p += len[f]; total += len[f];
         }
         double te = now() - t0;
+        zap_video *et = zap_venc_create(w, h, qs[qi], 60, 16);
+        zap_venc_threads(et, 8);
+        uint8_t *tp = malloc(cap);
+        t0 = now();
+        p = pk;
+        for (int f = 0; f < nf; f++) {
+            const uint8_t *y = all + fsz * (size_t)f, *u = y + (size_t)w * h, *vv = u + (size_t)w * h / 4;
+            size_t n = zap_venc_frame(et, y, u, vv, w, w / 2, tp, cap);
+            if (n != len[f] || memcmp(tp, p, n)) { printf("threaded encode differs at frame %d\n", f); return 1; }
+            p += len[f];
+        }
+        double tt = now() - t0;
+        zap_video_destroy(et); free(tp);
         zap_video *d = zap_vdec_create(w, h);
         double sy = 0, suv = 0;
         p = pk; /* pass 1: quality */
@@ -189,8 +208,8 @@ int main(int argc, char **argv) {
             for (int f = 0; f < nf; f++) { zap_vdec_frame(d, p, len[f]); p += len[f]; }
         }
         double td = now() - t0;
-        printf("  %5d  %9.0f   %6.2f    %6.2f   %8.1f     %8.1f\n", qs[qi], total * 8.0 / nf * 30 / 1000,
-               to_psnr(sy, (double)w * h * nf), to_psnr(sy + suv, (double)w * h * nf * 1.5), nf / te, nf * 3 / td);
+        printf("  %5d  %9.0f   %6.2f    %6.2f   %8.1f   %12.1f       %8.1f\n", qs[qi], total * 8.0 / nf * 30 / 1000,
+               to_psnr(sy, (double)w * h * nf), to_psnr(sy + suv, (double)w * h * nf * 1.5), nf / te, nf / tt, nf * 3 / td);
         zap_video_destroy(e); zap_video_destroy(d); free(pk); free(len);
     }
     return 0;

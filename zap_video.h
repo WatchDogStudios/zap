@@ -2,6 +2,7 @@
  * https://github.com/WatchDogStudios/zap   SPDX-License-Identifier: MIT   Copyright (c) 2026 WD Studios Corp.
  *
  *   zap_video *e = zap_venc_create(w, h, quality 1..100, keyint, hc_depth);   hc_depth 0 = fast stream packing
+ *   zap_venc_threads(e, 8);                                   optional, with ZAP_THREADS; output is identical
  *   size_t n = zap_venc_frame(e, y, u, v, ystride, uvstride, pkt, zap_video_bound(e));
  *   zap_video *d = zap_vdec_create(w, h);
  *   if (zap_vdec_frame(d, pkt, n) == 0) zap_video_planes(d, &y, &u, &v, &ystride, &uvstride);
@@ -22,6 +23,7 @@
 #define ZAP_VIDEO_H
 
 #include "zap.h"
+#include <math.h>
 
 /* SSE2 (always on for x64) for the decoder's inverse transform and motion compensation, and the
    encoder's SAD. Bit-exact with the scalar code. Define ZAP_NO_SIMD to force scalar. */
@@ -32,6 +34,12 @@
 
 enum { ZAP__VPAD = 32, ZAP__VCPAD = 16, ZAP__VMV = 128, ZAP__VHDR = 36 }; /* VMV: max |mv| in half-pels */
 enum { ZAP__SKIP = 0, ZAP__INTER = 1, ZAP__INTRA = 2 };
+#ifndef ZAP__VLAMBDA
+#define ZAP__VLAMBDA 0.12f /* encoder rate-distortion trade-off: lambda = K * step^2 */
+#endif
+#ifndef ZAP__VLM
+#define ZAP__VLM 1.0f /* motion search: SAD + VLM * sqrt(lambda) * vector bits */
+#endif
 
 typedef struct {
     int w, h, mbw, mbh, cw, ch, ys, cs, nmb;
@@ -43,6 +51,10 @@ typedef struct {
     /* encoder only */
     int enc, quality, keyint, depth;
     uint8_t *src[3], *tmp;
+    int threads;
+    size_t *rowlen;                /* per macroblock row: mv bytes, coef bytes */
+    int16_t *pmv;                  /* previous frame's vectors: search seeds that keep rows independent */
+    float bits[4][256];            /* estimated bits per byte: [0] I coefs, [1] P coefs, [2] modes, [3] mvs (from the last frame) */
     zap_state *st;
     zap_hc_state *hc;
 } zap_video;
@@ -88,7 +100,7 @@ static inline void zap_video_destroy(zap_video *v) {
     for (int f = 0; f < 2; f++) for (int p = 0; p < 3; p++) free(v->mem[f][p]);
     for (int p = 0; p < 3; p++) free(v->src[p]);
     free(v->tmp);
-    free(v->modes); free(v->mvs); free(v->coefs); free(v->mbmv); free(v->st); free(v->hc);
+    free(v->modes); free(v->mvs); free(v->coefs); free(v->mbmv); free(v->st); free(v->hc); free(v->rowlen); free(v->pmv);
     free(v);
 }
 
@@ -119,12 +131,16 @@ static inline zap_video *zap_vdec_create(int w, int h) { return zap__vcreate(w, 
 static inline zap_video *zap_venc_create(int w, int h, int quality, int keyint, int hc_depth) {
     zap_video *v = zap__vcreate(w, h);
     if (!v) return NULL;
+    for (int t = 0; t < 4; t++) for (int i = 0; i < 256; i++) v->bits[t][i] = 8;
     v->enc = 1; v->quality = quality; v->keyint = keyint < 1 ? 1 : keyint; v->depth = hc_depth;
     for (int p = 0; p < 3; p++) v->src[p] = (uint8_t *)malloc(p ? (size_t)(v->cw / 2) * (size_t)(v->ch / 2) : (size_t)v->cw * (size_t)v->ch);
     v->tmp = (uint8_t *)malloc(v->cap_coefs + 256);
+    v->rowlen = (size_t *)malloc(2 * sizeof(size_t) * (size_t)v->mbh);
+    v->pmv = (int16_t *)calloc((size_t)v->nmb, 2 * sizeof(int16_t));
+    v->threads = 1;
     if (hc_depth) v->hc = (zap_hc_state *)malloc(sizeof *v->hc);
     else v->st = (zap_state *)malloc(sizeof *v->st);
-    if (!v->src[0] || !v->src[1] || !v->src[2] || !v->tmp || (hc_depth ? !v->hc : !v->st)) { zap_video_destroy(v); return NULL; }
+    if (!v->src[0] || !v->src[1] || !v->src[2] || !v->tmp || !v->rowlen || !v->pmv || (hc_depth ? !v->hc : !v->st)) { zap_video_destroy(v); return NULL; }
     return v;
 }
 
@@ -383,8 +399,8 @@ static const float ZAP__FCT[8][8] = { /* ZAP__IC transposed */
     { 1448.f, -400.f, -1892.f, 1138.f, 1448.f, -1703.f, -784.f, 2009.f }, { 1448.f, -1138.f, -784.f, 2009.f, -1448.f, -400.f, 1892.f, -1703.f },
     { 1448.f, -1703.f, 784.f, 400.f, -1448.f, 2009.f, -1892.f, 1138.f }, { 1448.f, -2009.f, 1892.f, -1703.f, 1448.f, -1138.f, 784.f, -400.f } };
 
-static inline int zap__vfdctq(const int *res, const float *inv, float round, int16_t *q) {
-    float t[64], o[64];
+static inline void zap__vfdct(const int *res, const float *inv, float *o) {
+    float t[64];
 #ifdef ZAP__SSE2
     for (int m = 0; m < 8; m++) { /* t[m][:] = sum_n x[m][n] * C[:][n] */
         __m128 lo = _mm_setzero_ps(), hi = _mm_setzero_ps();
@@ -408,28 +424,89 @@ static inline int zap__vfdctq(const int *res, const float *inv, float round, int
     for (int u = 0; u < 8; u++)
         for (int vv = 0; vv < 8; vv++) { float a = 0; for (int m = 0; m < 8; m++) a += ZAP__IC[u][m] * t[m * 8 + vv]; o[u * 8 + vv] = a * inv[u * 8 + vv]; }
 #endif
-    int nz = 0;
-    for (int i = 0; i < 64; i++) {
-        float v = o[i];
-        int l = (int)(v < 0 ? -(-v + round) : v + round);
-        l = l < -32767 ? -32767 : l > 32767 ? 32767 : l;
-        q[i] = (int16_t)l;
-        nz += l != 0;
+}
+
+/* bits for one run/level token, from the byte cost table */
+static inline float zap__vtok(const float *tb, int run, int c) {
+    int a = c < 0 ? -c : c;
+    if (run < 8 && a <= 8) return tb[run << 4 | (c < 0 ? c + 8 : c + 7)];
+    return tb[0x81 + run] + 16;
+}
+
+/* Rate-distortion quantization of one block. o = DCT coefficients in units of step, so the pixel-domain
+   squared error of a level l is (o - l)^2 * step^2 (the transform is orthonormal). Starts from rounding,
+   then walks back from the last coefficient lowering each level by one or to zero when that lowers
+   distortion + lam * bits, then compares with dropping the whole block. Returns the block's cost
+   D + lam * R and writes the levels (all zero if dropped). */
+static inline float zap__vrdoq(const float *o, const uint8_t *step, float lam, const float *tb, int16_t *q) {
+    float a[64], w[64], d0 = 0;
+    int l[64], sg[64], last = -1;
+    for (int k = 0; k < 64; k++) {
+        float v = o[ZAP__ZZ[k]];
+        sg[k] = v < 0; a[k] = v < 0 ? -v : v; w[k] = (float)step[ZAP__ZZ[k]] * (float)step[ZAP__ZZ[k]];
+        l[k] = a[k] > 32767 ? 32767 : (int)(a[k] + 0.5f);
+        d0 += a[k] * a[k] * w[k];
+        if (l[k]) last = k;
     }
-    return nz;
+    memset(q, 0, 64 * sizeof *q);
+    if (last < 0) return d0;
+#define ZAP__T(r, k, lv) zap__vtok(tb, (r), sg[k] ? -(lv) : (lv))
+    for (int k = last, nxt = -1; k >= 0; k--) {
+        if (!l[k]) continue;
+        int prev = k - 1;
+        while (prev >= 0 && !l[prev]) prev--;
+        int run = k - prev - 1, lv = l[k];
+        float e = a[k] - (float)lv, rest = nxt >= 0 ? ZAP__T(nxt - k - 1, nxt, l[nxt]) : 0;
+        float best = e * e * w[k] + lam * (ZAP__T(run, k, lv) + rest);
+        int bl = lv;
+        if (lv > 1) {
+            float e1 = e + 1, j = e1 * e1 * w[k] + lam * (ZAP__T(run, k, lv - 1) + rest);
+            if (j < best) { best = j; bl = lv - 1; }
+        }
+        float jz = a[k] * a[k] * w[k] + lam * (nxt >= 0 ? ZAP__T(nxt - prev - 1, nxt, l[nxt]) : 0);
+        if (jz < best) bl = 0;
+        l[k] = bl;
+        if (bl) nxt = k;
+    }
+    float d = 0, r = tb[0x80];
+    for (int k = 0, run = 0; k < 64; k++) {
+        float e = a[k] - (float)l[k];
+        d += e * e * w[k];
+        if (!l[k]) { run++; continue; }
+        r += ZAP__T(run, k, l[k]);
+        run = 0;
+    }
+#undef ZAP__T
+    if (d + lam * r >= d0) return d0;
+    for (int k = 0; k < 64; k++) q[ZAP__ZZ[k]] = (int16_t)(sg[k] ? -l[k] : l[k]);
+    return d + lam * r;
+}
+
+/* bits of a motion vector component, and refresh a byte cost table from a stream the frame produced */
+static inline float zap__vmvbits(const float *tb, int d) { return d >= -127 && d <= 127 ? tb[d & 0xFF] : tb[0x80] + 16; }
+static inline void zap__vlearn(float *tb, const uint8_t *s, size_t n) {
+    if (n < 64) return; /* too little data to estimate from: keep the old table */
+    size_t cnt[256] = { 0 };
+    for (size_t i = 0; i < n; i++) cnt[s[i]]++;
+    for (int i = 0; i < 256; i++) {
+        float b = cnt[i] ? log2f((float)n / (float)cnt[i]) : log2f((float)n) + 2;
+        tb[i] = b < 1 ? 1 : b > 16 ? 16 : b;
+    }
 }
 
 /* predictive + logarithmic full-pel search, then half-pel refinement. Vectors in half-pels. */
 static inline int zap__vsearch(const zap_video *v, const uint8_t *sb, const uint8_t *ref, int x, int y, int px, int py,
-                               int tx, int ty, int *bx, int *by) {
+                               const int16_t *seeds, int ns, float lm, int *bx, int *by) {
+    /* cost = SAD + lm * bits of the vector (coded as a delta from the left neighbour px, py) */
+#define ZAP__MC(hx_, hy_) (int)(lm * (zap__vmvbits(v->bits[3], (hx_) - px) + zap__vmvbits(v->bits[3], (hy_) - py)))
     int lx, hx, ly, hy;
     zap__vmvrange(v, x, y, &lx, &hx, &ly, &hy);
     int flx = -zap__floor2(-lx), fhx = zap__floor2(hx), fly = -zap__floor2(-ly), fhy = zap__floor2(hy); /* full-pel range */
-    int cx[3] = { 0, zap__floor2(px), zap__floor2(tx) }, cy[3] = { 0, zap__floor2(py), zap__floor2(ty) };
     int best = 1 << 30, fx = 0, fy = 0;
-    for (int i = 0; i < 3; i++) {
-        int mx = zap__vclampi(cx[i], flx, fhx), my = zap__vclampi(cy[i], fly, fhy);
-        int s = zap__vsad(sb, v->cw, ref + (y + my) * v->ys + x + mx, v->ys, 16);
+    for (int i = -2; i < ns; i++) { /* zero, left neighbour, then the seeds */
+        int sx = i == -2 ? 0 : i == -1 ? px : seeds[2 * i], sy = i == -2 ? 0 : i == -1 ? py : seeds[2 * i + 1];
+        int mx = zap__vclampi(zap__floor2(sx), flx, fhx), my = zap__vclampi(zap__floor2(sy), fly, fhy);
+        int s = zap__vsad(sb, v->cw, ref + (y + my) * v->ys + x + mx, v->ys, 16) + ZAP__MC(2 * mx, 2 * my);
         if (s < best) { best = s; fx = mx; fy = my; }
     }
     static const int DX[8] = { 1, -1, 0, 0, 1, 1, -1, -1 }, DY[8] = { 0, 0, 1, -1, 1, -1, 1, -1 };
@@ -440,7 +517,7 @@ static inline int zap__vsearch(const zap_video *v, const uint8_t *sb, const uint
             for (int d = 0; d < 4; d++) {
                 int mx = ox + DX[d] * step, my = oy + DY[d] * step;
                 if (mx < flx || mx > fhx || my < fly || my > fhy) continue;
-                int s = zap__vsad(sb, v->cw, ref + (y + my) * v->ys + x + mx, v->ys, 16);
+                int s = zap__vsad(sb, v->cw, ref + (y + my) * v->ys + x + mx, v->ys, 16) + ZAP__MC(2 * mx, 2 * my);
                 if (s < best) { best = s; fx = mx; fy = my; moved = 1; }
             }
         }
@@ -451,9 +528,10 @@ static inline int zap__vsearch(const zap_video *v, const uint8_t *sb, const uint
         int mx = cx0 + DX[d], my = cy0 + DY[d];
         if (mx < lx || mx > hx || my < ly || my > hy) continue;
         zap__vpred(ref, v->ys, x, y, mx, my, 16, tmp);
-        int s = zap__vsad(sb, v->cw, tmp, 16, 16);
+        int s = zap__vsad(sb, v->cw, tmp, 16, 16) + ZAP__MC(mx, my);
         if (s < best) { best = s; *bx = mx; *by = my; }
     }
+#undef ZAP__MC
     return best;
 }
 
@@ -473,6 +551,129 @@ static inline size_t zap__vpack(zap_video *v, const uint8_t *s, size_t n, uint8_
 }
 
 /* returns packet size, 0 on failure (cap too small). Planes: y is w x h, u/v are w/2 x h/2. */
+/* one macroblock row. Rows share nothing within a frame (intra blocks don't predict from neighbours and
+   vectors are coded against the left neighbour), so they can be encoded in any order or in parallel. */
+typedef struct {
+    zap_video *v;
+    int key;
+    uint8_t steps[3][64], *rec[3], *ref[3];
+    float inv[3][64], lam, lm;
+} zap__vjob;
+
+static inline void zap__vrow(zap__vjob *j, int my) {
+    zap_video *v = j->v;
+    int key = j->key, ccw = v->cw / 2;
+    uint8_t (*steps)[64] = j->steps, **rec = j->rec, **ref = j->ref;
+    float (*inv)[64] = j->inv, lam = j->lam, lm = j->lm;
+    size_t rmv = 6 * (size_t)v->mbw, rcf = (size_t)v->mbw * 6 * (64 * 3 + 1); /* per-row slots of the stream buffers */
+    uint8_t *pm = v->modes + (size_t)my * v->mbw, *pv0 = v->mvs + my * rmv, *pc0 = v->coefs + my * rcf, *pv = pv0, *pc = pc0;
+        for (int mx = 0; mx < v->mbw; mx++) {
+            int i = my * v->mbw + mx, x = mx * 16, yy = my * 16, mvx = 0, mvy = 0;
+            int px = mx ? v->mbmv[2 * (i - 1)] : 0, py = mx ? v->mbmv[2 * (i - 1) + 1] : 0;
+            const uint8_t *sb = v->src[0] + (size_t)yy * v->cw + x, *sp[6];
+            int ss[6], cbp[2] = { 0, 0 };
+            for (int b = 0; b < 6; b++) {
+                int p = b < 4 ? 0 : b - 3, bx = b < 4 ? x + (b & 1) * 8 : x / 2, by = b < 4 ? yy + (b >> 1) * 8 : yy / 2;
+                ss[b] = p ? ccw : v->cw; sp[b] = v->src[p] + (size_t)by * ss[b] + bx;
+            }
+            /* candidates: [0] intra, [1] inter at the searched vector; each block rate-distortion quantized.
+               Costs are distortion (pixel SSE) + lam * estimated bits. */
+            int16_t q[2][6][64];
+            uint8_t pry[256], pru[64], prv[64];
+            float J[3] = { 0, 1e30f, 1e30f }; /* intra, inter, skip */
+            const float *ctb = v->bits[key ? 0 : 1];
+            int try_intra = key, sad = 0;
+            if (!key) {
+                int16_t seeds[10]; /* previous frame's vectors around this macroblock (the current frame's rows run independently) */
+                int ns = 0, mean = 0, act = 0;
+                static const int8_t NB[5][2] = { { 0, 0 }, { 0, -1 }, { 0, 1 }, { -1, 0 }, { 1, 0 } };
+                for (int k = 0; k < 5; k++) {
+                    int nx = mx + NB[k][0], ny = my + NB[k][1];
+                    if (nx < 0 || ny < 0 || nx >= v->mbw || ny >= v->mbh) continue;
+                    seeds[2 * ns] = v->pmv[2 * (ny * v->mbw + nx)]; seeds[2 * ns + 1] = v->pmv[2 * (ny * v->mbw + nx) + 1]; ns++;
+                }
+                sad = zap__vsearch(v, sb, ref[0], x, yy, px, py, seeds, ns, lm, &mvx, &mvy);
+                for (int r = 0; r < 16; r++) for (int c = 0; c < 16; c++) mean += sb[r * v->cw + c];
+                mean = (mean + 128) >> 8;
+                for (int r = 0; r < 16; r++) for (int c = 0; c < 16; c++) { int d = sb[r * v->cw + c] - mean; act += d < 0 ? -d : d; }
+                try_intra = act < 2 * sad; /* intra only has a chance when the block is flat relative to the prediction error */
+            }
+            if (!try_intra) J[0] = 1e30f;
+            else for (int b = 0; b < 6; b++) {
+                int res[64];
+                float o[64];
+                for (int r = 0; r < 8; r++) for (int c = 0; c < 8; c++) res[r * 8 + c] = sp[b][r * ss[b] + c] - 128;
+                zap__vfdct(res, inv[b < 4 ? 0 : 1], o);
+                float jb = zap__vrdoq(o, steps[b < 4 ? 0 : 1], lam, ctb, q[0][b]);
+                J[0] += jb;
+                for (int k = 0; k < 64; k++) if (q[0][b][k]) { cbp[0] |= 1 << b; break; }
+            }
+            if (!key) {
+                int smx = mvx, smy = mvy, plx, phx, ply, phy;
+                zap__vmvrange(v, x, yy, &plx, &phx, &ply, &phy);
+                for (int cand = 0; cand < 3; cand++) { /* searched vector, zero vector (the skip candidate), predicted vector (free to code) */
+                    int cx = cand == 0 ? smx : cand == 1 ? 0 : px, cy = cand == 0 ? smy : cand == 1 ? 0 : py;
+                    if (cand && ((cx == smx && cy == smy) || (cand == 2 && ((!cx && !cy) || cx < plx || cx > phx || cy < ply || cy > phy)))) continue;
+                    if (cand) {
+                        uint8_t t[256];
+                        zap__vpred(ref[0], v->ys, x, yy, cx, cy, 16, t);
+                        if (zap__vsad(sb, v->cw, t, 16, 16) > sad + sad / 4 + 64) continue;
+                    }
+                    zap__vpredmb(v, ref, x, yy, cx, cy, pry, pru, prv);
+                    float jd = 0, jskip = 0;
+                    int16_t qq[6][64];
+                    int cb = 0;
+                    for (int b = 0; b < 6; b++) {
+                        const uint8_t *pr = b < 4 ? pry + (b >> 1) * 128 + (b & 1) * 8 : b == 4 ? pru : prv;
+                        int ps = b < 4 ? 16 : 8, res[64];
+                        float o[64], e2 = 0;
+                        for (int r = 0; r < 8; r++) for (int c = 0; c < 8; c++) {
+                            int d = sp[b][r * ss[b] + c] - pr[r * ps + c];
+                            res[r * 8 + c] = d; e2 += (float)(d * d);
+                        }
+                        jskip += e2;
+                        zap__vfdct(res, inv[2], o);
+                        jd += zap__vrdoq(o, steps[2], lam, ctb, qq[b]);
+                        for (int k = 0; k < 64; k++) if (qq[b][k]) { cb |= 1 << b; break; }
+                    }
+                    if (!cx && !cy) J[2] = jskip + lam * v->bits[2][ZAP__SKIP];
+                    float jm = jd + lam * (v->bits[2][ZAP__INTER | cb << 2] + zap__vmvbits(v->bits[3], cx - px) + zap__vmvbits(v->bits[3], cy - py));
+                    if (!cx && !cy && !cb) jm = 1e30f; /* that's the skip candidate */
+                    if (jm < J[1]) { J[1] = jm; memcpy(q[1], qq, sizeof qq); cbp[1] = cb; mvx = cx; mvy = cy; }
+                }
+                if (try_intra) J[0] += lam * v->bits[2][ZAP__INTRA | cbp[0] << 2];
+            }
+            int mode = J[2] <= J[0] && J[2] <= J[1] ? ZAP__SKIP : J[1] < J[0] ? ZAP__INTER : ZAP__INTRA;
+            int m = mode == ZAP__INTRA ? 0 : 1, cb = mode == ZAP__SKIP ? 0 : cbp[m];
+            if (mode != ZAP__INTER) mvx = mvy = 0;
+            const uint8_t *pred[6] = { 0 };
+            uint8_t *dst[6];
+            int ds[6], pst[6];
+            if (mode != ZAP__INTRA) zap__vpredmb(v, ref, x, yy, mvx, mvy, pry, pru, prv);
+            for (int b = 0; b < 6; b++) {
+                int p = b < 4 ? 0 : b - 3, bx = b < 4 ? x + (b & 1) * 8 : x / 2, by = b < 4 ? yy + (b >> 1) * 8 : yy / 2, rs = p ? v->cs : v->ys;
+                dst[b] = rec[p] + by * rs + bx; ds[b] = rs; pst[b] = p ? 8 : 16;
+                if (mode != ZAP__INTRA) pred[b] = p == 0 ? pry + (b >> 1) * 128 + (b & 1) * 8 : p == 1 ? pru : prv;
+            }
+            *pm++ = (uint8_t)(mode | cb << 2);
+            if (mode == ZAP__INTER) { pv = zap__vputmv(pv, mvx - px); pv = zap__vputmv(pv, mvy - py); }
+            v->mbmv[2 * i] = (int16_t)mvx; v->mbmv[2 * i + 1] = (int16_t)mvy;
+            for (int b = 0; b < 6; b++) { /* reconstruct exactly like the decoder */
+                const uint8_t *st = mode == ZAP__INTRA ? steps[b < 4 ? 0 : 1] : steps[2];
+                if (cb >> b & 1) { pc = zap__vput(pc, q[m][b]); zap__vidct(q[m][b], st, pred[b], pst[b], dst[b], ds[b]); }
+                else if (pred[b]) zap__vcopy(dst[b], ds[b], pred[b], pst[b], 8);
+                else zap__vfill(dst[b], ds[b], 8);
+            }
+        }
+    v->rowlen[2 * my] = (size_t)(pv - pv0); v->rowlen[2 * my + 1] = (size_t)(pc - pc0);
+}
+
+#ifdef ZAP_THREADS
+static inline void zap__vrows(void *p, int t, int n) { zap__vjob *j = (zap__vjob *)p; for (int r = t; r < j->v->mbh; r += n) zap__vrow(j, r); }
+/* encode with up to n threads (default 1). Output is identical for any thread count. */
+static inline void zap_venc_threads(zap_video *v, int n) { v->threads = n < 1 ? 1 : n; }
+#endif
+
 static inline size_t zap_venc_frame(zap_video *v, const uint8_t *y, const uint8_t *u, const uint8_t *vp, int ystride,
                                     int uvstride, void *out_, size_t cap) {
     uint8_t *out = (uint8_t *)out_;
@@ -487,54 +688,25 @@ static inline size_t zap_venc_frame(zap_video *v, const uint8_t *y, const uint8_
         }
     }
     int key = !v->have_ref || v->frame_no % v->keyint == 0;
-    uint8_t steps[3][64];
-    float inv[3][64];
-    zap__vsteps(v->quality, steps);
-    for (int t = 0; t < 3; t++) for (int i = 0; i < 64; i++) inv[t][i] = 1.0f / (4096.0f * 4096.0f * (float)steps[t][i]);
-    uint8_t *rec[3], *ref[3], *pm = v->modes, *pv = v->mvs, *pc = v->coefs;
-    for (int p = 0; p < 3; p++) { rec[p] = zap__vplane(v, v->cur, p); ref[p] = zap__vplane(v, v->cur ^ 1, p); }
-    int ccw = v->cw / 2;
-    for (int my = 0; my < v->mbh; my++)
-        for (int mx = 0; mx < v->mbw; mx++) {
-            int i = my * v->mbw + mx, x = mx * 16, yy = my * 16, mode = ZAP__INTRA, mvx = 0, mvy = 0, cbp = 0;
-            int px = mx ? v->mbmv[2 * (i - 1)] : 0, py = mx ? v->mbmv[2 * (i - 1) + 1] : 0;
-            const uint8_t *sb = v->src[0] + (size_t)yy * v->cw + x;
-            if (!key) {
-                int tx = my ? v->mbmv[2 * (i - v->mbw)] : 0, ty = my ? v->mbmv[2 * (i - v->mbw) + 1] : 0;
-                int sad = zap__vsearch(v, sb, ref[0], x, yy, px, py, tx, ty, &mvx, &mvy), mean = 0, act = 0;
-                for (int r = 0; r < 16; r++) for (int c = 0; c < 16; c++) mean += sb[r * v->cw + c];
-                mean = (mean + 128) >> 8;
-                for (int r = 0; r < 16; r++) for (int c = 0; c < 16; c++) { int d = sb[r * v->cw + c] - mean; act += d < 0 ? -d : d; }
-                mode = act + 512 < sad ? ZAP__INTRA : ZAP__INTER;
-            }
-            if (mode == ZAP__INTRA) mvx = mvy = 0;
-            uint8_t pry[256], pru[64], prv[64];
-            if (mode == ZAP__INTER) zap__vpredmb(v, ref, x, yy, mvx, mvy, pry, pru, prv);
-            int16_t q[6][64];
-            const uint8_t *pred[6] = { 0 };
-            uint8_t *dst[6];
-            int ds[6], pst[6];
-            for (int b = 0; b < 6; b++) {
-                int p = b < 4 ? 0 : b - 3, bx = b < 4 ? x + (b & 1) * 8 : x / 2, by = b < 4 ? yy + (b >> 1) * 8 : yy / 2;
-                int ss = p ? ccw : v->cw, rs = p ? v->cs : v->ys, res[64];
-                const uint8_t *s = v->src[p] + (size_t)by * ss + bx;
-                dst[b] = rec[p] + by * rs + bx; ds[b] = rs; pst[b] = p ? 8 : 16;
-                if (mode == ZAP__INTER) pred[b] = p == 0 ? pry + (b >> 1) * 128 + (b & 1) * 8 : p == 1 ? pru : prv;
-                for (int r = 0; r < 8; r++)
-                    for (int c = 0; c < 8; c++) res[r * 8 + c] = s[r * ss + c] - (pred[b] ? pred[b][r * pst[b] + c] : 128);
-                if (zap__vfdctq(res, inv[mode == ZAP__INTER ? 2 : p ? 1 : 0], mode == ZAP__INTER ? 0.3f : 0.5f, q[b])) cbp |= 1 << b;
-            }
-            if (mode == ZAP__INTER && !cbp && !mvx && !mvy) mode = ZAP__SKIP;
-            *pm++ = (uint8_t)(mode | cbp << 2);
-            if (mode == ZAP__INTER) { pv = zap__vputmv(pv, mvx - px); pv = zap__vputmv(pv, mvy - py); }
-            v->mbmv[2 * i] = (int16_t)mvx; v->mbmv[2 * i + 1] = (int16_t)mvy;
-            for (int b = 0; b < 6; b++) { /* reconstruct exactly like the decoder */
-                const uint8_t *st = mode == ZAP__INTRA ? steps[b < 4 ? 0 : 1] : steps[2];
-                if (cbp >> b & 1) { pc = zap__vput(pc, q[b]); zap__vidct(q[b], st, pred[b], pst[b], dst[b], ds[b]); }
-                else if (pred[b]) zap__vcopy(dst[b], ds[b], pred[b], pst[b], 8);
-                else zap__vfill(dst[b], ds[b], 8);
-            }
-        }
+    zap__vjob j;
+    j.v = v; j.key = key;
+    zap__vsteps(v->quality, j.steps);
+    for (int t = 0; t < 3; t++) for (int i = 0; i < 64; i++) j.inv[t][i] = 1.0f / (4096.0f * 4096.0f * (float)j.steps[t][i]);
+    /* ponytail: one lambda per frame from the flat step, K tuned on the README clips */
+    j.lam = ZAP__VLAMBDA * (float)j.steps[2][0] * (float)j.steps[2][0]; j.lm = ZAP__VLM * sqrtf(j.lam);
+    for (int p = 0; p < 3; p++) { j.rec[p] = zap__vplane(v, v->cur, p); j.ref[p] = zap__vplane(v, v->cur ^ 1, p); }
+#ifdef ZAP_THREADS
+    if (v->threads > 1) zap__par(zap__threads(v->threads, (size_t)v->mbh), zap__vrows, &j);
+    else
+#endif
+    for (int r = 0; r < v->mbh; r++) zap__vrow(&j, r);
+    /* join the rows' mv and coef slots into contiguous streams */
+    size_t rmv = 6 * (size_t)v->mbw, rcf = (size_t)v->mbw * 6 * (64 * 3 + 1), nmv = 0, ncf = 0;
+    for (int r = 0; r < v->mbh; r++) {
+        memmove(v->mvs + nmv, v->mvs + r * rmv, v->rowlen[2 * r]); nmv += v->rowlen[2 * r];
+        memmove(v->coefs + ncf, v->coefs + r * rcf, v->rowlen[2 * r + 1]); ncf += v->rowlen[2 * r + 1];
+    }
+    uint8_t *pm = v->modes + v->nmb, *pv = v->mvs + nmv, *pc = v->coefs + ncf;
     zap__vextend(v, v->cur);
     /* header: "ZV" type quality w h, 3 method bytes, pad, then (raw, stored) sizes for modes / mvs / coefs */
     out[0] = 'Z'; out[1] = 'V'; out[2] = (uint8_t)(key ? 'I' : 'P'); out[3] = (uint8_t)v->quality;
@@ -547,6 +719,10 @@ static inline size_t zap_venc_frame(zap_video *v, const uint8_t *y, const uint8_
         if ((c = zap__vpack(v, streams[s], lens[s], out + pos, cap - pos, out + 8 + s, out + 12 + 8 * s)) == (size_t)-1) return 0;
         pos += c;
     }
+    /* success: only now update the state the next frame's decisions depend on */
+    zap__vlearn(v->bits[key ? 0 : 1], v->coefs, lens[2]);
+    if (!key) { zap__vlearn(v->bits[2], v->modes, lens[0]); zap__vlearn(v->bits[3], v->mvs, lens[1]); }
+    memcpy(v->pmv, v->mbmv, 2 * sizeof(int16_t) * (size_t)v->nmb);
     v->cur ^= 1; v->have_ref = 1; v->frame_no++;
     return pos;
 }
