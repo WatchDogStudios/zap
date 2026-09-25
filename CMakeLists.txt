@@ -56,6 +56,9 @@ if(PROJECT_IS_TOP_LEVEL)
       target_include_directories(zap_viewer_codecs PUBLIC ${lz4_SOURCE_DIR}/lib ${zstd_SOURCE_DIR}/lib)
       target_compile_definitions(zap_viewer_codecs PRIVATE ZSTD_DISABLE_ASM)
       target_link_libraries(zap_viewer PRIVATE zap_viewer_codecs)
+      add_executable(zap_compare tools/compare.c) # zap vs LZ4 / zstd (and your Oodle DLL, --oodle) on one file
+      target_link_libraries(zap_compare PRIVATE zap zap_viewer_codecs)
+      target_compile_definitions(zap_compare PRIVATE _CRT_SECURE_NO_WARNINGS)
     endif()
   endif()
 

@@ -1,20 +1,37 @@
-/* compare.c - zap vs LZ4 vs zstd on one file: same 4MB blocks, one thread, best of several runs.
+/* compare.c - zap vs LZ4 vs zstd (vs Oodle) on one file: same blocks, one thread, best of several runs.
  *
- * Needs LZ4 (lz4.h, lz4hc.h + library) and zstd (zstd.h + library or sources). Example (Windows, clang):
- *   clang -O3 -march=native -I. -Ipath/to/lz4/include -Ipath/to/zstd tools/compare.c <zstd .c files> path/to/lz4.lib -o compare.exe
- * Linux:  cc -O3 -march=native -I. tools/compare.c -llz4 -lzstd -o compare
- *   compare <file> [block_kb=4096]
+ * On Windows CMake builds it as zap_compare (with the LZ4 and zstd it fetches for the viewer). Elsewhere:
+ *   cc -O3 -march=native -I. tools/compare.c -llz4 -lzstd -ldl -o compare
+ *   compare [--only substring] [--oodle path/to/oo2core_9_win64.dll] <file> [block_kb=4096]
+ * Oodle is optional and never shipped: point --oodle (or ZAP_OODLE_DLL) at a library you're licensed to use.
  */
 #include "zap.h"
 #include <lz4.h>
 #include <lz4hc.h>
 #include <zstd.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#define zap_dlopen(p) (void *)LoadLibraryA(p)
+#define zap_dlsym(h, n) (void *)GetProcAddress((HMODULE)(h), n)
+#else
+#include <dlfcn.h>
+#define zap_dlopen(p) dlopen(p, RTLD_NOW)
+#define zap_dlsym(h, n) dlsym(h, n)
+#endif
+
+/* Oodle 2.6-2.9 exports */
+typedef long long (*oodle_compress_t)(int, const void *, long long, void *, int, const void *, const void *, const void *, void *, long long);
+typedef long long (*oodle_decompress_t)(const void *, long long, void *, long long, int, int, int, void *, long long, void *, void *, void *, long long, int);
+static oodle_compress_t oo_c;
+static oodle_decompress_t oo_d;
 
 static double now(void) { struct timespec t; timespec_get(&t, TIME_UTC); return t.tv_sec + t.tv_nsec * 1e-9; }
 
-enum { ZAP_FAST, ZAP_HC, LZ4_FAST, LZ4_HC, ZSTD };
+enum { ZAP_FAST, ZAP_HC, LZ4_FAST, LZ4_HC, ZSTD, OODLE };
+#define OO(c, l) ((c) << 4 | (l)) /* Oodle compressor (8 Kraken, 9 Mermaid, 11 Selkie, 13 Leviathan) and level (6 = Optimal2) */
 typedef struct { const char *name; int kind, level; } codec;
 
 static const uint8_t *g_src;
@@ -29,7 +46,7 @@ static size_t blk(size_t b) { return b == g_nb - 1 ? g_n - b * g_bs : g_bs; }
 static void compress_all(const codec *c) {
     for (size_t b = 0; b < g_nb; b++) {
         const uint8_t *s = g_src + b * g_bs;
-        size_t len = blk(b), cap = zap_bound(len) + 1024, r = 0;
+        size_t len = blk(b), cap = zap_bound(len) + 1024 + 512 * (len / 262144 + 1), r = 0;
         uint8_t *d = g_c[b];
         int depth = c->level & ~ZAP_ENTROPY, e = (c->level & ZAP_ENTROPY) != 0;
         switch (c->kind) {
@@ -40,6 +57,7 @@ static void compress_all(const codec *c) {
         case LZ4_FAST: r = (size_t)LZ4_compress_default((const char *)s, (char *)d, (int)len, (int)cap); break;
         case LZ4_HC: r = (size_t)LZ4_compress_HC((const char *)s, (char *)d, (int)len, (int)cap, c->level); break;
         case ZSTD: r = ZSTD_compress(d, cap, s, len, c->level); break;
+        case OODLE: { long long z = oo_c(c->level >> 4, s, (long long)len, d, c->level & 15, NULL, NULL, NULL, NULL, 0); r = z > 0 ? (size_t)z : 0; break; }
         }
         g_cs[b] = r;
     }
@@ -57,6 +75,7 @@ static int decompress_all(const codec *c) {
             break;
         case LZ4_FAST: case LZ4_HC: r = LZ4_decompress_safe((const char *)g_c[b], (char *)o, (int)g_cs[b], (int)len); break;
         case ZSTD: r = (long long)ZSTD_decompress(o, len, g_c[b], g_cs[b]); break;
+        case OODLE: r = oo_d(g_c[b], (long long)g_cs[b], o, (long long)len, 1, 0, 0, NULL, 0, NULL, NULL, NULL, 0, 3); break;
         }
         if (r != (long long)len) return -1;
     }
@@ -64,7 +83,19 @@ static int decompress_all(const codec *c) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "compare <file> [block_kb]\n"); return 1; }
+    const char *only = NULL, *oodle = getenv("ZAP_OODLE_DLL");
+    int a = 1;
+    for (; a + 1 < argc && argv[a][0] == '-' && argv[a][1] == '-'; a += 2) {
+        if (!strcmp(argv[a], "--only")) only = argv[a + 1];
+        else if (!strcmp(argv[a], "--oodle")) oodle = argv[a + 1];
+    }
+    argv += a - 1; argc -= a - 1;
+    if (argc < 2) { fprintf(stderr, "compare [--only substring] [--oodle oo2core.dll] <file> [block_kb]\n"); return 1; }
+    if (oodle) {
+        void *h = zap_dlopen(oodle);
+        if (h) { oo_c = (oodle_compress_t)zap_dlsym(h, "OodleLZ_Compress"); oo_d = (oodle_decompress_t)zap_dlsym(h, "OodleLZ_Decompress"); }
+        if (!oo_c || !oo_d) { fprintf(stderr, "can't use Oodle from %s\n", oodle); return 1; }
+    }
     FILE *f = fopen(argv[1], "rb");
     if (!f) { perror(argv[1]); return 1; }
     fseek(f, 0, SEEK_END); g_n = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
@@ -75,7 +106,7 @@ int main(int argc, char **argv) {
     g_bs = (argc > 2 ? (size_t)atoi(argv[2]) : 4096) << 10;
     g_nb = (g_n + g_bs - 1) / g_bs;
     g_c = malloc(g_nb * sizeof *g_c); g_cs = malloc(g_nb * sizeof *g_cs); g_out = malloc(g_n);
-    for (size_t b = 0; b < g_nb; b++) g_c[b] = malloc(zap_bound(g_bs) + 1024);
+    for (size_t b = 0; b < g_nb; b++) g_c[b] = malloc(zap_bound(g_bs) + 1024 + 512 * (g_bs / 262144 + 1));
     g_state = malloc(sizeof(zap_hc_state));
     g_scratch = malloc(zap_entropy_scratch(g_bs));
     const codec codecs[] = {
@@ -83,16 +114,18 @@ int main(int argc, char **argv) {
         { "zap fast", ZAP_FAST, 0 }, { "zap hc16", ZAP_HC, 16 }, { "zap hc64", ZAP_HC, 64 }, { "zap hc64 -x", ZAP_HC, 64 | ZAP_FAST_DECODE },
         { "zstd 1", ZSTD, 1 }, { "zstd 3", ZSTD, 3 }, { "zstd 9", ZSTD, 9 }, { "zstd 19", ZSTD, 19 },
         { "zap fast+entropy", ZAP_FAST, ZAP_ENTROPY }, { "zap hc16+entropy", ZAP_HC, 16 | ZAP_ENTROPY }, { "zap hc64+entropy", ZAP_HC, 64 | ZAP_ENTROPY }, { "zap hc64+entropy -x", ZAP_HC, 64 | ZAP_ENTROPY | ZAP_FAST_DECODE },
+        { "oodle selkie 6", OODLE, OO(11, 6) }, { "oodle mermaid 6", OODLE, OO(9, 6) }, { "oodle kraken 6", OODLE, OO(8, 6) }, { "oodle leviathan 6", OODLE, OO(13, 6) },
     };
     printf("%s: %.1f MB, %zu KB blocks, 1 thread, best of runs\n", argv[1], g_n / 1e6, g_bs >> 10);
     printf("  %-18s %6s  %10s  %12s\n", "codec", "ratio", "compress", "decompress");
     for (size_t k = 0; k < sizeof codecs / sizeof codecs[0]; k++) {
         const codec *c = &codecs[k];
+        if ((c->kind == OODLE && !oo_c) || (only && !strstr(c->name, only))) continue;
         double tc = 1e30, td = 1e30;
-        int reps = (c->kind == LZ4_HC && c->level >= 12) || (c->kind == ZSTD && c->level >= 12) || (c->kind == ZAP_HC && (c->level & 0xFFFF) > 16) ? 1 : 3;
+        int reps = (c->kind == LZ4_HC && c->level >= 12) || (c->kind == ZSTD && c->level >= 12) || (c->kind == ZAP_HC && (c->level & 0xFFFF) > 16) || c->kind == OODLE ? 1 : 3;
         for (int r = 0; r < reps; r++) { double t0 = now(); compress_all(c); double t = now() - t0; if (t < tc) tc = t; }
         size_t total = 0;
-        for (size_t b = 0; b < g_nb; b++) { if (!g_cs[b] || ZSTD_isError(g_cs[b])) { printf("  %s: compress failed\n", c->name); return 1; } total += g_cs[b]; }
+        for (size_t b = 0; b < g_nb; b++) { if (!g_cs[b] || (c->kind == ZSTD && ZSTD_isError(g_cs[b]))) { printf("  %s: compress failed\n", c->name); return 1; } total += g_cs[b]; }
         for (int r = 0; r < 7; r++) {
             double t0 = now();
             if (decompress_all(c)) { printf("  %s: decompress failed\n", c->name); return 1; }

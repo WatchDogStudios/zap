@@ -388,7 +388,7 @@ These are single runs on an AMD Ryzen 7 5800X (8 cores) with clang 18 `-O3 -marc
 
 ### zap vs LZ4 vs zstd
 
-These results use the same 92.6 MB binary corpus, split into 4 MB blocks, on one thread, taking the best of several runs, with only light background load. Reproduce them with [`tools/compare.c`](tools/compare.c). zstd 1.5.2 was built from source without its x64 assembly Huffman decoder, which may cost its decompressor some speed.
+(Measured with zap 1.2; 1.3's entropy version 2 is smaller and somewhat slower to decode, see the Oodle comparison below.) These results use the same 92.6 MB binary corpus, split into 4 MB blocks, on one thread, taking the best of several runs, with only light background load. Reproduce them with [`tools/compare.c`](tools/compare.c). zstd 1.5.2 was built from source without its x64 assembly Huffman decoder, which may cost its decompressor some speed.
 
 | Codec | Ratio | Compress | Decompress |
 |---|---|---|---|
@@ -409,7 +409,22 @@ These results use the same 92.6 MB binary corpus, split into 4 MB blocks, on one
 - **Entropy mode:** it compresses smaller than zstd 9 at the same decode speed. zstd 19 still compresses smaller (2.73), because zap has no FSE/ANS entropy coder and no larger-scale parsing yet. zap's compressor is also much slower than zstd's at similar ratios.
 - **Plain format:** it compresses a little smaller than LZ4-HC, and LZ4 decodes about 1.3–1.5× faster. At matched ratio (`ZAP_FAST_DECODE`, 2.05 vs lz4hc 12's 2.02), zap decodes at about 78% of LZ4's speed.
 - **What's left of the plain gap:** an LZ4-format decoder written in zap's style runs about 14% slower than LZ4's own decoder on the same data. That's what zap's decoder hardening costs (every copy is bounds-checked and output is exact-size). The rest comes from zap's 8 MB match window and its 2- or 3-byte offsets.
-- **Oodle:** measured with `zap_viewer`'s Package tab on a 225 MB Source-engine VPK from Portal Revolution (uncompressed game data: textures, models, sounds), 4 MB blocks, with Oodle 2.8 (`oo2ext_8_win64.dll`) as shipped by a game. Ratios are exact. Decode speeds are single-thread and were measured while other work was running, so treat them as rough.
+- **Oodle, zap 1.3 (entropy version 2):** a 32 MB sample of the same VPK (8 evenly spaced 4 MB pieces), 4 MB blocks, one thread, measured with `zap_compare --oodle` (`tools/compare.c`, built by CMake on Windows). Oodle 2.8 at Optimal2 (level 6).
+
+  | Codec | Ratio | Decode |
+  |---|---|---|
+  | zap hc64 | 2.528 | 2.5 GB/s |
+  | lz4hc 12 | 2.565 | 5.0 GB/s |
+  | Oodle Selkie | 2.600 | 5.8 GB/s |
+  | zap hc64 + entropy (1.2) | 2.876 | 1.6 GB/s |
+  | **zap hc64 + entropy (1.3)** | **3.045** | 1.3 GB/s |
+  | Oodle Mermaid | 3.054 | 3.2 GB/s |
+  | zstd 19 | 3.074 | 0.9 GB/s |
+  | Oodle Kraken | 3.300 | 1.8 GB/s |
+  | Oodle Leviathan | 3.358 | 1.2 GB/s |
+
+  Entropy version 2 (three repeat offsets tracked by the optimal parser, low offset bits entropy coded) is +5.9% on this data and draws level with Mermaid's ratio, but Mermaid decodes 2.4× faster and Kraken is 8% smaller and 1.4× faster. Oodle still dominates every tier here. The measured gaps, in order: the decoder's per-sequence cost (the Huffman streams are only a third of decode time), weaker match finding (lz4hc 12 beats zap hc64's ratio at the same 64 KB window; a deeper search reaches 3.10), and a parser that prices bytes but not decode time (limiting zap's window to 1 MB makes plain decode 35% faster for 0.7% ratio).
+- **Oodle, zap 1.2:** measured with `zap_viewer`'s Package tab on a 225 MB Source-engine VPK from Portal Revolution (uncompressed game data: textures, models, sounds), 4 MB blocks, with Oodle 2.8 (`oo2ext_8_win64.dll`) as shipped by a game. Ratios are exact. Decode speeds are single-thread and were measured while other work was running, so treat them as rough.
 
   | Codec | Ratio | Decode (1 thread) |
   |---|---|---|
@@ -448,11 +463,11 @@ A frame looks like this (all fields little-endian):
 
 A block whose stored size equals its raw size is stored uncompressed.
 
-With `ZAP_ENTROPY`, the magic is `"ZAP2"` and each block starts with a method byte: 0 raw, 1 plain, 2 entropy. An entropy block is laid out like this:
+With `ZAP_ENTROPY`, the magic is `"ZAP2"` and each block starts with a method byte: 0 raw, 1 plain, 2 entropy. Since 1.3 an entropy block is version 2 (the top bit of its first word is set):
 
 ```
-u32 n_literals  u32 n_sequences  u32 n_length_bytes  u32 n_extra_bytes
-4 streams: literals, tokens, length bytes, offset codes
+u32 n_literals | 1 << 31  u32 n_sequences  u32 n_length_bytes  u32 n_extra_bytes  u32 n_low_nibbles
+5 streams: literals, tokens, length bytes, offset codes, offset low nibbles
    each: u8 method (0 raw, 1 Huffman) + u32 size + data
    Huffman = 128 bytes of 4-bit code lengths (max 11), u32 sizes of sub-streams 0-2, then 4 bitstreams
    (the symbols split into 4 contiguous quarters, decoded in parallel)
@@ -460,7 +475,8 @@ offset extra bits (LSB-first)
 ```
 
 - **Tokens:** same as the plain format (4-bit literal length, 4-bit match length − 4, with 15 continuing as 255-runs in the length stream).
-- **Offset codes:** code 0 repeats the previous offset. Code c in 1..23 means an offset in [2^(c−1), 2^c), followed by c−1 extra bits.
+- **Offset codes:** 0, 1 and 2 reuse one of the three most recent offsets, which then moves to the front. Code 3 + k is a new offset in [2^k, 2^(k+1)). For k ≥ 4 its low 4 bits come from the low-nibble stream and the k − 4 bits above them are extra bits; otherwise it has k extra bits. Aligned game data (DXT blocks, vertex strides, PCM frames) makes the low nibbles very predictable: on the VPK sample below they cost 1.5 bits instead of 4.
+- **Version 1** blocks (zap 1.1–1.2: header without `n_low_nibbles`, 4 streams, one repeat offset as code 0, code c ≥ 1 an offset in [2^(c−1), 2^c) with c − 1 extra bits) still decode.
 - **End of block:** literals left over after the last sequence end the block.
 
 ### .zappak
