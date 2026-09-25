@@ -39,7 +39,9 @@
 
 #define ZAP_HLOG 16
 #define ZAP_HC_HLOG 17
-#define ZAP_WINDOW_LOG 23
+#ifndef ZAP_WINDOW_LOG
+#define ZAP_WINDOW_LOG 23 /* max match distance 2^23 - 1 (the format allows 23; smaller = compressor-side limit) */
+#endif
 #define ZAP_MAX_DIST (((size_t)1 << ZAP_WINDOW_LOG) - 1)
 #define ZAP_FRAME_MAGIC 0x3150415Au /* "ZAP1" */
 
@@ -214,12 +216,146 @@ static inline size_t zap__hc_find(zap_hc_state *s, const uint8_t *src, const uin
     return best;
 }
 
-/* depth: chain steps per position. 16 = quick, 64 = good default, 1024+ = max effort */
+/* ---------------- optimal parse (zap_compress_hc with depth >= ZAP_OPT_DEPTH)
+ * Shortest path over a window of positions: every match length the match finder offers, priced by what it
+ * costs to encode (bytes for the plain format, estimated Huffman bits for entropy mode), plus a small
+ * per-sequence penalty so ties go to fewer, longer matches - which also decode faster. */
+#define ZAP_OPT_DEPTH 32
+#define ZAP_FAST_DECODE (1 << 17) /* OR into depth (>= ZAP_OPT_DEPTH): ~2 bytes per sequence penalty -> ~15% faster decode, ~3.5% bigger */
+#define ZAP__SEQ_PENALTY(depth) ((depth) & ZAP_FAST_DECODE ? 256u : 8u)
+enum { ZAP__OPTN = 2048, ZAP__SUFF = 64, ZAP__MAXC = 24 };
+
+typedef struct { uint32_t len, off; } zap__match;
+typedef struct { uint32_t price, len, off, lit, rep; } zap__opt;
+
+/* prices in 1/16 bit */
+typedef struct {
+    int entropy;
+    uint32_t lit[256], tok[256], oc[24], lenb, seq;
+} zap__cost;
+
+static inline void zap__cost_plain(zap__cost *c, uint32_t seq) {
+    memset(c, 0, sizeof *c);
+    for (int i = 0; i < 256; i++) { c->lit[i] = 128; c->tok[i] = 128; }
+    c->lenb = 128; c->seq = seq;
+}
+
+/* matches at ip with strictly increasing length (repeat offset first); inserts every position up to ip */
+static inline int zap__hc_all(zap_hc_state *s, const uint8_t *src, const uint8_t *ip, const uint8_t *iend, const zap_dict *d,
+                              int depth, size_t *next, size_t rep, zap__match *m) {
+    const size_t mask = ((size_t)1 << ZAP_WINDOW_LOG) - 1, pos = (size_t)(ip - src);
+    for (size_t p = *next; p < pos; p++) {
+        uint32_t h = zap__hash(zap__r32(src + p), ZAP_HC_HLOG);
+        s->prev[p & mask] = s->head[h]; s->head[h] = (uint32_t)p;
+    }
+    if (pos > *next) *next = pos;
+    uint32_t seq = zap__r32(ip);
+    size_t best = 3, c = s->head[zap__hash(seq, ZAP_HC_HLOG)];
+    int n = 0;
+    if (rep && rep <= pos && zap__r32(ip - rep) == seq) {
+        best = 4 + zap__count(ip + 4, ip - rep + 4, iend);
+        m[n].len = (uint32_t)best; m[n].off = (uint32_t)rep; n++;
+    }
+    while (c != 0xFFFFFFFFu && c >= pos) c = s->prev[c & mask]; /* position revisited: skip newer entries */
+    while (c < pos && pos - c <= ZAP_MAX_DIST && depth-- > 0 && ip + best < iend) {
+        const uint8_t *q = src + c;
+        if (q[best] == ip[best] && zap__r32(q) == seq) {
+            size_t l = 4 + zap__count(ip + 4, q + 4, iend);
+            if (l > best) {
+                best = l;
+                if (n == ZAP__MAXC) n--;
+                m[n].len = (uint32_t)l; m[n].off = (uint32_t)(pos - c); n++;
+            }
+        }
+        c = s->prev[c & mask];
+    }
+    if (d) {
+        size_t o, l = zap__dmatch(d, ip, src, iend, &o);
+        if (l > best) { if (n == ZAP__MAXC) n--; m[n].len = (uint32_t)l; m[n].off = (uint32_t)o; n++; }
+    }
+    return n;
+}
+
+static inline uint32_t zap__ext_bytes(size_t v) { return v < 15 ? 0 : (uint32_t)((v - 15) / 255 + 1); }
+
+static inline uint32_t zap__match_price(const zap__cost *c, size_t len, size_t off, size_t lit, size_t rep) {
+    uint32_t p = c->seq + zap__ext_bytes(len - 4) * c->lenb;
+    if (!c->entropy) return p + c->tok[0] + (off < 0x8000 ? 256u : 384u);
+    p += c->tok[(lit < 15 ? lit : 15) << 4 | (len - 4 < 15 ? len - 4 : 15)];
+    if (off == rep) return p + c->oc[0];
+    int k = zap__log2((uint32_t)off);
+    return p + c->oc[k + 1] + 16u * (uint32_t)k;
+}
+
+static inline size_t zap__compress_opt(const uint8_t *src, size_t n, uint8_t *dst, size_t cap, zap_hc_state *s, const zap_dict *d,
+                                       int depth, const zap__cost *cm) {
+    const uint8_t *iend = src + n;
+    uint8_t *op = dst, *oend = dst + cap;
+    zap__opt *opt = (zap__opt *)malloc(sizeof(zap__opt) * (ZAP__OPTN + ZAP__SUFF + 2));
+    zap__match m[ZAP__MAXC];
+    size_t next = 0, anchor = 0, start = 0, rep = 0, limit = n >= 13 ? n - 12 : 0;
+    if (!opt) return 0;
+    memset(s->head, 0xFF, sizeof s->head);
+    while (start < limit) {
+        size_t last = 0, p, fl = 0, fo = 0;
+        opt[0].price = 0; opt[0].len = 0; opt[0].lit = (uint32_t)(start - anchor); opt[0].rep = (uint32_t)rep;
+        for (p = 0; p <= last && p < ZAP__OPTN && start + p < limit; p++) {
+            zap__opt o = opt[p];
+            size_t pos = start + p;
+            /* one more literal */
+            uint32_t lp = o.price + cm->lit[src[pos]] + (zap__ext_bytes(o.lit + 1) - zap__ext_bytes(o.lit)) * cm->lenb;
+            if (p + 1 > last) { opt[p + 1].price = 0xFFFFFFFFu; last = p + 1; }
+            if (lp < opt[p + 1].price) { opt[p + 1].price = lp; opt[p + 1].len = 0; opt[p + 1].lit = o.lit + 1; opt[p + 1].rep = o.rep; }
+            int nm = zap__hc_all(s, src, src + pos, iend, d, depth, &next, o.rep, m);
+            if (nm && m[nm - 1].len >= ZAP__SUFF) { fl = m[nm - 1].len; fo = m[nm - 1].off; break; } /* long match: just take it */
+            for (int i = 0; i < nm; i++) {
+                size_t lo = i ? m[i - 1].len + 1 : 4;
+                for (size_t L = lo; L <= m[i].len; L++) {
+                    uint32_t mp = o.price + zap__match_price(cm, L, m[i].off, o.lit, o.rep);
+                    while (last < p + L) opt[++last].price = 0xFFFFFFFFu;
+                    if (mp < opt[p + L].price) { opt[p + L].price = mp; opt[p + L].len = (uint32_t)L; opt[p + L].off = m[i].off; opt[p + L].lit = 0; opt[p + L].rep = m[i].off; }
+                }
+            }
+        }
+        /* end the window at the furthest settled position reached by a match (or the forced long match) */
+        size_t end = fl ? p : 0;
+        if (!fl) for (size_t e = p < last ? p : last; e > 0; e--) if (opt[e].len) { end = e; break; }
+        if (!end && !fl) { start += p ? p : 1; continue; } /* nothing matched: the literals carry into the next window */
+        /* backtrack: matches along the path to end, then emit them in order */
+        size_t cnt = 0, t = end;
+        while (t > 0) { if (opt[t].len) { cnt++; t -= opt[t].len; } else t--; }
+        size_t *seqs = (size_t *)malloc((cnt + 1) * 3 * sizeof(size_t)), k = cnt;
+        if (!seqs) { free(opt); return 0; }
+        for (t = end; t > 0;) {
+            if (opt[t].len) { k--; seqs[3 * k] = start + t - opt[t].len; seqs[3 * k + 1] = opt[t].len; seqs[3 * k + 2] = opt[t].off; t -= opt[t].len; }
+            else t--;
+        }
+        if (fl) { seqs[3 * cnt] = start + p; seqs[3 * cnt + 1] = fl; seqs[3 * cnt + 2] = fo; cnt++; }
+        for (k = 0; k < cnt; k++) {
+            if (!(op = zap__emit(op, oend, src + anchor, seqs[3 * k] - anchor, seqs[3 * k + 2], seqs[3 * k + 1]))) { free(seqs); free(opt); return 0; }
+            anchor = seqs[3 * k] + seqs[3 * k + 1];
+            rep = seqs[3 * k + 2];
+        }
+        free(seqs);
+        start = anchor;
+    }
+    free(opt);
+    return zap__finish(op, oend, src + anchor, iend, dst);
+}
+
+/* depth: chain steps per position. 16 = quick lazy parse; >= ZAP_OPT_DEPTH (32) = optimal parse (64 = good default) */
 static inline size_t zap_compress_hc(const void *src_, size_t n, void *dst_, size_t cap,
                                      zap_hc_state *s, const zap_dict *d, int depth) {
     const uint8_t *src = (const uint8_t *)src_, *ip = src, *anchor = src, *iend = src + n;
     uint8_t *op = (uint8_t *)dst_, *oend = op + cap;
     size_t next = 0;
+    uint32_t seq = ZAP__SEQ_PENALTY(depth);
+    depth &= 0xFFFF;
+    if (depth >= ZAP_OPT_DEPTH) {
+        zap__cost cm;
+        zap__cost_plain(&cm, seq);
+        return zap__compress_opt(src, n, op, cap, s, d, depth, &cm);
+    }
     memset(s->head, 0xFF, sizeof s->head);
     if (n >= 13) {
         const uint8_t *mflimit = iend - 12;
@@ -289,26 +425,41 @@ static inline ptrdiff_t zap_decompress(const void *src_, size_t n, void *dst_, s
         if (ip >= iend) return -1;
         unsigned tok = *ip++;
         size_t lit = tok >> 4;
-        /* hot path: short literals + short match, lots of headroom -> fixed-size copies, no loops */
-        if (lit < 15 && (tok & 15) < 15 && iend - ip >= 32 && oend - op >= 32) {
+        /* hot path: short literals with headroom -> fixed-size copies */
+        if (lit < 15 && iend - ip >= 32 && oend - op >= 32) {
             memcpy(op, ip, 16);
             op += lit; ip += lit;
             /* branch-free 2/3-byte offset: near/far offsets mix unpredictably in big blocks */
-            size_t v = (size_t)ip[0] | ((size_t)ip[1] << 8), far = v >> 15, ml = (tok & 15) + 4;
-            size_t off = (v & 0x7FFF) | (((size_t)ip[2] << 15) & ((size_t)0 - far));
+            size_t v = (size_t)ip[0] | ((size_t)ip[1] << 8), far = v >> 15, ml = tok & 15;
+            size_t off = (v & 0x7FFF) | (((size_t)ip[2] << 15) & ((size_t)0 - far)), have;
             ip += 2 + far;
-            size_t have = (size_t)(op - ostart);
-            if (off >= 16 && off <= have) {
-                memcpy(op, op - off, 16);
-                memcpy(op + 16, op - off + 16, 2);
-            } else if (off == 0 || off > have + dlen) {
-                return -1;
-            } else if (off >= have + 18) { /* whole match inside dict */
-                memcpy(op, d->data + dlen - (off - have), 18);
+            have = (size_t)(op - ostart);
+            if (ml < 15) { /* short match: one 18-byte copy */
+                ml += 4;
+                if (off >= 16 && off <= have) {
+                    memcpy(op, op - off, 16);
+                    memcpy(op + 16, op - off + 16, 2);
+                } else if (off == 0 || off > have + dlen) {
+                    return -1;
+                } else if (off >= have + 18) { /* whole match inside dict */
+                    memcpy(op, d->data + dlen - (off - have), 18);
+                } else {
+                    zap__dict_copy(op, ostart, oend, d, off, ml);
+                }
+                op += ml;
+                continue;
+            }
+            ml += 4 + zap__ext(&ip, iend, &err); /* long match: 16-byte chunks while there's room */
+            if (err || off == 0 || off > have + dlen || ml > (size_t)(oend - op)) return -1;
+            if (off >= 16 && off <= have && (size_t)(oend - op) >= ml + 16) {
+                const uint8_t *m = op - off;
+                uint8_t *e = op + ml;
+                do { memcpy(op, m, 16); op += 16; m += 16; } while (op < e);
+                op = e;
             } else {
                 zap__dict_copy(op, ostart, oend, d, off, ml);
+                op += ml;
             }
-            op += ml;
             continue;
         }
         if (lit == 15) { lit += zap__ext(&ip, iend, &err); if (err) return -1; }
@@ -584,13 +735,50 @@ static inline size_t zap__e_encode(const uint8_t *lz, size_t lzn, size_t raw, ui
     return r;
 }
 
-/* depth 0: fast parse (state = zap_state*), else hc chain depth (state = zap_hc_state*). 0 = doesn't fit in cap. */
+/* entropy-mode prices from a finished parse: Huffman code lengths of each stream, unseen symbols priced high */
+static inline void zap__cost_from_lz(const uint8_t *lz, size_t lzn, zap__cost *c, uint32_t seq) {
+    uint32_t fl[256] = { 0 }, ft[256] = { 0 }, fo[256] = { 0 }, fx = 0, nx = 0;
+    uint8_t len[256];
+    size_t rep = 0;
+    for (const uint8_t *ip = lz, *ie = lz + lzn;;) {
+        unsigned tok = *ip++;
+        size_t ll = tok >> 4;
+        if (ll == 15) { uint8_t b; do { b = *ip++; ll += b; fx++; } while (b == 255); }
+        for (size_t i = 0; i < ll; i++) fl[ip[i]]++;
+        ip += ll;
+        if (ip >= ie) break;
+        size_t off = (size_t)ip[0] | ((size_t)ip[1] << 8);
+        ip += 2;
+        if (off & 0x8000) off = (off & 0x7FFF) | ((size_t)*ip++ << 15);
+        if ((tok & 15) == 15) { uint8_t b; do { b = *ip++; fx++; } while (b == 255); }
+        ft[tok]++; nx++;
+        fo[off == rep ? 0 : zap__log2((uint32_t)off) + 1]++;
+        rep = off;
+    }
+    memset(c, 0, sizeof *c);
+    c->entropy = 1;
+    zap__hlens(fl, len); for (int i = 0; i < 256; i++) c->lit[i] = 16u * (len[i] ? len[i] : ZAP__HMAX + 2);
+    zap__hlens(ft, len); for (int i = 0; i < 256; i++) c->tok[i] = 16u * (len[i] ? len[i] : ZAP__HMAX + 2);
+    zap__hlens(fo, len); for (int i = 0; i < 24; i++) c->oc[i] = 16u * (len[i] ? len[i] : ZAP__HMAX + 2);
+    c->lenb = 16 * 7; c->seq = seq;
+    (void)fx; (void)nx;
+}
+
+/* depth 0: fast parse (state = zap_state*), else hc chain depth (state = zap_hc_state*). 0 = doesn't fit in cap.
+   depth >= ZAP_OPT_DEPTH: two optimal parses, the second priced with the first one's Huffman code lengths. */
 static inline size_t zap_compress_entropy(const void *src, size_t n, void *dst, size_t cap, void *state, int depth, const zap_dict *d) {
     size_t lcap = zap_bound(n), r = 0;
     uint8_t *lz = (uint8_t *)malloc(lcap);
     if (!lz) return 0;
+    uint32_t seq = ZAP__SEQ_PENALTY(depth);
+    int fd = depth & ZAP_FAST_DECODE;
     depth &= 0xFFFF;
-    size_t ln = depth ? zap_compress_hc(src, n, lz, lcap, (zap_hc_state *)state, d, depth) : zap_compress(src, n, lz, lcap, (zap_state *)state, d);
+    size_t ln = depth ? zap_compress_hc(src, n, lz, lcap, (zap_hc_state *)state, d, depth | fd) : zap_compress(src, n, lz, lcap, (zap_state *)state, d);
+    if (ln && depth >= ZAP_OPT_DEPTH) {
+        zap__cost cm;
+        zap__cost_from_lz(lz, ln, &cm, seq);
+        ln = zap__compress_opt((const uint8_t *)src, n, lz, lcap, (zap_hc_state *)state, d, depth, &cm);
+    }
     if (ln) r = zap__e_encode(lz, ln, n, (uint8_t *)dst, cap);
     free(lz);
     return r;
@@ -705,7 +893,8 @@ static inline size_t zap__block2(const uint8_t *src, size_t len, uint8_t *dst, s
     if (len >= 2) {
         ln = depth ? zap_compress_hc(src, len, lz, lcap, (zap_hc_state *)st, d, depth) : zap_compress(src, len, lz, lcap, (zap_state *)st, d);
         if (ln && ln < best) { best = ln; m = 1; }
-        if (ln && best > 1) en = zap__e_encode(lz, ln, len, e, best - 1);
+        if ((depth & 0xFFFF) >= ZAP_OPT_DEPTH && best > 1) en = zap_compress_entropy(src, len, e, best - 1, st, depth, d); /* its own, entropy-priced parse */
+        else if (ln && best > 1) en = zap__e_encode(lz, ln, len, e, best - 1);
         if (en && en < best) { best = en; m = 2; }
     }
     size_t r = 0;
@@ -728,7 +917,7 @@ static inline size_t zap_frame_compress(const void *src_, size_t n, void *dst_, 
     const uint8_t *src = (const uint8_t *)src_;
     uint8_t *dst = (uint8_t *)dst_;
     int v2 = (depth & ZAP_ENTROPY) != 0;
-    depth &= 0xFFFF;
+    depth = depth & 0xFFFF ? depth & ~ZAP_ENTROPY : 0;
     size_t nb, pos = zap__frame_hdr(dst, cap, n, bs, &nb, v2), hdr = pos;
     if (!pos) return 0;
     void *st = malloc(depth ? sizeof(zap_hc_state) : sizeof(zap_state));
@@ -882,7 +1071,7 @@ static inline size_t zap_frame_compress_mt(const void *src_, size_t n, void *dst
     size_t nb, pos = zap__frame_hdr(dst, cap, n, bs, &nb, v2), hdr = pos;
     if (!pos) return 0;
     size_t slot = v2 ? (nb == 1 ? n : bs) + 1 : bs;
-    zap__cjob j = { src, (uint8_t *)malloc(v2 ? nb * slot + 1 : n + 1), n, bs, nb, (size_t *)malloc((nb ? nb : 1) * sizeof(size_t)), slot, depth & 0xFFFF, v2, d };
+    zap__cjob j = { src, (uint8_t *)malloc(v2 ? nb * slot + 1 : n + 1), n, bs, nb, (size_t *)malloc((nb ? nb : 1) * sizeof(size_t)), slot, depth & 0xFFFF ? depth & ~ZAP_ENTROPY : 0, v2, d };
     if (!j.tmp || !j.cs) { free(j.tmp); free(j.cs); return 0; }
     for (size_t b = 0; b < nb; b++) j.cs[b] = SIZE_MAX;
     zap__par(zap__threads(threads, nb), zap__cwork, &j);

@@ -32,9 +32,9 @@ Fractal zooms are close to worst-case content for zap. Here zap needs about 4× 
 **zap.h:**
 
 - **One header, no dependencies.** Drop `zap.h` into your project.
-- **Fast decode.** About 1.5–2 GB/s per core, and 5–8 GB/s across 8 threads on packaged data.
-- **Two compressors, one format.** `fast` runs at hundreds of MB/s for runtime use. `hc` is slower but gives smaller files for offline packaging. The same decoder reads both.
-- **Entropy mode.** It re-codes the matches as Huffman streams, with a repeat-offset code. On the benchmark data it compresses about 15% smaller (ratio 2.09 → 2.41) and decodes at about 0.7–0.85 GB/s, the same class as zstd levels 3–9.
+- **Fast decode.** About 2.3–3.2 GB/s per core (3.6 GB/s with `ZAP_FAST_DECODE`), and 9–11 GB/s across 8 threads on packaged data.
+- **Two compressors, one format.** `fast` runs at hundreds of MB/s for runtime use. `hc` is slower but gives smaller files for offline packaging. At depth 32 and up it runs an optimal parser, which picks the cheapest set of matches for the whole block rather than the best match at each position. That gives smaller files *and* faster decoding. The same decoder reads all of them.
+- **Entropy mode.** It re-codes the matches as Huffman streams, with a repeat-offset code. With the optimal parser (two passes, the second priced with the first's Huffman code lengths) it reaches ratio 2.52 at 1.3 GB/s decode, ahead of zstd 9 (2.47 at the same speed).
 - **Safe on untrusted input.** Every read and write in the decoder is bounds-checked, and it only writes inside the output buffer you give it. It's fuzzed under AddressSanitizer and UBSan in CI.
 - **Packet dictionaries.** Train a shared dictionary once, then compress 50–200 byte packets that would otherwise barely shrink.
 - **Parallel frames.** Packaging frames hold independent blocks. Compress or decode them on built-in threads, or hand single blocks to your own job system.
@@ -52,7 +52,8 @@ Fractal zooms are close to worst-case content for zap. Here zap needs about 4× 
 size_t cap = zap_frame_bound(n, 4 << 20);
 void  *out = malloc(cap);
 size_t size = zap_frame_compress_mt(asset, n, out, cap, 4 << 20 /* block */, 64 /* hc depth, 0 = fast */, NULL, 8);
-/* smaller files, ~half the decode speed: 64 | ZAP_ENTROPY (writes a version-2 frame; same decode calls) */
+/* depth >= 32 = optimal parse.  | ZAP_ENTROPY: ~20% smaller, ~40% of the decode speed (version-2 frame, same decode calls)
+   | ZAP_FAST_DECODE: fewer, longer matches -> ~15% faster decode, ~3.5% bigger (plain format) */
 
 /* decompress (at runtime) */
 zap_frame f;
@@ -148,7 +149,7 @@ if (zap_vdec_frame(dec, packet, n) == 0) {
 ### Command-line tool
 
 ```sh
-zap c [-e] [-l depth] [-b block_kb] [-t threads] [-D dict] in out   # pack   (depth 0 = fast, default 64; -e entropy mode)
+zap c [-e] [-x] [-l depth] [-b block_kb] [-t threads] [-D dict] in out   # pack (depth 0 = fast, >= 32 optimal parse, default 64; -e entropy, -x faster decode)
 zap d [-t threads] [-D dict] in out                            # unpack
 zap train [-s dict_bytes] dict.bin samples...                  # train a packet dictionary
 zap tex [-f bc1|bc3|bc4|bc5|bc7] [-r rdo] [-m] [-S] w h in.rgba out.dds  # raw RGBA8 -> DDS (-m mip chain, -S sRGB)
@@ -182,7 +183,7 @@ The view is split: drag the line to move it, zoom with the mouse wheel, pan with
 | Function | Use |
 |---|---|
 | `zap_compress(src, n, dst, cap, state, dict)` | Fast block compressor. Returns the size, or 0 if the output didn't fit in `cap`. |
-| `zap_compress_hc(src, n, dst, cap, hc_state, dict, depth)` | Slower, stronger compressor, same format. `depth`: 16 is quick, 64 is a good default, 1024+ is maximum effort. |
+| `zap_compress_hc(src, n, dst, cap, hc_state, dict, depth)` | Slower, stronger compressor, same format. `depth` below 32 is a quick lazy parse; 32 and up (`ZAP_OPT_DEPTH`) is the optimal parser, where 64 is a good default. OR in `ZAP_FAST_DECODE` to trade about 3.5% of ratio for about 15% faster decoding. |
 | `zap_decompress(src, n, dst, raw_size, dict)` | Returns `raw_size`, or -1 if the data is corrupt or doesn't produce exactly `raw_size` bytes. |
 | `zap_bound(n)` | Worst-case compressed size of a block. |
 | `zap_frame_compress[_mt](...)` | Self-describing frame of independent blocks. The `_mt` version produces byte-identical output. |
@@ -225,10 +226,11 @@ These are single runs on an AMD Ryzen 7 5800X (8 cores) with clang 18 `-O3 -marc
 
 | Mode | Ratio | Compress 1T / 8T | Decode 1T / 8T |
 |---|---|---|---|
-| fast, 256 KB blocks | 1.74 | 377 / 1330 MB/s | 1953 / 8099 MB/s |
-| fast, 4 MB blocks | 1.77 | 249 / 923 MB/s | 1444 / 5070 MB/s |
-| hc depth 16, 4 MB blocks | 2.05 | 5 / 29 MB/s | 1498 / 6739 MB/s |
-| hc depth 64, 4 MB blocks | 2.09 | 4 / 14 MB/s | 1440 / 5565 MB/s |
+| fast, 256 KB blocks | 1.74 | 447 / 1551 MB/s | 2362 / 11474 MB/s |
+| fast, 4 MB blocks | 1.77 | 359 / 1315 MB/s | 2286 / 9037 MB/s |
+| hc depth 16 (lazy parse), 4 MB blocks | 2.05 | 20 / 39 MB/s | 2460 / 9306 MB/s |
+| hc depth 64 (optimal parse), 4 MB blocks | 2.12 | 3 / 9 MB/s | 2792 / 9717 MB/s |
+| hc depth 64 + entropy, 4 MB blocks | 2.52 | 1 / 3 MB/s | 1303 / 5366 MB/s |
 | *zlib level 6, 4 MB blocks (reference)* | *2.23* | *52 MB/s (1T)* | *447 MB/s (1T)* |
 
 **Networking:** 20,000 synthetic entity-update packets, averaging 85 bytes, 16 KB dictionary.
@@ -287,24 +289,28 @@ These are single runs on an AMD Ryzen 7 5800X (8 cores) with clang 18 `-O3 -marc
 
 ### zap vs LZ4 vs zstd
 
-These results use the same 92.6 MB binary corpus, split into 4 MB blocks, on one thread, taking the best of several runs. Reproduce them with [`tools/compare.c`](tools/compare.c). The machine had another heavy program running at the time, so absolute speeds are low for every codec; compare the rows against each other. zstd 1.5.2 was built from source without its x64 assembly Huffman decoder, which may cost its decompressor some speed.
+These results use the same 92.6 MB binary corpus, split into 4 MB blocks, on one thread, taking the best of several runs, with only light background load. Reproduce them with [`tools/compare.c`](tools/compare.c). zstd 1.5.2 was built from source without its x64 assembly Huffman decoder, which may cost its decompressor some speed.
 
 | Codec | Ratio | Compress | Decompress |
 |---|---|---|---|
-| lz4 1.9.4 | 1.62 | 518 MB/s | 3092 MB/s |
-| lz4hc 12 | 2.02 | 8 MB/s | 2961 MB/s |
-| zap fast | 1.77 | 227 MB/s | 1551 MB/s |
-| zap hc64 | 2.09 | 2 MB/s | 1223 MB/s |
-| zstd 1 | 2.02 | 331 MB/s | 821 MB/s |
-| zstd 3 | 2.26 | 147 MB/s | 754 MB/s |
-| zstd 9 | 2.47 | 37 MB/s | 678 MB/s |
-| zstd 19 | 2.73 | 2 MB/s | 547 MB/s |
-| zap fast + entropy | 2.10 | 132 MB/s | 651 MB/s |
-| zap hc64 + entropy | 2.41 | 2 MB/s | 696 MB/s |
+| lz4 1.9.4 | 1.62 | 814 MB/s | 4863 MB/s |
+| lz4hc 12 | 2.02 | 15 MB/s | 4711 MB/s |
+| zap fast | 1.77 | 412 MB/s | 2441 MB/s |
+| zap hc16 | 2.05 | 25 MB/s | 2734 MB/s |
+| zap hc64 | 2.12 | 4 MB/s | 3155 MB/s |
+| zap hc64 `ZAP_FAST_DECODE` | 2.05 | 4 MB/s | 3645 MB/s |
+| zstd 1 | 2.02 | 558 MB/s | 1294 MB/s |
+| zstd 3 | 2.26 | 257 MB/s | 1290 MB/s |
+| zstd 9 | 2.47 | 80 MB/s | 1327 MB/s |
+| zstd 19 | 2.73 | 6 MB/s | 1057 MB/s |
+| zap fast + entropy | 2.10 | 218 MB/s | 1165 MB/s |
+| zap hc16 + entropy | 2.38 | 24 MB/s | 1303 MB/s |
+| **zap hc64 + entropy** | **2.52** | 2 MB/s | **1311 MB/s** |
 
-- **Plain format:** it compresses a little smaller than LZ4 and LZ4-HC, but LZ4's decoder is about 2× faster. Some of that gap is zap's larger match window (8 MB, against LZ4's 64 KB) and its hardened decoder. The rest is decoder tuning still to do.
-- **Entropy mode:** it sits on the zstd curve, between zstd 3 and zstd 9 on both ratio and decode speed. It doesn't beat zstd. What zap adds is everything else in one header: dictionaries, parallel frames, textures and video.
-- **Oodle:** Oodle is proprietary and wasn't benchmarked. Going by its published figures, Kraken decodes at about 1–1.5 GB/s per core with ratios around or above zstd's middle levels, so zap's entropy mode doesn't match Kraken yet.
+- **Entropy mode:** it compresses smaller than zstd 9 at the same decode speed. zstd 19 still compresses smaller (2.73), because zap has no FSE/ANS entropy coder and no larger-scale parsing yet. zap's compressor is also much slower than zstd's at similar ratios.
+- **Plain format:** it compresses a little smaller than LZ4-HC, and LZ4 decodes about 1.3–1.5× faster. At matched ratio (`ZAP_FAST_DECODE`, 2.05 vs lz4hc 12's 2.02), zap decodes at about 78% of LZ4's speed.
+- **What's left of the plain gap:** an LZ4-format decoder written in zap's style runs about 14% slower than LZ4's own decoder on the same data. That's what zap's decoder hardening costs (every copy is bounds-checked and output is exact-size). The rest comes from zap's 8 MB match window and its 2- or 3-byte offsets.
+- **Oodle:** Oodle is proprietary and wasn't benchmarked. Going by its published figures, Kraken decodes at about 1–1.5 GB/s per core at ratios above zstd's middle levels. zap's entropy mode is now roughly in that range on this data; that's a comparison with published numbers, not a measurement.
 
 ## Format
 
@@ -363,9 +369,9 @@ On Windows, CMake builds `zap_viewer` and fetches Dear ImGui v1.92.7 with FetchC
 
 ## Limitations
 
-- **Compression ratio:** the plain format has no entropy coding. Entropy mode adds Huffman coding, but there's no optimal parsing or finite-state entropy coding (FSE/ANS) yet, so ratios are below zstd's high levels and Kraken's.
-- **Decode speed:** the plain decoder is about half LZ4's speed on the comparison above.
-- **hc speed:** hc compression is slow and limited by memory latency. It's meant for offline builds, where the `_mt` variant helps.
+- **Compression ratio:** entropy mode uses Huffman coding and an optimal parser, but there's no finite-state entropy coding (FSE/ANS) and no long-range matching yet. It beats zstd 9 and falls short of zstd 19.
+- **Decode speed:** the plain decoder is about 1.3–1.5× slower than LZ4 (see the comparison above).
+- **hc speed:** the optimal parser compresses at about 3 MB/s per core (1 MB/s with entropy mode's two passes). It's meant for offline builds. The `_mt` variant helps, though with 32 MB of match-finder state per thread it's limited by memory bandwidth.
 - **Match distance:** matches reach at most 8 MB back. Blocks can be up to 2 GB.
 - **No stored sizes:** the raw block API doesn't record sizes, so store them yourself. Frames do record them.
 - **MSVC:** `ZAP_THREADS` needs MSVC 17.8+ for `<threads.h>`. You can skip it and use `zap_frame_decode_block` from your own threads instead.

@@ -1,5 +1,5 @@
 /* zap.c - command line tool.
- *   zap c [-e] [-l depth] [-b block_kb] [-t threads] [-D dict] in out   pack (depth 0 = fast, default 64; -e entropy mode)
+ *   zap c [-e] [-x] [-l depth] [-b block_kb] [-t threads] [-D dict] in out   pack (depth 0 = fast, >= 32 optimal parse, default 64; -e entropy mode, -x faster decode)
  *   zap d [-t threads] [-D dict] in out                            unpack
  *   zap train [-s dict_bytes] out samples...                       train a packet dictionary (default 16384)
  *   zap tex [-f bc1|bc3|bc4|bc5|bc7] [-r rdo] [-m] [-S] w h in.rgba out.dds  GPU block-compress raw RGBA8 to DDS (-m mips, -S sRGB)
@@ -44,7 +44,7 @@ static void save(const char *path, const void *p, size_t n) {
 }
 
 static int usage(void) {
-    fprintf(stderr, "zap c [-e] [-l depth] [-b block_kb] [-t threads] [-D dict] in out\n"
+    fprintf(stderr, "zap c [-e] [-x] [-l depth] [-b block_kb] [-t threads] [-D dict] in out\n"
                     "zap d [-t threads] [-D dict] in out\n"
                     "zap train [-s bytes] out samples...\n"
                     "zap tex [-f bc1|bc3|bc4|bc5|bc7] [-r rdo] [-m] [-S] w h in.rgba out.dds\n"
@@ -141,10 +141,10 @@ int main(int argc, char **argv) {
     int depth = 64, threads = 8, quality = 70, keyint = 60, fps = 30, i = 2;
     size_t bs = 4 << 20, dsize = 16384;
     float rdo = 0;
-    int entropy = 0, mips = 0, srgb = 0;
+    int entropy = 0, mips = 0, srgb = 0, fastdec = 0;
     for (; i + 1 < argc && argv[i][0] == '-'; i += 2) {
-        if (argv[i][1] == 'e' || argv[i][1] == 'm' || argv[i][1] == 'S') { /* flags without a value */
-            if (argv[i][1] == 'e') entropy = 1; else if (argv[i][1] == 'm') mips = 1; else srgb = 1;
+        if (argv[i][1] == 'e' || argv[i][1] == 'm' || argv[i][1] == 'S' || argv[i][1] == 'x') { /* flags without a value */
+            if (argv[i][1] == 'e') entropy = 1; else if (argv[i][1] == 'm') mips = 1; else if (argv[i][1] == 'x') fastdec = 1; else srgb = 1;
             i--; continue;
         }
         switch (argv[i][1]) {
@@ -191,7 +191,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "c")) {
         size_t cap = zap_frame_bound(n, bs ? bs : 1);
         uint8_t *out = malloc(cap);
-        size_t cn = out ? zap_frame_compress_mt(in, n, out, cap, bs, depth | (entropy ? ZAP_ENTROPY : 0), d, threads) : 0;
+        size_t cn = out ? zap_frame_compress_mt(in, n, out, cap, bs, depth | (entropy ? ZAP_ENTROPY : 0) | (fastdec ? ZAP_FAST_DECODE : 0), d, threads) : 0;
         if (!cn) { fprintf(stderr, "compress failed (bad block size or out of memory)\n"); return 1; }
         save(argv[i + 1], out, cn);
         printf("%zu -> %zu (%.3fx)\n", n, cn, (double)n / cn);

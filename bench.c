@@ -69,6 +69,7 @@ static void selftest(void) {
         roundtrip(buf, 100000, 0, depth);                                      /* incompressible */
         memcpy(buf + 300000, buf, 300000);                                     /* repeat 300KB back: needs the long window */
         assert(roundtrip(buf, N, 0, depth) < N * 6 / 10);
+        if (depth) roundtrip(buf, N, 0, depth | ZAP_FAST_DECODE);
         zap_dict_init(&dict, buf, 5000);                                       /* dict: packet == dict tail + noise */
         uint8_t pkt[600]; memcpy(pkt, buf + 4700, 300); memcpy(pkt + 300, buf + 100, 300); pkt[77] ^= 1;
         roundtrip(pkt, sizeof pkt, &dict, depth);
@@ -77,8 +78,8 @@ static void selftest(void) {
     }
     /* frames: mixed compressible / raw blocks, odd tail; version 1 and version 2 (entropy) */
     for (size_t i = 0; i < N; i++) buf[i] = i < N / 2 ? (uint8_t)(i / 100 + (i % 7 == 0) * (i >> 9)) : (uint8_t)rand();
-    static const int depths[4] = { 0, 16, ZAP_ENTROPY, 16 | ZAP_ENTROPY };
-    for (int di = 0; di < 4; di++) {
+    static const int depths[8] = { 0, 16, 32, 32 | ZAP_FAST_DECODE, ZAP_ENTROPY, 16 | ZAP_ENTROPY, 32 | ZAP_ENTROPY, 32 | ZAP_ENTROPY | ZAP_FAST_DECODE };
+    for (int di = 0; di < 8; di++) {
         int depth = depths[di];
         size_t n = N - 123, cap = zap_frame_bound(n, 65536);
         uint8_t *c = malloc(cap), *o = malloc(n);

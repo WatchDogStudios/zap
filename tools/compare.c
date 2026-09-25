@@ -31,7 +31,7 @@ static void compress_all(const codec *c) {
         const uint8_t *s = g_src + b * g_bs;
         size_t len = blk(b), cap = zap_bound(len) + 1024, r = 0;
         uint8_t *d = g_c[b];
-        int depth = c->level & 0xFFFF, e = (c->level & ZAP_ENTROPY) != 0;
+        int depth = c->level & ~ZAP_ENTROPY, e = (c->level & ZAP_ENTROPY) != 0;
         switch (c->kind) {
         case ZAP_FAST: case ZAP_HC:
             r = e ? zap_compress_entropy(s, len, d, cap, g_state, depth, NULL)
@@ -80,16 +80,16 @@ int main(int argc, char **argv) {
     g_scratch = malloc(zap_entropy_scratch(g_bs));
     const codec codecs[] = {
         { "lz4 1.9.4", LZ4_FAST, 0 }, { "lz4hc 9", LZ4_HC, 9 }, { "lz4hc 12", LZ4_HC, 12 },
-        { "zap fast", ZAP_FAST, 0 }, { "zap hc16", ZAP_HC, 16 }, { "zap hc64", ZAP_HC, 64 },
+        { "zap fast", ZAP_FAST, 0 }, { "zap hc16", ZAP_HC, 16 }, { "zap hc64", ZAP_HC, 64 }, { "zap hc64 -x", ZAP_HC, 64 | ZAP_FAST_DECODE },
         { "zstd 1", ZSTD, 1 }, { "zstd 3", ZSTD, 3 }, { "zstd 9", ZSTD, 9 }, { "zstd 19", ZSTD, 19 },
-        { "zap fast+entropy", ZAP_FAST, ZAP_ENTROPY }, { "zap hc16+entropy", ZAP_HC, 16 | ZAP_ENTROPY }, { "zap hc64+entropy", ZAP_HC, 64 | ZAP_ENTROPY },
+        { "zap fast+entropy", ZAP_FAST, ZAP_ENTROPY }, { "zap hc16+entropy", ZAP_HC, 16 | ZAP_ENTROPY }, { "zap hc64+entropy", ZAP_HC, 64 | ZAP_ENTROPY }, { "zap hc64+entropy -x", ZAP_HC, 64 | ZAP_ENTROPY | ZAP_FAST_DECODE },
     };
     printf("%s: %.1f MB, %zu KB blocks, 1 thread, best of runs\n", argv[1], g_n / 1e6, g_bs >> 10);
     printf("  %-18s %6s  %10s  %12s\n", "codec", "ratio", "compress", "decompress");
     for (size_t k = 0; k < sizeof codecs / sizeof codecs[0]; k++) {
         const codec *c = &codecs[k];
         double tc = 1e30, td = 1e30;
-        int reps = c->level >= 12 || (c->kind == ZAP_HC && !(c->level & ZAP_ENTROPY) && c->level > 16) ? 1 : 3;
+        int reps = (c->kind == LZ4_HC && c->level >= 12) || (c->kind == ZSTD && c->level >= 12) || (c->kind == ZAP_HC && (c->level & 0xFFFF) > 16) ? 1 : 3;
         for (int r = 0; r < reps; r++) { double t0 = now(); compress_all(c); double t = now() - t0; if (t < tc) tc = t; }
         size_t total = 0;
         for (size_t b = 0; b < g_nb; b++) { if (!g_cs[b] || ZSTD_isError(g_cs[b])) { printf("  %s: compress failed\n", c->name); return 1; } total += g_cs[b]; }
