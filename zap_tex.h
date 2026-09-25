@@ -715,7 +715,43 @@ static inline int zap__bc7_err(const uint8_t px[16][4], const uint8_t *blk) {
     return err;
 }
 
-/* best of mode 6, mode 5 and (for opaque blocks) mode 1 over all 64 partitions */
+/* Cheap mode-1 partition ranking: per subset, the squared error left after fitting a line through its colours
+   (trace of the scatter matrix minus its largest eigenvalue) plus the error of 8 even levels along the line
+   (about lambda / 49 for a uniform spread). Built from per-pixel moments {r, g, b, rr, gg, bb, rg, rb, gb}; no
+   quantization, so it ranks partitions for ~2% of the cost of fitting one. */
+static inline float zap__bc7_est1(const float m[16][9], const float tot[9], int part) {
+    float s[2][9];
+    int n1 = 0;
+    for (int j = 0; j < 9; j++) s[1][j] = 0;
+    for (int i = 0; i < 16; i++) if (ZAP__BC7P2[part] >> i & 1) { n1++; for (int j = 0; j < 9; j++) s[1][j] += m[i][j]; }
+    for (int j = 0; j < 9; j++) s[0][j] = tot[j] - s[1][j];
+    float err = 0;
+    for (int k = 0; k < 2; k++) {
+        float n = (float)(k ? n1 : 16 - n1), *v = s[k];
+        if (n < 2) continue;
+        float S[3][3] = { { v[3] - v[0] * v[0] / n, v[6] - v[0] * v[1] / n, v[7] - v[0] * v[2] / n }, { 0, v[4] - v[1] * v[1] / n, v[8] - v[1] * v[2] / n }, { 0, 0, v[5] - v[2] * v[2] / n } };
+        S[1][0] = S[0][1]; S[2][0] = S[0][2]; S[2][1] = S[1][2];
+        float tr = S[0][0] + S[1][1] + S[2][2], ax[3];
+        int r0 = S[0][0] >= S[1][1] && S[0][0] >= S[2][2] ? 0 : S[1][1] >= S[2][2] ? 1 : 2;
+        for (int c = 0; c < 3; c++) ax[c] = S[r0][c]; /* start the power iteration from the dominant column */
+        for (int it = 0; it < 3; it++) {
+            float t[3], mx = 1e-12f;
+            for (int c = 0; c < 3; c++) { t[c] = S[c][0] * ax[0] + S[c][1] * ax[1] + S[c][2] * ax[2]; mx = t[c] > mx ? t[c] : -t[c] > mx ? -t[c] : mx; }
+            for (int c = 0; c < 3; c++) ax[c] = t[c] / mx;
+        }
+        float vv = ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2], vsv = 0;
+        for (int c = 0; c < 3; c++) vsv += ax[c] * (S[c][0] * ax[0] + S[c][1] * ax[1] + S[c][2] * ax[2]);
+        float lam = vv > 1e-12f ? vsv / vv : 0;
+        err += tr - lam * (48.0f / 49.0f);
+    }
+    return err;
+}
+
+#ifndef ZAP__BC7_M1K
+#define ZAP__BC7_M1K 4 /* mode-1 partitions fully fitted after ranking all 64 with zap__bc7_est1 */
+#endif
+
+/* best of mode 6, mode 5 and (for opaque blocks) mode 1 over the best-ranked partitions */
 static inline int zap__bc7_encode(const uint8_t px[16][4], uint8_t out[16]) {
     int err = zap__bc7_m6(px, out), opaque = 1;
     for (int i = 0; i < 16; i++) opaque &= px[i][3] == 255;
@@ -725,8 +761,19 @@ static inline int zap__bc7_encode(const uint8_t px[16][4], uint8_t out[16]) {
     int e5 = zap__bc7_err(px, m5); /* actual decoded error */
     if (e5 < err) { memcpy(out, m5, 16); err = e5; }
     if (!opaque) return err;
-    int bp = -1, be = err;
-    for (int part = 0; part < 64; part++) { int e = zap__bc7_m1(px, part, NULL); if (e < be) { be = e; bp = part; } }
+    float mo[16][9], tot[9] = { 0 }, ce[ZAP__BC7_M1K];
+    int cand[ZAP__BC7_M1K], bp = -1, be = err;
+    for (int i = 0; i < 16; i++) {
+        float r = px[i][0], g = px[i][1], b = px[i][2], v[9] = { r, g, b, r * r, g * g, b * b, r * g, r * b, g * b };
+        for (int j = 0; j < 9; j++) { mo[i][j] = v[j]; tot[j] += v[j]; }
+    }
+    for (int j = 0; j < ZAP__BC7_M1K; j++) { ce[j] = 1e30f; cand[j] = -1; }
+    for (int part = 0; part < 64; part++) {
+        float e = zap__bc7_est1((const float(*)[9])mo, tot, part);
+        for (int j = 0; j < ZAP__BC7_M1K; j++)
+            if (e < ce[j]) { for (int t = ZAP__BC7_M1K - 1; t > j; t--) { ce[t] = ce[t - 1]; cand[t] = cand[t - 1]; } ce[j] = e; cand[j] = part; break; }
+    }
+    for (int j = 0; j < ZAP__BC7_M1K; j++) { int e = zap__bc7_m1(px, cand[j], NULL); if (e < be) { be = e; bp = cand[j]; } }
     if (bp >= 0) {
         uint8_t m1[16];
         zap__bc7_m1(px, bp, m1);
@@ -1235,19 +1282,27 @@ static inline unsigned zap__astc_2means(const uint8_t px[16][4]) {
     return m;
 }
 
-static inline int zap__popc16(unsigned x) { int n = 0; while (x) { n += x & 1; x >>= 1; } return n; }
+static inline int zap__popc16(unsigned x) { /* branch-free */
+    x = x - ((x >> 1) & 0x5555u); x = (x & 0x3333u) + ((x >> 2) & 0x3333u); x = (x + (x >> 4)) & 0x0F0Fu;
+    return (int)((x + (x >> 8)) & 0x1Fu);
+}
 
 /* RGBA8 -> ASTC 4x4 blocks (16 bytes each, zap_bc_size(w, h, ZAP_BC7) bytes). Decode as UNORM (not sRGB). */
 static inline void zap_astc_encode(const uint8_t *rgba, int w, int h, size_t stride, void *out_) {
     uint8_t *out = (uint8_t *)out_;
     zap__isetab tab;
     zap__astc_cfg cfg[8];
-    uint16_t pmask[1024]; /* 2-partition patterns: bit i set = texel i in partition 1 */
+    uint16_t pmask[1024], pseed[1024]; /* usable 2-partition patterns (bit i set = texel i in partition 1) and their seeds */
+    int np = 0;
     zap__isetab_init(&tab);
     zap__astc_cfg_init(&cfg[0], 8, 4, 1); zap__astc_cfg_init(&cfg[1], 8, 3, 1); zap__astc_cfg_init(&cfg[2], 8, 5, 1);
     zap__astc_cfg_init(&cfg[3], 12, 4, 1); zap__astc_cfg_init(&cfg[4], 12, 3, 1); zap__astc_cfg_init(&cfg[5], 12, 2, 1);
     zap__astc_cfg_init(&cfg[6], 8, 3, 2); zap__astc_cfg_init(&cfg[7], 8, 2, 2);
-    for (int sd = 0; sd < 1024; sd++) { unsigned m = 0; for (int i = 0; i < 16; i++) m |= (unsigned)zap__astc_part(sd, i & 3, i >> 2, 2) << i; pmask[sd] = (uint16_t)m; }
+    for (int sd = 0; sd < 1024; sd++) {
+        unsigned m = 0;
+        for (int i = 0; i < 16; i++) m |= (unsigned)zap__astc_part(sd, i & 3, i >> 2, 2) << i;
+        if (m && m != 0xFFFFu) { pmask[np] = (uint16_t)m; pseed[np++] = (uint16_t)sd; } /* skip degenerate patterns */
+    }
     int bw = (w + 3) / 4, bh = (h + 3) / 4;
     for (int by = 0; by < bh; by++)
         for (int bx = 0; bx < bw; bx++) {
@@ -1268,19 +1323,17 @@ static inline void zap_astc_encode(const uint8_t *rgba, int w, int h, size_t str
             if (opaque && best > 16 * 3 * 4) { /* 2 partitions: patterns closest to the 2-means split, fully fitted */
                 unsigned km = zap__astc_2means((const uint8_t(*)[4])px);
                 int cand[4] = { -1, -1, -1, -1 }, cd[4] = { 99, 99, 99, 99 };
-                for (int sd = 0; sd < 1024; sd++) {
-                    int pc = zap__popc16(pmask[sd]);
-                    if (pc == 0 || pc == 16) continue; /* degenerate pattern */
-                    int dd = zap__popc16(pmask[sd] ^ km), di = 16 - dd;
+                for (int pi = 0; pi < np && cd[3]; pi++) { /* stops early once 4 exact matches are found */
+                    int dd = zap__popc16(pmask[pi] ^ km), di = 16 - dd;
                     int dist = dd < di ? dd : di;
-                    for (int j = 0; j < 4; j++) if (dist < cd[j]) { for (int t = 3; t > j; t--) { cd[t] = cd[t - 1]; cand[t] = cand[t - 1]; } cd[j] = dist; cand[j] = sd; break; }
+                    for (int j = 0; j < 4; j++) if (dist < cd[j]) { for (int t = 3; t > j; t--) { cd[t] = cd[t - 1]; cand[t] = cand[t - 1]; } cd[j] = dist; cand[j] = pi; break; }
                 }
                 for (int j = 0; j < 4 && cand[j] >= 0; j++) {
                     int part[16];
                     for (int i = 0; i < 16; i++) part[i] = pmask[cand[j]] >> i & 1;
                     for (int k = 6; k < 8; k++) {
                         int e = zap__astc_try((const uint8_t(*)[4])px, &cfg[k], part, ise, wt);
-                        if (e < best) { best = e; bc = k; bseed = cand[j]; memcpy(bi, ise, sizeof ise); memcpy(bwt, wt, sizeof wt); }
+                        if (e < best) { best = e; bc = k; bseed = pseed[cand[j]]; memcpy(bi, ise, sizeof ise); memcpy(bwt, wt, sizeof wt); }
                     }
                 }
             }

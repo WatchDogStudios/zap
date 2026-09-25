@@ -196,12 +196,13 @@ To get raw input from any image or video, use ffmpeg: `ffmpeg -i in.png -pix_fmt
 zap_viewer [image | video]      # or drag & drop files onto the window
 zap_viewer --verify             # decode every BC format on your GPU and diff it against zap's decoder
 zap_viewer --shot out [image] [--video clip.mp4] [--pak folder]   # render the screenshots above to out_*.png
+zap_viewer --oodle path/to/oo2core_9_win64.dll   # (or set ZAP_OODLE_DLL) add Oodle to the Package tab's comparison
 ```
 
 The view is split: drag the line to move it, zoom with the mouse wheel, pan with the right button. **Difference ×8** shows where the two sides disagree.
 
 - **Texture tab:** open any image WIC can read (PNG, JPEG, TIFF, BMP, …). Pick a format for each side (original RGBA8, BC1, BC3, BC7 or ASTC 4×4), each with its own RDO slider (BCn only). D3D11 can't sample ASTC, so the viewer shows zap's CPU decode of it. The table shows PSNR, GPU memory, size on disk after zap, bits per pixel and encode time for both sides. Re-encodes run in the background on all cores.
-- **Package tab:** add or drop files and folders. **Build .zappak** packs them with the chosen zap mode and block size on all cores, unpacks with one thread and with all threads, and checks that every file round-trips; the table shows sizes per file type, and **Save** writes the archive. **Run comparison** puts the same files, cut into the same blocks, through zap's modes, LZ4, LZ4-HC and zstd 1/3/9/19: compression runs on all cores, decompression is timed on one thread (best run) after a verified round trip. Untick codecs to skip them.
+- **Package tab:** add or drop files and folders. **Build .zappak** packs them with the chosen zap mode and block size on all cores, unpacks with one thread and with all threads, and checks that every file round-trips; the table shows sizes per file type, and **Save** writes the archive. **Run comparison** puts the same files, cut into the same blocks, through zap's modes, LZ4, LZ4-HC and zstd 1/3/9/19: compression runs on all cores, decompression is timed on one thread (best run) after a verified round trip. Untick codecs to skip them. **Load Oodle DLL...** adds Selkie, Mermaid, Kraken and Leviathan: Oodle is proprietary, so zap doesn't ship or download it; point the viewer at an `oo2core_*_win64.dll` you're licensed to use and it loads `OodleLZ_Compress` / `OodleLZ_Decompress` at run time (the same exports [Oodle.NET](https://github.com/NotOfficer/Oodle.NET) wraps). Decompression runs with Oodle's fuzz-safe checks on, like zap's.
 - **Video tab:** open any file Media Foundation can decode (MP4/MOV/MKV/AVI/WMV with H.264, HEVC, VP9 or AV1, if the codec is installed). Each frame is transcoded live through zap: the source is decoded on the left and zap's encode/decode is shown on the right. Live stats and plots cover bitrate for both, zap's PSNR against the source, decode time per frame for both, and zap's encode time. Quality, keyframe interval and stream packing can be changed while it plays.
 
 `--verify` result on an AMD Radeon RX 9060 XT:
@@ -302,6 +303,14 @@ These are single runs on an AMD Ryzen 7 5800X (8 cores) with clang 18 `-O3 -marc
 - **Quality reference:** ffmpeg's DXT1 encoder, which is derived from stb_dxt, scores 46.9 dB on the same image, against zap's 48.5 dB with RDO off.
 - **Decoder check:** ffmpeg's DDS decoder reproduces zap's own BC1/BC3/BC5 decode within ±2 levels (±1 for BC5), which is normal interpolation rounding.
 - **When split helps:** `zap_bc_split` helps BC1/BC3 by 10–22%. On BC5 with RDO off, and on BC7 at high RDO, it makes the file larger, so measure it on your own data.
+- **BC7 / ASTC encode speed on detailed content:** a 3840×2160 game screenshot (Portal Revolution's `menu_act3.jpg`), 16 threads, Release build:
+
+  | | Before | Now |
+  |---|---|---|
+  | BC7 | 4.1 s | **0.63 s** (−0.01 dB) |
+  | ASTC 4×4 | 2.1 s | **0.80 s** (identical output) |
+
+  BC7 used to fit all 64 mode-1 partitions for every block that wasn't smooth. It now ranks them with a covariance estimate and fits the best 8 (`ZAP__BC7_M1K`), which is about 4× faster per block. ASTC's 2-partition pattern search used a bit-by-bit popcount; it's now branch-free. `zap_viewer` also hands out small bands from a shared counter instead of one band per thread: detail is uneven, and with static bands one thread did most of the work (0.3 s vs 16 s per band on a detailed photo). Debug builds are 10–30× slower than these numbers.
 - **Choosing a format:** BC7 is the quality choice, at about +5 dB over BC3 on this image. At small file sizes, BC1 with RDO still beats BC7 with RDO on this smooth photo.
 - **BC7 alpha (mode 5):** two synthetic 256×256 RGBA textures, PSNR over all four channels:
 
@@ -363,7 +372,7 @@ These results use the same 92.6 MB binary corpus, split into 4 MB blocks, on one
 - **Entropy mode:** it compresses smaller than zstd 9 at the same decode speed. zstd 19 still compresses smaller (2.73), because zap has no FSE/ANS entropy coder and no larger-scale parsing yet. zap's compressor is also much slower than zstd's at similar ratios.
 - **Plain format:** it compresses a little smaller than LZ4-HC, and LZ4 decodes about 1.3–1.5× faster. At matched ratio (`ZAP_FAST_DECODE`, 2.05 vs lz4hc 12's 2.02), zap decodes at about 78% of LZ4's speed.
 - **What's left of the plain gap:** an LZ4-format decoder written in zap's style runs about 14% slower than LZ4's own decoder on the same data. That's what zap's decoder hardening costs (every copy is bounds-checked and output is exact-size). The rest comes from zap's 8 MB match window and its 2- or 3-byte offsets.
-- **Oodle:** Oodle is proprietary and wasn't benchmarked. Going by its published figures, Kraken decodes at about 1–1.5 GB/s per core at ratios above zstd's middle levels. zap's entropy mode is now roughly in that range on this data; that's a comparison with published numbers, not a measurement.
+- **Oodle:** Oodle is proprietary and wasn't benchmarked here. You can measure it on your own content: `zap_viewer`'s Package tab compares Kraken, Mermaid, Selkie and Leviathan against zap, LZ4 and zstd once you point it at your own Oodle DLL. Going by Oodle's published figures, Kraken decodes at about 1–1.5 GB/s per core at ratios above zstd's middle levels. zap's entropy mode is now roughly in that range on this data; that's a comparison with published numbers, not a measurement.
 
 ## Format
 
