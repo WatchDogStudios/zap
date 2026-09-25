@@ -7,9 +7,10 @@ Single-header C compression for games:
 | `zap.h` | Fast LZ77 compressor for **asset packaging** and **network packets**, with an optional Huffman-coded **entropy mode** |
 | `zap_tex.h` | GPU texture block compression (**BC1/BC3/BC4/BC5/BC7**, **BC6H** for HDR, and **ASTC 4×4** for mobile) with rate-distortion optimisation tuned for `zap.h`, and **mipmap** generation |
 | `zap_video.h` | Simple, fast-decoding **video codec** for cutscenes and UI video (SSE2 decoder) |
-| `samples/dx11` | **zap_viewer**: D3D11 + Dear ImGui app that compares encodings of your own images and videos side by side, with stats |
+| `zap_pak.h` | **.zappak** archives: many named files, one zap frame each, with a sorted table of contents |
+| `samples/dx11` | **zap_viewer**: D3D11 + Dear ImGui app that compares encodings of your own images and videos side by side, packages content into .zappak files, and benchmarks zap against LZ4 and zstd |
 
-Each header works on its own, except that `zap_video.h` includes `zap.h`. They're C11 and also compile as C++, with no dependencies.
+Each header works on its own, except that `zap_video.h` and `zap_pak.h` include `zap.h`. They're C11 and also compile as C++, with no dependencies.
 
 ## Showcase
 
@@ -26,6 +27,10 @@ These screenshots come from [`zap_viewer`](#zap_viewer-windows-d3d11--dear-imgui
 **Video: an H.264 MP4 (left) transcoded live through zap (right)**, with bitrate, PSNR, per-frame decode and encode times, and plots:
 
 ![Video tab: H.264 source vs zap live transcode with stats](docs/images/viewer_video.png)
+
+**Package: a folder packed into a .zappak, then the same files through every codec**, with ratio, compress speed (all cores) and single-thread decompress speed, and a ratio vs decode-speed plot. The content here is the LZ4, zstd and Dear ImGui source trees (985 files, 13 MB); drop in your own game content to see how it packs:
+
+![Package tab: .zappak build stats and zap vs LZ4 vs zstd comparison](docs/images/viewer_package.png)
 
 Fractal zooms are close to worst-case content for zap. Here zap needs about 4× the H.264 source's bitrate to reach 44.5 dB. The [video benchmarks](#benchmarks) show where it lands on more typical footage.
 
@@ -151,6 +156,27 @@ if (zap_vdec_frame(dec, packet, n) == 0) {
 - Packets are decoded in order; store them in any container you like.
 - A corrupt packet returns -1, and the decoder then waits for the next keyframe instead of showing garbage.
 
+### Packages (.zappak)
+
+```c
+#define ZAP_THREADS                /* optional: compress files in parallel */
+#include "zap_pak.h"
+
+zap_pak_file files[] = { { "levels/e1m1.bsp", bsp, bsp_size }, { "textures/wall.dds", dds, dds_size } };
+size_t cap = zap_pak_bound(files, 2, 4 << 20);
+size_t len = zap_pak_write(files, 2, out, cap, 4 << 20 /* block */, 64 /* depth, as for frames */, 8 /* threads */);
+
+zap_pak k;
+if (zap_pak_open(&k, buf, len) == 0) {                   /* validates the whole table of contents */
+    long i = zap_pak_find(&k, "textures/wall.dds");       /* binary search */
+    if (i >= 0) zap_pak_read(&k, (size_t)i, dst, zap_pak_raw_size(&k, (size_t)i));
+}
+```
+
+- Each file is a normal zap frame, so `zap_pak_frame` hands you its bytes for `zap_frame_decode_mt` or per-block decoding on your own job system.
+- The archive is byte-identical for any thread count. Names must be unique; `zap_pak_write` returns 0 otherwise.
+- A corrupt archive fails in `zap_pak_open` or in the frame decoder, never by reading outside the buffer (fuzzed in the self-test).
+
 ### Command-line tool
 
 ```sh
@@ -169,12 +195,13 @@ To get raw input from any image or video, use ffmpeg: `ffmpeg -i in.png -pix_fmt
 ```sh
 zap_viewer [image | video]      # or drag & drop files onto the window
 zap_viewer --verify             # decode every BC format on your GPU and diff it against zap's decoder
-zap_viewer --shot out [image] [--video clip.mp4]   # render the screenshots above to out_*.png
+zap_viewer --shot out [image] [--video clip.mp4] [--pak folder]   # render the screenshots above to out_*.png
 ```
 
 The view is split: drag the line to move it, zoom with the mouse wheel, pan with the right button. **Difference ×8** shows where the two sides disagree.
 
 - **Texture tab:** open any image WIC can read (PNG, JPEG, TIFF, BMP, …). Pick a format for each side (original RGBA8, BC1, BC3, BC7 or ASTC 4×4), each with its own RDO slider (BCn only). D3D11 can't sample ASTC, so the viewer shows zap's CPU decode of it. The table shows PSNR, GPU memory, size on disk after zap, bits per pixel and encode time for both sides. Re-encodes run in the background on all cores.
+- **Package tab:** add or drop files and folders. **Build .zappak** packs them with the chosen zap mode and block size on all cores, unpacks with one thread and with all threads, and checks that every file round-trips; the table shows sizes per file type, and **Save** writes the archive. **Run comparison** puts the same files, cut into the same blocks, through zap's modes, LZ4, LZ4-HC and zstd 1/3/9/19: compression runs on all cores, decompression is timed on one thread (best run) after a verified round trip. Untick codecs to skip them.
 - **Video tab:** open any file Media Foundation can decode (MP4/MOV/MKV/AVI/WMV with H.264, HEVC, VP9 or AV1, if the codec is installed). Each frame is transcoded live through zap: the source is decoded on the left and zap's encode/decode is shown on the right. Live stats and plots cover bitrate for both, zap's PSNR against the source, decode time per frame for both, and zap's encode time. Quality, keyframe interval and stream packing can be changed while it plays.
 
 `--verify` result on an AMD Radeon RX 9060 XT:
@@ -215,6 +242,14 @@ Memory: `zap_state` is 256 KB, `zap_dict` is 256 KB plus the dictionary data, an
 | `zap_mip_next_f(src, w, h, stride, dst, dst_stride)` | The same for float (linear or HDR) images. |
 
 The formats are `ZAP_BC1`, `ZAP_BC3`, `ZAP_BC4`, `ZAP_BC5` and `ZAP_BC7`. To load BC7 from DDS, use the `DX10` header with `DXGI_FORMAT_BC7_UNORM` (98). `zap tex` writes that, plus the `_SRGB` formats and a full mip chain with `-S` and `-m`.
+
+| zap_pak.h | Use |
+|---|---|
+| `zap_pak_write(files, n, out, cap, block, depth, threads)` | Write an archive. `block` and `depth` are as for `zap_frame_compress`. Size it with `zap_pak_bound(files, n, block)`. Returns the size, or 0. |
+| `zap_pak_open(&k, buf, n)` | Validate an archive in memory. Returns 0, or -1 if it's malformed. |
+| `zap_pak_find(&k, name)` | Index of a file, or -1. Names are compared bytewise. |
+| `zap_pak_read(&k, i, dst, cap)` | Decode file `i`. Returns its size, or -1. |
+| `zap_pak_count`, `zap_pak_name`, `zap_pak_raw_size`, `zap_pak_stored_size`, `zap_pak_frame` | Walk the table of contents. `zap_pak_frame` gives the file's zap frame. |
 
 | zap_video.h | Use |
 |---|---|
@@ -383,13 +418,13 @@ cc -std=c11 -O2 -pthread bench.c -o zap_bench && ./zap_bench
 
 CI runs on Linux (gcc), macOS (clang) and Windows (MSVC, which also builds `zap_viewer`), plus ASan+UBSan builds with gcc and clang. The big-endian code path is compile-tested only.
 
-On Windows, CMake builds `zap_viewer` and fetches Dear ImGui v1.92.7 with FetchContent. Pass `-DZAP_BUILD_VIEWER=OFF` to skip it, or `-DFETCHCONTENT_SOURCE_DIR_IMGUI=path` to use a local copy.
+On Windows, CMake builds `zap_viewer` and fetches Dear ImGui v1.92.7, LZ4 1.10.0 and zstd 1.5.7 (hash-pinned) with FetchContent. LZ4 and zstd are compiled into the viewer only, for the Package tab's comparison. Pass `-DZAP_BUILD_VIEWER=OFF` to skip it, or `-DFETCHCONTENT_SOURCE_DIR_IMGUI=path` (likewise `_LZ4`, `_ZSTD`) to use local copies.
 
 ## Limitations
 
 - **Compression ratio:** entropy mode uses Huffman coding and an optimal parser, but there's no finite-state entropy coding (FSE/ANS) and no long-range matching yet. It beats zstd 9 and falls short of zstd 19.
 - **Decode speed:** the plain decoder is about 1.3–1.5× slower than LZ4 (see the comparison above).
-- **hc speed:** the optimal parser compresses at about 3 MB/s per core (1 MB/s with entropy mode's two passes). It's meant for offline builds. The `_mt` variant helps, though with 32 MB of match-finder state per thread it's limited by memory bandwidth.
+- **hc speed:** the optimal parser compresses at about 3 MB/s per core (1 MB/s with entropy mode's two passes). It's meant for offline builds. Blocks of 512 KB and up that three fast-compressor samples find incompressible (already-compressed audio, images, archives) skip the hc search and use the fast parse, which is 10–100× quicker on that data and gives up at most about 1.6% (the probe's threshold). The `_mt` variant helps, though with 32 MB of match-finder state per thread it's limited by memory bandwidth.
 - **Match distance:** matches reach at most 8 MB back. Blocks can be up to 2 GB.
 - **No stored sizes:** the raw block API doesn't record sizes, so store them yourself. Frames do record them.
 - **MSVC:** `ZAP_THREADS` needs MSVC 17.8+ for `<threads.h>`. You can skip it and use `zap_frame_decode_block` from your own threads instead.

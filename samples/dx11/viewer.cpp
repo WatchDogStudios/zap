@@ -5,7 +5,10 @@
 //                                   Media Foundation can decode (MP4, MOV, MKV, ...) is transcoded live through zap;
 //                                   split view source vs zap with bitrate, PSNR and decode-time stats.
 //   zap_viewer --verify             GPU conformance: decode every BC format (BC1-BC7, BC6H) on the GPU and diff against zap
-//   zap_viewer --shot out [image] [--video file]   render out_texture(_zoom|_diff).png and out_video.png, then exit
+//                                   Package tab: drop files/folders, build a .zappak and compare zap against LZ4 and zstd
+//                                   (ratio, compress and decompress speed, per file type).
+//   zap_viewer --shot out [image] [--video file] [--pak folder]   render out_texture(...).png, out_video.png and
+//                                   out_package.png, then exit
 //
 // Mouse: wheel zoom, right-drag pan, left-drag moves the split line. Drag & drop files onto the window.
 #define _CRT_SECURE_NO_WARNINGS
@@ -13,6 +16,10 @@
 #include "../../zap.h"
 #include "../../zap_tex.h"
 #include "../../zap_video.h"
+#include "../../zap_pak.h"
+#include <lz4.h>
+#include <lz4hc.h>
+#include <zstd.h>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -33,7 +40,11 @@
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 #include <memory>
@@ -651,8 +662,8 @@ static void view_xf(int iw, int ih, float out[4]) {
     out[0] = sx; out[1] = sy;
     out[2] = 0.5f - sx * 0.5f + A.panx; out[3] = 0.5f - sy * 0.5f + A.pany;
 }
-static int cur_w() { return A.tab ? A.vid.w : A.iw; }
-static int cur_h() { return A.tab ? A.vid.h : A.ih; }
+static int cur_w() { return A.tab == 0 ? A.iw : A.tab == 1 ? A.vid.w : 0; }
+static int cur_h() { return A.tab == 0 ? A.ih : A.tab == 1 ? A.vid.h : 0; }
 
 static void resize(int w, int h) {
     if (!A.g.swap || w <= 0 || h <= 0) return;
@@ -663,6 +674,9 @@ static void resize(int w, int h) {
     CHECK(A.g.swap->GetBuffer(0, IID_PPV_ARGS(&bb)));
     CHECK(A.g.dev->CreateRenderTargetView(bb.Get(), nullptr, &A.g.rtv));
 }
+
+static void pak_add(std::vector<std::wstring> paths);
+static bool pak_idle();
 
 static void open_any(const std::wstring &p) {
     if (is_video_path(p)) { open_video(p); A.want_tab = 1; }
@@ -677,8 +691,14 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE: if (wp != SIZE_MINIMIZED) resize(LOWORD(lp), HIWORD(lp)); return 0;
     case WM_DROPFILES: {
         wchar_t p[MAX_PATH];
-        if (DragQueryFileW((HDROP)wp, 0, p, MAX_PATH)) open_any(p);
+        UINT n = DragQueryFileW((HDROP)wp, 0xFFFFFFFF, nullptr, 0);
+        std::vector<std::wstring> all;
+        for (UINT i = 0; i < n; i++) if (DragQueryFileW((HDROP)wp, i, p, MAX_PATH)) all.push_back(p);
         DragFinish((HDROP)wp);
+        DWORD at = all.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(all[0].c_str());
+        bool folder = at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY);
+        if ((A.tab == 2 || folder || all.size() > 1) && pak_idle()) { pak_add(all); A.want_tab = 2; } // package content
+        else if (!all.empty() && A.tab != 2) open_any(all[0]);
         return 0;
     }
     case WM_LBUTTONDOWN: if (!ui) { A.drag_split = true; A.split = (float)GET_X_LPARAM(lp) / A.ww; SetCapture(h); } return 0;
@@ -709,6 +729,337 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     }
     return DefWindowProcW(h, msg, wp, lp);
+}
+
+// ---------------------------------------------------------------- package tab: .zappak builds and codec comparisons
+
+struct PakFile { std::string name; std::vector<uint8_t> data; };
+struct CodecDef { const char *name; int kind, level; };
+enum { K_ZAP, K_ZAPHC, K_ZAPE, K_LZ4, K_LZ4HC, K_ZSTD };
+static const CodecDef kCodecs[] = {
+    { "zap fast", K_ZAP, 0 }, { "zap hc16", K_ZAPHC, 16 }, { "zap hc64", K_ZAPHC, 64 }, { "zap hc64 -x", K_ZAPHC, 64 | ZAP_FAST_DECODE },
+    { "zap fast + entropy", K_ZAPE, 0 }, { "zap hc64 + entropy", K_ZAPE, 64 }, { "lz4", K_LZ4, 0 }, { "lz4hc 9", K_LZ4HC, 9 },
+    { "lz4hc 12", K_LZ4HC, 12 }, { "zstd 1", K_ZSTD, 1 }, { "zstd 3", K_ZSTD, 3 }, { "zstd 9", K_ZSTD, 9 }, { "zstd 19", K_ZSTD, 19 },
+};
+enum { kNCodecs = sizeof kCodecs / sizeof kCodecs[0] };
+struct CodecResult { bool done = false, ok = false; size_t packed = 0; double c_mbs = 0, d_mbs = 0; };
+struct TypeRow { std::string ext; int files = 0; size_t raw = 0, stored = 0; };
+
+static const char *kPakMode[] = { "fast", "hc16", "hc64", "hc64 -x (fast decode)", "hc64 + entropy" };
+static const int kPakDepth[] = { 0, 16, 64, 64 | ZAP_FAST_DECODE, 64 | ZAP_ENTROPY };
+static const char *kPakBlock[] = { "256 KB", "1 MB", "4 MB" };
+static const size_t kPakBlockBytes[] = { 256 << 10, 1 << 20, 4 << 20 };
+
+static struct Pak {
+    std::vector<PakFile> files; // owned by the UI thread except while a job runs (busy)
+    size_t raw = 0;
+    std::vector<TypeRow> types;
+    int mode = 2, block = 2;
+    bool use[kNCodecs];
+    std::thread job;
+    std::atomic<bool> busy{ false }, cancel{ false };
+    std::atomic<float> progress{ 0 };
+    std::mutex m; // guards everything below
+    std::string status;
+    // last .zappak build
+    std::vector<uint8_t> pak;
+    bool built = false, verified = false;
+    size_t pak_size = 0;
+    double pack_ms = 0, unpack1_ms = 0, unpackn_ms = 0;
+    int threads = 1;
+    std::string built_with;
+    std::vector<TypeRow> pak_types;
+    // last comparison
+    CodecResult res[kNCodecs];
+    size_t cmp_raw = 0;
+    Pak() { for (bool &u : use) u = true; }
+} P;
+
+static int hw_threads() { return (int)std::min<unsigned>(std::max(1u, std::thread::hardware_concurrency()), 64u); }
+static std::string ext_of(const std::string &n) {
+    size_t s = n.find_last_of('/'), d = n.find_last_of('.');
+    if (d == std::string::npos || (s != std::string::npos && d < s)) return "(none)";
+    std::string e = n.substr(d);
+    for (char &c : e) c = (char)tolower((unsigned char)c);
+    return e;
+}
+static std::string utf8(const std::wstring &w) {
+    std::string s(WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr), 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, s.data(), (int)s.size(), nullptr, nullptr);
+    if (!s.empty()) s.pop_back();
+    return s;
+}
+static std::string human(double b) {
+    char s[32];
+    if (b >= 1e9) snprintf(s, sizeof s, "%.2f GB", b / 1e9);
+    else if (b >= 1e6) snprintf(s, sizeof s, "%.2f MB", b / 1e6);
+    else if (b >= 1e3) snprintf(s, sizeof s, "%.1f KB", b / 1e3);
+    else snprintf(s, sizeof s, "%.0f B", b);
+    return s;
+}
+static void set_status(const std::string &s) { std::lock_guard<std::mutex> l(P.m); P.status = s; }
+
+/* sorted by total size, largest first */
+static std::vector<TypeRow> type_rows(const std::vector<std::string> &names, const std::vector<size_t> &raw, const std::vector<size_t> &stored) {
+    std::vector<TypeRow> t;
+    for (size_t i = 0; i < names.size(); i++) {
+        std::string e = ext_of(names[i]);
+        auto it = std::find_if(t.begin(), t.end(), [&](const TypeRow &r) { return r.ext == e; });
+        if (it == t.end()) { t.push_back({ e }); it = t.end() - 1; }
+        it->files++; it->raw += raw[i]; it->stored += stored[i];
+    }
+    std::sort(t.begin(), t.end(), [](const TypeRow &a, const TypeRow &b) { return a.raw > b.raw; });
+    return t;
+}
+
+static bool pak_idle() { return !P.busy; }
+
+static void pak_start(std::function<void()> fn) {
+    if (P.busy) return;
+    if (P.job.joinable()) P.job.join();
+    P.busy = true; P.cancel = false; P.progress = 0;
+    P.job = std::thread([fn] { fn(); P.busy = false; });
+}
+
+/* add files and folders (recursively). Names are relative to each dropped item's parent, with '/' separators. */
+static void pak_add(std::vector<std::wstring> paths) {
+    pak_start([paths] {
+        namespace fs = std::filesystem;
+        std::vector<std::pair<fs::path, std::string>> todo;
+        for (const std::wstring &p : paths) {
+            std::error_code ec;
+            fs::path root(p), base = root.parent_path();
+            if (fs::is_directory(root, ec)) {
+                for (auto it = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
+                    if (it->is_regular_file(ec)) todo.push_back({ it->path(), utf8(it->path().lexically_relative(base).generic_wstring()) });
+            } else if (fs::is_regular_file(root, ec)) todo.push_back({ root, utf8(root.filename().wstring()) });
+        }
+        std::vector<PakFile> got;
+        for (size_t i = 0; i < todo.size() && !P.cancel; i++) {
+            P.progress = (float)i / todo.size();
+            FILE *f = _wfopen(todo[i].first.c_str(), L"rb");
+            if (!f) continue;
+            PakFile pf{ todo[i].second };
+            _fseeki64(f, 0, SEEK_END);
+            long long n = _ftelli64(f);
+            _fseeki64(f, 0, SEEK_SET);
+            if (n >= 0) { pf.data.resize((size_t)n); if (n && fread(pf.data.data(), 1, (size_t)n, f) != (size_t)n) pf.data.clear(); }
+            fclose(f);
+            got.push_back(std::move(pf));
+        }
+        std::lock_guard<std::mutex> l(P.m);
+        for (auto &g : got) { /* keep names unique: the archive needs that */
+            std::string base = g.name;
+            for (int k = 2; std::any_of(P.files.begin(), P.files.end(), [&](const PakFile &f) { return f.name == g.name; }); k++) g.name = base + " (" + std::to_string(k) + ")";
+            P.raw += g.data.size();
+            P.files.push_back(std::move(g));
+        }
+        std::vector<std::string> names;
+        std::vector<size_t> raw;
+        for (auto &f : P.files) { names.push_back(f.name); raw.push_back(f.data.size()); }
+        P.types = type_rows(names, raw, raw);
+        P.status = std::to_string(got.size()) + " files added";
+    });
+}
+
+static void pak_build() {
+    int mode = P.mode, block = P.block;
+    pak_start([mode, block] {
+        int nt = hw_threads();
+        std::vector<zap_pak_file> in;
+        for (auto &f : P.files) in.push_back({ f.name.c_str(), f.data.data(), f.data.size() });
+        set_status("packing...");
+        std::vector<uint8_t> out(zap_pak_bound(in.data(), in.size(), kPakBlockBytes[block]));
+        auto t0 = Clock::now();
+        size_t len = zap_pak_write(in.data(), in.size(), out.data(), out.size(), kPakBlockBytes[block], kPakDepth[mode], nt);
+        double pack = ms_since(t0);
+        if (!len) { set_status("packing failed"); return; }
+        out.resize(len);
+        P.progress = 0.5f;
+        zap_pak k;
+        bool ok = zap_pak_open(&k, out.data(), len) == 0;
+        size_t cnt = ok ? zap_pak_count(&k) : 0, big = 0;
+        for (size_t i = 0; i < cnt; i++) big = std::max(big, zap_pak_raw_size(&k, i));
+        std::vector<std::string> names(cnt);
+        std::vector<size_t> raw(cnt), stored(cnt);
+        { /* verify every entry against its source */
+            std::vector<uint8_t> buf(big ? big : 1);
+            for (size_t i = 0; ok && i < cnt; i++) {
+                size_t nl;
+                const char *nm = zap_pak_name(&k, i, &nl);
+                names[i].assign(nm, nl);
+                raw[i] = zap_pak_raw_size(&k, i); stored[i] = zap_pak_stored_size(&k, i);
+                auto src = std::find_if(P.files.begin(), P.files.end(), [&](const PakFile &f) { return f.name == names[i]; });
+                ok = src != P.files.end() && zap_pak_read(&k, i, buf.data(), buf.size()) == (ptrdiff_t)raw[i] && !memcmp(buf.data(), src->data.data(), raw[i]);
+            }
+        }
+        set_status("timing unpack...");
+        auto unpack = [&](int threads) { /* best of 3: entries striped over threads, one scratch buffer each */
+            double best = 1e30;
+            for (int rep = 0; rep < 3 && ok; rep++) {
+                auto t = Clock::now();
+                std::vector<std::thread> th;
+                for (int ti = 0; ti < threads; ti++)
+                    th.emplace_back([&, ti] {
+                        std::vector<uint8_t> buf(big ? big : 1);
+                        for (size_t i = (size_t)ti; i < cnt; i += (size_t)threads) zap_pak_read(&k, i, buf.data(), buf.size());
+                    });
+                for (auto &x : th) x.join();
+                best = std::min(best, ms_since(t));
+            }
+            return best;
+        };
+        double u1 = unpack(1), un = unpack(nt);
+        std::lock_guard<std::mutex> l(P.m);
+        P.pak.swap(out);
+        P.built = true; P.verified = ok; P.pak_size = len; P.pack_ms = pack; P.unpack1_ms = u1; P.unpackn_ms = un; P.threads = nt;
+        P.built_with = std::string(kPakMode[mode]) + ", " + kPakBlock[block] + " blocks";
+        P.pak_types = type_rows(names, raw, stored);
+        P.status = ok ? "built and verified" : "VERIFY FAILED";
+    });
+}
+
+/* every codec gets the same blocks: each file split into block-size pieces */
+struct CmpBlock { const uint8_t *src; size_t len, off, cap, clen; bool raw; };
+
+static size_t codec_bound(const CodecDef &c, size_t n) {
+    switch (c.kind) {
+    case K_LZ4: case K_LZ4HC: return (size_t)LZ4_compressBound((int)n);
+    case K_ZSTD: return ZSTD_compressBound(n);
+    default: return zap_bound(n) + 1024;
+    }
+}
+
+static void pak_compare() {
+    int block = P.block;
+    bool use[kNCodecs];
+    memcpy(use, P.use, sizeof use);
+    for (auto &r : P.res) r = CodecResult(); /* the UI calls this holding P.m */
+    P.cmp_raw = P.raw;
+    pak_start([block, use] {
+        size_t bs = kPakBlockBytes[block];
+        std::vector<CmpBlock> blocks;
+        size_t raw = 0;
+        for (auto &f : P.files)
+            for (size_t o = 0; o < f.data.size(); o += bs) blocks.push_back({ f.data.data() + o, std::min(bs, f.data.size() - o) }), raw += blocks.back().len;
+        int nt = hw_threads(), todo = 0, done = 0;
+        for (bool u : use) todo += u;
+        for (int ci = 0; ci < kNCodecs && !P.cancel; ci++) {
+            if (!use[ci]) continue;
+            const CodecDef &c = kCodecs[ci];
+            set_status(std::string("compressing: ") + c.name);
+            size_t total = 0;
+            for (auto &b : blocks) { b.off = total; b.cap = codec_bound(c, b.len); total += b.cap; }
+            std::vector<uint8_t> comp(total ? total : 1);
+            std::atomic<size_t> next{ 0 };
+            auto t0 = Clock::now();
+            std::vector<std::thread> th; /* compression on all cores: blocks are independent */
+            for (int t = 0; t < nt; t++)
+                th.emplace_back([&] {
+                    void *st = c.kind == K_ZAP || (c.kind == K_ZAPE && !c.level) ? malloc(sizeof(zap_state)) : c.kind == K_ZAPHC || c.kind == K_ZAPE ? malloc(sizeof(zap_hc_state)) : nullptr;
+                    ZSTD_CCtx *zc = c.kind == K_ZSTD ? ZSTD_createCCtx() : nullptr;
+                    for (size_t i; (i = next++) < blocks.size() && !P.cancel;) {
+                        CmpBlock &b = blocks[i];
+                        uint8_t *d = comp.data() + b.off;
+                        size_t r = 0;
+                        switch (c.kind) {
+                        case K_ZAP: r = zap_compress(b.src, b.len, d, b.cap, (zap_state *)st, nullptr); break;
+                        case K_ZAPHC: r = zap_compress_hc(b.src, b.len, d, b.cap, (zap_hc_state *)st, nullptr, c.level); break;
+                        case K_ZAPE: r = zap_compress_entropy(b.src, b.len, d, b.cap, st, c.level, nullptr); break;
+                        case K_LZ4: r = (size_t)std::max(0, LZ4_compress_default((const char *)b.src, (char *)d, (int)b.len, (int)b.cap)); break;
+                        case K_LZ4HC: r = (size_t)std::max(0, LZ4_compress_HC((const char *)b.src, (char *)d, (int)b.len, (int)b.cap, c.level)); break;
+                        case K_ZSTD: { size_t z = ZSTD_compressCCtx(zc, d, b.cap, b.src, b.len, c.level); r = ZSTD_isError(z) ? 0 : z; break; }
+                        }
+                        b.raw = !r || r >= b.len; /* incompressible blocks are stored raw, the same for every codec */
+                        b.clen = b.raw ? b.len : r;
+                        P.progress = ((float)done + (float)(i + 1) / blocks.size() * 0.7f) / todo;
+                    }
+                    free(st);
+                    ZSTD_freeCCtx(zc);
+                });
+            for (auto &x : th) x.join();
+            double cms = ms_since(t0);
+            if (P.cancel) break;
+            set_status(std::string("decompressing: ") + c.name);
+            std::vector<uint8_t> out(bs), scratch(c.kind == K_ZAPE ? zap_entropy_scratch(bs) : 1);
+            ZSTD_DCtx *zd = ZSTD_createDCtx();
+            auto dec = [&](const CmpBlock &b) -> bool {
+                const uint8_t *s = comp.data() + b.off;
+                if (b.raw) { memcpy(out.data(), b.src, b.len); return true; }
+                switch (c.kind) {
+                case K_ZAP: case K_ZAPHC: return zap_decompress(s, b.clen, out.data(), b.len, nullptr) == (ptrdiff_t)b.len;
+                case K_ZAPE: return zap_decompress_entropy(s, b.clen, out.data(), b.len, nullptr, scratch.data(), scratch.size()) == (ptrdiff_t)b.len;
+                case K_LZ4: case K_LZ4HC: return LZ4_decompress_safe((const char *)s, (char *)out.data(), (int)b.clen, (int)b.len) == (int)b.len;
+                default: return ZSTD_decompressDCtx(zd, out.data(), b.len, s, b.clen) == b.len;
+                }
+            };
+            bool ok = true;
+            size_t packed = 0;
+            for (auto &b : blocks) { ok = ok && dec(b) && !memcmp(out.data(), b.src, b.len); packed += b.clen; } /* verify pass */
+            double best = 1e30; /* single-thread decode: best of up to 5 runs, stopping after ~1.5 s */
+            auto tall = Clock::now();
+            for (int rep = 0; rep < 5 && ok && !P.cancel && (rep < 2 || ms_since(tall) < 1500); rep++) {
+                auto t = Clock::now();
+                for (auto &b : blocks) dec(b);
+                best = std::min(best, ms_since(t));
+            }
+            ZSTD_freeDCtx(zd);
+            done++;
+            P.progress = (float)done / todo;
+            std::lock_guard<std::mutex> l(P.m);
+            CodecResult &r = P.res[ci];
+            r.done = true; r.ok = ok; r.packed = packed;
+            r.c_mbs = raw / 1e3 / std::max(cms, 1e-3); r.d_mbs = ok ? raw / 1e3 / std::max(best, 1e-3) : 0;
+        }
+        set_status(P.cancel ? "cancelled" : "comparison done");
+    });
+}
+
+static std::wstring pick_folder(HWND owner) {
+    ComPtr<IFileOpenDialog> d;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return {};
+    DWORD o = 0;
+    d->GetOptions(&o);
+    d->SetOptions(o | FOS_PICKFOLDERS);
+    ComPtr<IShellItem> it;
+    PWSTR p = nullptr;
+    if (FAILED(d->Show(owner)) || FAILED(d->GetResult(&it)) || FAILED(it->GetDisplayName(SIGDN_FILESYSPATH, &p))) return {};
+    std::wstring s = p;
+    CoTaskMemFree(p);
+    return s;
+}
+
+static std::vector<std::wstring> pick_files(HWND owner) {
+    std::vector<std::wstring> r;
+    ComPtr<IFileOpenDialog> d;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return r;
+    DWORD o = 0;
+    d->GetOptions(&o);
+    d->SetOptions(o | FOS_ALLOWMULTISELECT);
+    ComPtr<IShellItemArray> items;
+    DWORD n = 0;
+    if (FAILED(d->Show(owner)) || FAILED(d->GetResults(&items)) || FAILED(items->GetCount(&n))) return r;
+    for (DWORD i = 0; i < n; i++) {
+        ComPtr<IShellItem> it;
+        PWSTR p = nullptr;
+        if (SUCCEEDED(items->GetItemAt(i, &it)) && SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &p))) { r.push_back(p); CoTaskMemFree(p); }
+    }
+    return r;
+}
+
+static std::wstring pick_save(HWND owner) {
+    ComPtr<IFileSaveDialog> d;
+    if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return {};
+    COMDLG_FILTERSPEC f[1] = { { L"zap package", L"*.zappak" } };
+    d->SetFileTypes(1, f);
+    d->SetDefaultExtension(L"zappak");
+    d->SetFileName(L"content.zappak");
+    ComPtr<IShellItem> it;
+    PWSTR p = nullptr;
+    if (FAILED(d->Show(owner)) || FAILED(d->GetResult(&it)) || FAILED(it->GetDisplayName(SIGDN_FILESYSPATH, &p))) return {};
+    std::wstring s = p;
+    CoTaskMemFree(p);
+    return s;
 }
 
 // ---------------------------------------------------------------- GUI
@@ -826,6 +1177,181 @@ static void ui_video() {
     ui_view_controls();
 }
 
+/* ratio (y) against single-thread decode speed (x, log scale): up and to the right is better */
+static void pak_scatter() {
+    float fs = ImGui::GetFontSize();
+    ImVec2 size(std::max(fs * 34, ImGui::GetContentRegionAvail().x), fs * 18), p0 = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##scatter", size);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    float l = p0.x + fs * 3, r = p0.x + size.x - fs * 0.5f, t = p0.y + fs * 0.5f, b = p0.y + size.y - fs * 2;
+    double xmin = 1e30, xmax = 0, ymin = 1e30, ymax = 0;
+    for (int i = 0; i < kNCodecs; i++)
+        if (P.res[i].done && P.res[i].ok && P.res[i].packed) {
+            double x = P.res[i].d_mbs, y = (double)P.cmp_raw / P.res[i].packed;
+            xmin = std::min(xmin, x); xmax = std::max(xmax, x); ymin = std::min(ymin, y); ymax = std::max(ymax, y);
+        }
+    dl->AddRectFilled(ImVec2(l, t), ImVec2(r, b), IM_COL32(20, 20, 24, 255));
+    dl->AddRect(ImVec2(l, t), ImVec2(r, b), IM_COL32(90, 90, 100, 255));
+    if (xmax <= 0) { dl->AddText(ImVec2(l + fs, t + fs), IM_COL32(160, 160, 160, 255), "run a comparison to plot ratio vs decode speed"); return; }
+    double lx0 = std::log10(xmin / 1.3), lx1 = std::log10(xmax * 1.3), y0 = ymin - (ymax - ymin) * 0.1 - 0.01, y1 = ymax + (ymax - ymin) * 0.15 + 0.01;
+    auto X = [&](double x) { return l + (float)((std::log10(x) - lx0) / (lx1 - lx0)) * (r - l); };
+    auto Y = [&](double y) { return b - (float)((y - y0) / (y1 - y0)) * (b - t); };
+    for (double g = std::pow(10.0, std::floor(lx0)); g <= std::pow(10.0, lx1); g *= 10)
+        for (int m = 1; m < 10; m++) { /* decade grid */
+            double x = g * m;
+            if (x < std::pow(10.0, lx0) || x > std::pow(10.0, lx1)) continue;
+            dl->AddLine(ImVec2(X(x), t), ImVec2(X(x), b), m == 1 ? IM_COL32(70, 70, 80, 255) : IM_COL32(40, 40, 46, 255));
+            if (m == 1 || m == 2 || m == 5) {
+                char s[16];
+                snprintf(s, sizeof s, x >= 1000 ? "%.0fG" : "%.0fM", x >= 1000 ? x / 1000 : x);
+                dl->AddText(ImVec2(X(x) - fs * 0.6f, b + fs * 0.2f), IM_COL32(150, 150, 150, 255), s);
+            }
+        }
+    char s[64];
+    snprintf(s, sizeof s, "%.2f", y1); dl->AddText(ImVec2(p0.x, t), IM_COL32(150, 150, 150, 255), s);
+    snprintf(s, sizeof s, "%.2f", y0); dl->AddText(ImVec2(p0.x, b - fs), IM_COL32(150, 150, 150, 255), s);
+    dl->AddText(ImVec2(l, b + fs * 1.0f), IM_COL32(150, 150, 150, 255), "decode MB/s, one thread (log)  ->");
+    std::vector<ImVec4> placed; /* dots and label boxes so far: labels try right, left, above, below, then further out */
+    for (int i = 0; i < kNCodecs; i++)
+        if (P.res[i].done && P.res[i].ok && P.res[i].packed) {
+            ImVec2 p(X(P.res[i].d_mbs), Y((double)P.cmp_raw / P.res[i].packed));
+            placed.push_back(ImVec4(p.x - fs * 0.3f, p.y - fs * 0.3f, p.x + fs * 0.3f, p.y + fs * 0.3f));
+        }
+    for (int i = 0; i < kNCodecs; i++) {
+        const CodecResult &c = P.res[i];
+        if (!c.done || !c.ok || !c.packed) continue;
+        bool zap = kCodecs[i].kind <= K_ZAPE;
+        ImU32 col = zap ? IM_COL32(255, 176, 32, 255) : kCodecs[i].kind == K_ZSTD ? IM_COL32(110, 170, 255, 255) : IM_COL32(120, 220, 140, 255);
+        ImVec2 p(X(c.d_mbs), Y((double)P.cmp_raw / c.packed)), ts = ImGui::CalcTextSize(kCodecs[i].name);
+        dl->AddCircleFilled(p, fs * 0.28f, col);
+        ImVec2 best(p.x + fs * 0.4f, p.y - ts.y * 0.5f);
+        for (int k = 0; k < 16; k++) {
+            float d = fs * (0.4f + 0.9f * (k / 4)), dx[4] = { d, -d - ts.x, -ts.x * 0.5f, -ts.x * 0.5f }, dy[4] = { -ts.y * 0.5f, -ts.y * 0.5f, -d - ts.y * 0.5f, d - ts.y * 0.5f };
+            ImVec2 q(p.x + dx[k % 4], p.y + dy[k % 4]);
+            if (q.x < l || q.x + ts.x > r || q.y < t || q.y + ts.y > b) continue;
+            bool hit = false;
+            float g = fs * 0.2f;
+            for (auto &o : placed) hit |= q.x - g < o.z && q.x + ts.x + g > o.x && q.y - g < o.w && q.y + ts.y + g > o.y;
+            if (!hit) { best = q; break; }
+        }
+        placed.push_back(ImVec4(best.x, best.y, best.x + ts.x, best.y + ts.y));
+        if (std::fabs(best.x - p.x) > fs * 1.5f || std::fabs(best.y + ts.y * 0.5f - p.y) > fs * 1.5f) /* leader line to a moved label */
+            dl->AddLine(p, ImVec2(std::clamp(p.x, best.x, best.x + ts.x), std::clamp(p.y, best.y, best.y + ts.y)), (col & 0x00FFFFFF) | 0x80000000);
+        dl->AddText(best, col, kCodecs[i].name);
+    }
+}
+
+static void ui_package() {
+    bool busy = P.busy;
+    ImGui::BeginDisabled(busy);
+    if (ImGui::Button("Add folder...")) { std::wstring p = pick_folder(A.hwnd); if (!p.empty()) pak_add({ p }); }
+    ImGui::SameLine();
+    if (ImGui::Button("Add files...")) { auto f = pick_files(A.hwnd); if (!f.empty()) pak_add(f); }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear")) { std::lock_guard<std::mutex> l(P.m); P.files.clear(); P.types.clear(); P.raw = 0; }
+    ImGui::EndDisabled();
+    std::lock_guard<std::mutex> lock(P.m);
+    ImGui::SameLine();
+    ImGui::Text("%zu files, %s", P.files.size(), human((double)P.raw).c_str());
+    if (busy) {
+        ImGui::ProgressBar(P.progress, ImVec2(ImGui::GetFontSize() * 20, 0), P.status.c_str());
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) P.cancel = true;
+    } else if (!P.status.empty()) ImGui::TextDisabled("%s", P.status.c_str());
+    if (P.files.empty()) { ImGui::TextDisabled("Drop files or folders here (game content, levels, textures, anything) to package and compare."); return; }
+
+    ImGui::SeparatorText(".zappak");
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
+    ImGui::Combo("zap mode", &P.mode, kPakMode, IM_ARRAYSIZE(kPakMode));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6);
+    ImGui::Combo("block", &P.block, kPakBlock, IM_ARRAYSIZE(kPakBlock));
+    ImGui::SameLine();
+    ImGui::BeginDisabled(busy);
+    if (ImGui::Button("Build .zappak")) pak_build();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!P.built);
+    if (ImGui::Button("Save .zappak...")) {
+        std::wstring p = pick_save(A.hwnd);
+        FILE *f = p.empty() ? nullptr : _wfopen(p.c_str(), L"wb");
+        if (f) { bool ok = fwrite(P.pak.data(), 1, P.pak.size(), f) == P.pak.size(); ok = fclose(f) == 0 && ok; P.status = ok ? "saved " + file_name(p) : "write failed"; }
+    }
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    if (P.built && ImGui::BeginTable("pak", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit)) {
+        char s[128];
+        double raw = 0;
+        for (auto &t : P.pak_types) raw += (double)t.raw;
+        label_col("Built with"); ImGui::TableNextColumn(); ImGui::TextUnformatted(P.built_with.c_str());
+        label_col("Archive"); ImGui::TableNextColumn();
+        snprintf(s, sizeof s, "%s of %s  (ratio %.3f)", human((double)P.pak_size).c_str(), human(raw).c_str(), raw / std::max<size_t>(P.pak_size, 1));
+        ImGui::TextUnformatted(s);
+        label_col("Pack"); ImGui::TableNextColumn();
+        ImGui::Text("%.0f ms, %.0f MB/s (%d threads)", P.pack_ms, raw / 1e3 / std::max(P.pack_ms, 1e-3), P.threads);
+        label_col("Unpack, 1 thread"); ImGui::TableNextColumn();
+        ImGui::Text("%.1f ms, %.0f MB/s", P.unpack1_ms, raw / 1e3 / std::max(P.unpack1_ms, 1e-3));
+        label_col("Unpack, all threads"); ImGui::TableNextColumn();
+        ImGui::Text("%.1f ms, %.0f MB/s (%d threads)", P.unpackn_ms, raw / 1e3 / std::max(P.unpackn_ms, 1e-3), P.threads);
+        label_col("Round trip"); ImGui::TableNextColumn();
+        ImGui::TextColored(P.verified ? ImVec4(0.5f, 0.9f, 0.5f, 1) : ImVec4(1, 0.4f, 0.4f, 1), P.verified ? "every file matches" : "MISMATCH");
+        ImGui::EndTable();
+    }
+    const std::vector<TypeRow> &types = P.built ? P.pak_types : P.types;
+    if (!types.empty() && ImGui::TreeNode("By file type")) {
+        if (ImGui::BeginTable("types", P.built ? 5 : 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollY, ImVec2(0, ImGui::GetFontSize() * 12))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Type"); ImGui::TableSetupColumn("Files"); ImGui::TableSetupColumn("Size");
+            if (P.built) { ImGui::TableSetupColumn("In .zappak"); ImGui::TableSetupColumn("Ratio"); }
+            ImGui::TableHeadersRow();
+            for (auto &t : types) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(t.ext.c_str());
+                ImGui::TableNextColumn(); ImGui::Text("%d", t.files);
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(human((double)t.raw).c_str());
+                if (P.built) {
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(human((double)t.stored).c_str());
+                    ImGui::TableNextColumn(); ImGui::Text("%.2f", (double)t.raw / std::max<size_t>(t.stored, 1));
+                }
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TreePop();
+    }
+
+    ImGui::SeparatorText("Compare codecs (same files, same blocks)");
+    ImGui::BeginDisabled(busy);
+    if (ImGui::Button("Run comparison")) pak_compare();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled("compress: all cores   decompress: one thread, best run, output verified");
+    if (ImGui::BeginTable("cmp", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableSetupColumn(""); ImGui::TableSetupColumn("Codec"); ImGui::TableSetupColumn("Ratio"); ImGui::TableSetupColumn("Size");
+        ImGui::TableSetupColumn("Compress MB/s"); ImGui::TableSetupColumn("Decompress MB/s");
+        ImGui::TableHeadersRow();
+        double best_d = 0, best_r = 0;
+        for (auto &r : P.res) if (r.done && r.ok) { best_d = std::max(best_d, r.d_mbs); best_r = std::max(best_r, (double)P.cmp_raw / std::max<size_t>(r.packed, 1)); }
+        for (int i = 0; i < kNCodecs; i++) {
+            const CodecResult &r = P.res[i];
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::BeginDisabled(busy);
+            ImGui::PushID(i); ImGui::Checkbox("##use", &P.use[i]); ImGui::PopID();
+            ImGui::EndDisabled();
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(kCodecs[i].name);
+            if (!r.done) { for (int k = 0; k < 4; k++) { ImGui::TableNextColumn(); ImGui::TextDisabled("-"); } continue; }
+            if (!r.ok) { ImGui::TableNextColumn(); ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "round trip FAILED"); continue; }
+            double ratio = (double)P.cmp_raw / std::max<size_t>(r.packed, 1);
+            ImVec4 hi(0.5f, 0.9f, 0.5f, 1), no = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+            ImGui::TableNextColumn(); ImGui::TextColored(ratio == best_r ? hi : no, "%.3f", ratio);
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(human((double)r.packed).c_str());
+            ImGui::TableNextColumn(); ImGui::Text("%.0f", r.c_mbs);
+            ImGui::TableNextColumn(); ImGui::TextColored(r.d_mbs == best_d ? hi : no, "%.0f", r.d_mbs);
+        }
+        ImGui::EndTable();
+    }
+    pak_scatter();
+}
+
 static void ui() {
     ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_FirstUseEver);
     ImGui::Begin("zap", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
@@ -833,6 +1359,7 @@ static void ui() {
         int prev = A.tab;
         if (ImGui::BeginTabItem("Texture", nullptr, A.want_tab == 0 ? ImGuiTabItemFlags_SetSelected : 0)) { A.tab = 0; ui_texture(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Video", nullptr, A.want_tab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) { A.tab = 1; ui_video(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Package", nullptr, A.want_tab == 2 ? ImGuiTabItemFlags_SetSelected : 0)) { A.tab = 2; ui_package(); ImGui::EndTabItem(); }
         if (A.tab != prev) { A.zoom = 1; A.panx = A.pany = 0; }
         ImGui::EndTabBar();
     }
@@ -890,7 +1417,7 @@ static void frame(ID3D11RenderTargetView *rtv) {
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 }
 
-static void shots(const std::wstring &prefix, bool have_video) {
+static void shots(const std::wstring &prefix, bool have_video, const std::wstring &pak) {
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = (UINT)A.ww; td.Height = (UINT)A.wh; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
     td.BindFlags = D3D11_BIND_RENDER_TARGET;
@@ -933,17 +1460,25 @@ static void shots(const std::wstring &prefix, bool have_video) {
         A.vid.paused = true;
         grab(L"_video.png");
     }
+    if (!pak.empty()) { // package a folder, build a .zappak, compare codecs
+        pak_add({ pak }); P.job.join();
+        pak_build(); P.job.join();
+        pak_compare(); P.job.join();
+        A.want_tab = 2;
+        grab(L"_package.png");
+    }
 }
 
 // ----------------------------------------------------------------
 
 int wmain(int argc, wchar_t **argv) {
-    std::wstring path, shot, video;
+    std::wstring path, shot, video, pak;
     for (int i = 1; i < argc; i++) {
         std::wstring a = argv[i];
         if (a == L"--verify") return verify();
         if (a == L"--shot" && i + 1 < argc) shot = argv[++i];
         else if (a == L"--video" && i + 1 < argc) video = argv[++i];
+        else if (a == L"--pak" && i + 1 < argc) pak = argv[++i];
         else path = a;
     }
     CHECK(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
@@ -986,7 +1521,7 @@ int wmain(int argc, wchar_t **argv) {
     if (path.empty() || !open_image(path)) open_image(L"C:\\Windows\\Web\\Wallpaper\\Windows\\img0.jpg");
     if (!video.empty()) { open_video(video); A.want_tab = 1; }
 
-    if (!shot.empty()) shots(shot, A.vid.rd != nullptr);
+    if (!shot.empty()) shots(shot, A.vid.rd != nullptr, pak);
     else {
         ShowWindow(A.hwnd, SW_SHOW);
         for (bool quit = false; !quit;) {
@@ -1002,6 +1537,8 @@ int wmain(int argc, wchar_t **argv) {
         }
     }
     for (auto &j : A.jobs) j.join();
+    P.cancel = true;
+    if (P.job.joinable()) P.job.join();
     video_close();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

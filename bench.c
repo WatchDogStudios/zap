@@ -1,6 +1,7 @@
 /* bench.c - self-test, fuzz, and speed.  usage: bench [file] [threads] */
 #define ZAP_THREADS
 #include "zap.h"
+#include "zap_pak.h"
 #undef NDEBUG /* the self-tests are asserts: keep them in release builds */
 #include <assert.h>
 #include <stdio.h>
@@ -57,6 +58,59 @@ static size_t roundtrip(const uint8_t *src, size_t n, const zap_dict *d, int dep
     return cn;
 }
 
+/* incompressible blocks take the fast path inside hc and entropy mode (zap__hc_skip): still a valid round trip */
+static void incompressible_test(void) {
+    enum { N = 1 << 20 };
+    uint8_t *src = malloc(N), *c = malloc(zap_bound(N) + 1024), *d = malloc(N);
+    for (int i = 0; i < N; i++) src[i] = (uint8_t)(rand() >> 3);
+    memcpy(src + N / 3, src, 4096); /* a little redundancy the fast path must still round-trip */
+    int depths[3] = { 16, 64, 64 | ZAP_FAST_DECODE };
+    for (int k = 0; k < 3; k++) {
+        size_t n = zap_compress_hc(src, N, c, zap_bound(N), hc, NULL, depths[k]);
+        assert(n && zap_decompress(c, n, d, N, NULL) == N && !memcmp(src, d, N));
+        n = zap_compress_entropy(src, N, c, zap_bound(N) + 1024, hc, depths[k], NULL);
+        assert(!n || (zap_decompress_entropy(c, n, d, N, NULL, NULL, 0) == N && !memcmp(src, d, N)));
+    }
+    free(src); free(c); free(d);
+}
+
+static void pak_test(void) {
+    enum { N = 6 };
+    static uint8_t a[70000], b[5000];
+    for (size_t i = 0; i < sizeof a; i++) a[i] = (uint8_t)("zap pak test "[i % 13] ^ (i / 997));
+    for (size_t i = 0; i < sizeof b; i++) b[i] = (uint8_t)rand();
+    zap_pak_file f[N] = { { "z/last.bin", a, sizeof a }, { "a/first.txt", a, 1000 }, { "empty", a, 0 },
+                          { "noise", b, sizeof b }, { "m/mid", a + 5, 20000 }, { "m/mid2", b, 17 } };
+    size_t cap = zap_pak_bound(f, N, 16384);
+    uint8_t *p1 = malloc(cap), *p2 = malloc(cap), *out = malloc(sizeof a);
+    int depths[3] = { 0, 16, 32 | ZAP_ENTROPY };
+    for (int di = 0; di < 3; di++) {
+        size_t n1 = zap_pak_write(f, N, p1, cap, 16384, depths[di], 1), n2 = zap_pak_write(f, N, p2, cap, 16384, depths[di], 4);
+        assert(n1 && n1 == n2 && !memcmp(p1, p2, n1)); /* same bytes for any thread count */
+        zap_pak k;
+        assert(zap_pak_open(&k, p1, n1) == 0 && zap_pak_count(&k) == N);
+        for (int i = 0; i < N; i++) {
+            long e = zap_pak_find(&k, f[i].name);
+            assert(e >= 0 && zap_pak_raw_size(&k, (size_t)e) == f[i].size);
+            assert(zap_pak_read(&k, (size_t)e, out, sizeof a) == (ptrdiff_t)f[i].size && !memcmp(out, f[i].data, f[i].size));
+        }
+        size_t l0, l1;
+        const char *n0 = zap_pak_name(&k, 0, &l0), *nl = zap_pak_name(&k, N - 1, &l1);
+        assert(l0 == 11 && !memcmp(n0, "a/first.txt", 11) && l1 == 10 && !memcmp(nl, "z/last.bin", 10)); /* sorted */
+        assert(zap_pak_find(&k, "m") < 0 && zap_pak_find(&k, "m/mid3") < 0 && zap_pak_find(&k, "") < 0);
+        assert(zap_pak_open(&k, p1, n1 - 1) != 0 && zap_pak_write(f, N, p2, n1 - 1, 16384, depths[di], 1) == 0);
+        for (int t = 0; t < 2000; t++) { /* corrupt archives must fail cleanly, never crash */
+            memcpy(p2, p1, n1);
+            p2[rand() % n1] ^= (uint8_t)(1 + rand() % 255);
+            if (zap_pak_open(&k, p2, n1) == 0)
+                for (size_t i = 0; i < zap_pak_count(&k); i++) zap_pak_read(&k, i, out, sizeof a);
+        }
+    }
+    f[5].name = "noise"; /* duplicate names are rejected */
+    assert(zap_pak_write(f, N, p1, cap, 16384, 0, 1) == 0);
+    free(p1); free(p2); free(out);
+}
+
 static void selftest(void) {
     enum { N = 600000 };
     uint8_t *buf = malloc(N);
@@ -99,6 +153,8 @@ static void selftest(void) {
         free(c); free(o);
     }
     free(buf);
+    incompressible_test();
+    pak_test();
     printf("selftest ok\n");
 }
 

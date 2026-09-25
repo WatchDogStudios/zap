@@ -30,7 +30,7 @@ if(PROJECT_IS_TOP_LEVEL)
 
   # D3D11 + Dear ImGui viewer (Windows): texture and video split-view comparisons
   if(WIN32)
-    option(ZAP_BUILD_VIEWER "Build the D3D11 + Dear ImGui viewer sample (downloads Dear ImGui)" ON)
+    option(ZAP_BUILD_VIEWER "Build the D3D11 + Dear ImGui viewer sample (downloads Dear ImGui, LZ4 and zstd)" ON)
     if(ZAP_BUILD_VIEWER)
       enable_language(CXX)
       include(FetchContent)
@@ -42,6 +42,20 @@ if(PROJECT_IS_TOP_LEVEL)
       target_include_directories(zap_viewer PRIVATE ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
       target_compile_features(zap_viewer PRIVATE cxx_std_17)
       target_link_libraries(zap_viewer PRIVATE zap d3d11 dxgi d3dcompiler windowscodecs mfplat mfreadwrite mfuuid shell32 ole32)
+
+      # Package tab compares against LZ4 and zstd (compiled into the viewer only; the zap headers stay dependency-free)
+      FetchContent_Declare(lz4 URL https://github.com/lz4/lz4/releases/download/v1.10.0/lz4-1.10.0.tar.gz
+        URL_HASH SHA256=537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR none)
+      FetchContent_Declare(zstd URL https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+        URL_HASH SHA256=eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR none)
+      FetchContent_MakeAvailable(lz4 zstd)
+      file(GLOB zap_zstd_src ${zstd_SOURCE_DIR}/lib/common/*.c ${zstd_SOURCE_DIR}/lib/compress/*.c ${zstd_SOURCE_DIR}/lib/decompress/*.c)
+      add_library(zap_viewer_codecs STATIC ${lz4_SOURCE_DIR}/lib/lz4.c ${lz4_SOURCE_DIR}/lib/lz4hc.c ${zap_zstd_src})
+      target_include_directories(zap_viewer_codecs PUBLIC ${lz4_SOURCE_DIR}/lib ${zstd_SOURCE_DIR}/lib)
+      target_compile_definitions(zap_viewer_codecs PRIVATE ZSTD_DISABLE_ASM)
+      target_link_libraries(zap_viewer PRIVATE zap_viewer_codecs)
     endif()
   endif()
 

@@ -344,10 +344,28 @@ static inline size_t zap__compress_opt(const uint8_t *src, size_t n, uint8_t *ds
 }
 
 /* depth: chain steps per position. 16 = quick lazy parse; >= ZAP_OPT_DEPTH (32) = optimal parse (64 = good default) */
+/* On incompressible data (already-compressed audio, images, archives) the hc search walks full chains of hash
+   collisions, a cache miss each, for nothing: a 2.4 MB .tar.gz took 0.8 s at depth 16. Probe three 128 KB samples
+   with the fast compressor (the hc state's prev table is the scratch); if none saves 1/64, the caller uses the fast
+   compressor for the block. Compressible blocks are unaffected.
+   ponytail: three samples can miss a compressible stretch between them; probe more spots if that shows up in real content. */
+static inline int zap__hc_skip(const uint8_t *src, size_t n, zap_hc_state *s) {
+    enum { P = 128 << 10 };
+    if (n < 4 * (size_t)P || sizeof s->prev < sizeof(zap_state) + 2 * (size_t)P) return 0;
+    zap_state *t = (zap_state *)(void *)s->prev;
+    uint8_t *o = (uint8_t *)(s->prev + (1 << ZAP_HLOG));
+    for (int k = 0; k < 3; k++) {
+        size_t c = zap_compress(src + (n - P) / 2 * (size_t)k, P, o, zap_bound(P), t, NULL);
+        if (c && c < P - P / 64) return 0;
+    }
+    return 1;
+}
+
 static inline size_t zap_compress_hc(const void *src_, size_t n, void *dst_, size_t cap,
                                      zap_hc_state *s, const zap_dict *d, int depth) {
     const uint8_t *src = (const uint8_t *)src_, *ip = src, *anchor = src, *iend = src + n;
     uint8_t *op = (uint8_t *)dst_, *oend = op + cap;
+    if (zap__hc_skip(src, n, s)) return zap_compress(src, n, dst_, cap, (zap_state *)(void *)s->prev, d);
     size_t next = 0;
     uint32_t seq = ZAP__SEQ_PENALTY(depth);
     depth &= 0xFFFF;
@@ -773,8 +791,10 @@ static inline size_t zap_compress_entropy(const void *src, size_t n, void *dst, 
     uint32_t seq = ZAP__SEQ_PENALTY(depth);
     int fd = depth & ZAP_FAST_DECODE;
     depth &= 0xFFFF;
-    size_t ln = depth ? zap_compress_hc(src, n, lz, lcap, (zap_hc_state *)state, d, depth | fd) : zap_compress(src, n, lz, lcap, (zap_state *)state, d);
-    if (ln && depth >= ZAP_OPT_DEPTH) {
+    int skip = depth && zap__hc_skip((const uint8_t *)src, n, (zap_hc_state *)state); /* incompressible: fast parse, Huffman still applies */
+    size_t ln = skip ? zap_compress(src, n, lz, lcap, (zap_state *)(void *)((zap_hc_state *)state)->prev, d)
+              : depth ? zap_compress_hc(src, n, lz, lcap, (zap_hc_state *)state, d, depth | fd) : zap_compress(src, n, lz, lcap, (zap_state *)state, d);
+    if (ln && depth >= ZAP_OPT_DEPTH && !skip) {
         zap__cost cm;
         zap__cost_from_lz(lz, ln, &cm, seq);
         ln = zap__compress_opt((const uint8_t *)src, n, lz, lcap, (zap_hc_state *)state, d, depth, &cm);
