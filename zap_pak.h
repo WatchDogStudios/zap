@@ -11,7 +11,8 @@
  *   }
  *
  * block and depth are zap_frame_compress's (depth may include ZAP_ENTROPY / ZAP_FAST_DECODE). threads > 1 compresses
- * files in parallel when ZAP_THREADS is defined; the archive is byte-identical for any thread count.
+ * files (and the blocks of files bigger than one block) in parallel when ZAP_THREADS is defined; the archive is
+ * byte-identical for any thread count.
  *
  * Layout (little-endian):
  *   header  32 bytes: "ZPAK", u32 version (1), u32 count, u32 0, u64 toc offset, u64 toc size
@@ -39,9 +40,10 @@ static inline size_t zap_pak_bound(const zap_pak_file *f, size_t n, size_t block
 /* ---------------- writer */
 
 typedef struct { const zap_pak_file *f; size_t n, block, *cs; uint8_t **buf; int depth; } zap__pjob;
-static inline void zap__pwork(void *p, int t, int nt) {
+static inline void zap__pwork(void *p, int t, int nt) { /* files of up to one block, striped over threads */
     zap__pjob *j = (zap__pjob *)p;
     for (size_t i = (size_t)t; i < j->n; i += (size_t)nt) {
+        if (nt > 1 && j->f[i].size > j->block) continue; /* multi-block files are done separately, block-parallel */
         size_t cap = zap_frame_bound(j->f[i].size, j->block);
         j->buf[i] = (uint8_t *)malloc(cap ? cap : 1);
         j->cs[i] = j->buf[i] ? zap_frame_compress(j->f[i].data, j->f[i].size, j->buf[i], cap, j->block, j->depth, NULL) : 0;
@@ -68,7 +70,15 @@ static inline size_t zap_pak_write(const zap_pak_file *f, size_t n, void *dst_, 
     (void)threads;
     if (ok) {
 #ifdef ZAP_THREADS
-        zap__par(zap__threads(threads, n), zap__pwork, &j);
+        if (threads > 1) {
+            zap__par(zap__threads(threads, n), zap__pwork, &j);
+            for (size_t i = 0; i < n; i++) /* big files: one at a time, blocks in parallel (same bytes as the serial writer) */
+                if (f[i].size > block) {
+                    size_t fcap = zap_frame_bound(f[i].size, block);
+                    buf[i] = (uint8_t *)malloc(fcap);
+                    cs[i] = buf[i] ? zap_frame_compress_mt(f[i].data, f[i].size, buf[i], fcap, block, depth, NULL, threads) : 0;
+                }
+        } else zap__pwork(&j, 0, 1);
 #else
         zap__pwork(&j, 0, 1);
 #endif
@@ -152,5 +162,15 @@ static inline ptrdiff_t zap_pak_read(const zap_pak *k, size_t i, void *dst, size
     ptrdiff_t r = zap_frame_decode(fr, len, dst, cap, NULL);
     return r == (ptrdiff_t)zap_pak_raw_size(k, i) ? r : -1;
 }
+
+#ifdef ZAP_THREADS
+/* the same, decoding the entry's blocks on up to `threads` threads (for big files) */
+static inline ptrdiff_t zap_pak_read_mt(const zap_pak *k, size_t i, void *dst, size_t cap, int threads) {
+    size_t len;
+    const void *fr = zap_pak_frame(k, i, &len);
+    ptrdiff_t r = zap_frame_decode_mt(fr, len, dst, cap, NULL, threads);
+    return r == (ptrdiff_t)zap_pak_raw_size(k, i) ? r : -1;
+}
+#endif
 
 #endif

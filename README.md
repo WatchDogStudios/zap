@@ -6,7 +6,7 @@ Single-header C compression for games:
 |---|---|
 | `zap.h` | Fast LZ77 compressor for **asset packaging** and **network packets**, with an optional Huffman-coded **entropy mode** |
 | `zap_tex.h` | GPU texture block compression (**BC1/BC3/BC4/BC5/BC7**, **BC6H** for HDR, and **ASTC 4×4** for mobile) with rate-distortion optimisation tuned for `zap.h`, and **mipmap** generation |
-| `zap_video.h` | Simple, fast-decoding **video codec** for cutscenes and UI video (SSE2 decoder) |
+| `zap_video.h` | Fast-decoding **video codec** for cutscenes and UI video, with the seekable **.zapvid** file format. Decodes 2–6× faster than H.264 on one thread and 2–3× faster on all threads (multi-threaded SSE2 decoder) |
 | `zap_pak.h` | **.zappak** archives: many named files, one zap frame each, with a sorted table of contents |
 | `samples/dx11` | **zap_viewer**: D3D11 + Dear ImGui app that compares encodings of your own images and videos side by side, packages content into .zappak files, and benchmarks zap against LZ4 and zstd |
 
@@ -146,14 +146,23 @@ zap_venc_threads(enc, 8);   /* optional (needs ZAP_THREADS): same output for any
 size_t n = zap_venc_frame(enc, y, u, v, 1280, 640, packet, zap_video_bound(enc));   /* one I420 frame -> one packet */
 
 zap_video *dec = zap_vdec_create(1280, 720);
+zap_vdec_threads(dec, 8);   /* optional (needs ZAP_THREADS): slices decode in parallel, same output */
 if (zap_vdec_frame(dec, packet, n) == 0) {
     const uint8_t *py, *pu, *pv; int ystride, uvstride;
     zap_video_planes(dec, &py, &pu, &pv, &ystride, &uvstride);   /* upload, or convert to RGB in a shader */
 }
+
+/* .zapvid files: header + packets + seek index (layout under Format) */
+zap_vid v;
+if (zap_vid_open(&v, file, file_size) == 0)                    /* validates the header and the whole index */
+    for (uint32_t i = zap_vid_keyframe(&v, seek_to); i < v.frames; i++) {
+        size_t len; const void *pkt = zap_vid_frame(&v, i, &len, NULL);
+        zap_vdec_frame(dec, pkt, len);
+    }
 ```
 
 - Input and output are 8-bit YUV 4:2:0 (I420) with even width and height.
-- Packets are decoded in order; store them in any container you like.
+- Packets are decoded in order from a keyframe. Store them in a `.zapvid` file (written with `zap_vid_write_header` / `zap_vid_write_entry`, or by `zap venc` and `zap_viewer --export`) or in any container you like.
 - A corrupt packet returns -1, and the decoder then waits for the next keyframe instead of showing garbage.
 
 ### Packages (.zappak)
@@ -184,11 +193,20 @@ zap c [-e] [-x] [-l depth] [-b block_kb] [-t threads] [-D dict] in out   # pack 
 zap d [-t threads] [-D dict] in out                            # unpack
 zap train [-s dict_bytes] dict.bin samples...                  # train a packet dictionary
 zap tex [-f bc1|bc3|bc4|bc5|bc7|astc] [-r rdo] [-m] [-S] w h in.rgba out.dds  # raw RGBA8 -> DDS (-m mip chain, -S sRGB); -f astc writes a .astc file
-zap venc [-q quality] [-k keyint] [-F fps] w h in.yuv out.zv   # raw I420 -> .zv video
-zap vdec in.zv out.yuv                                         # .zv -> raw I420
+zap venc [-q quality] [-k keyint] [-F fps|num/den] [-t threads] [-C 601|709|601full|709full] w h in.yuv|- out.zapvid   # raw I420 -> .zapvid
+zap vdec [-t threads] in.zapvid out.yuv|-|null                 # .zapvid -> raw I420 (- = stdout, null = just time the decode)
+zap pak [-e] [-x] [-l depth] [-b block_kb] [-t threads] out.zappak files/folders...   # package content
+zap unpak in.zappak outdir                                     # extract (names that would escape outdir are refused)
+zap ls file                                                    # describe a .zappak, .zapvid or zap frame
 ```
 
-To get raw input from any image or video, use ffmpeg: `ffmpeg -i in.png -pix_fmt rgba -f rawvideo in.rgba`, or `ffmpeg -i in.mp4 -pix_fmt yuv420p -f rawvideo in.yuv`.
+To get raw input from any image or video, use ffmpeg: `ffmpeg -i in.png -pix_fmt rgba -f rawvideo in.rgba`. Videos can be piped straight in:
+
+```sh
+ffmpeg -i cutscene.mp4 -f rawvideo -pix_fmt yuv420p - | zap venc -q 70 -F 30000/1001 1920 1080 - cutscene.zapvid
+```
+
+On Windows, `zap_viewer --export cutscene.mp4 cutscene.zapvid [-q 70]` does the same with Media Foundation, without ffmpeg. Colour info (BT.601/709, limited/full range) is stored in the file: the viewer copies it from the source, and `zap venc` assumes BT.709 limited range for 720p and up and BT.601 below (ffmpeg's convention), or takes `-C`.
 
 ### zap_viewer (Windows, D3D11 + Dear ImGui)
 
@@ -197,13 +215,14 @@ zap_viewer [image | video]      # or drag & drop files onto the window
 zap_viewer --verify             # decode every BC format on your GPU and diff it against zap's decoder
 zap_viewer --shot out [image] [--video clip.mp4] [--pak folder]   # render the screenshots above to out_*.png
 zap_viewer --oodle path/to/oo2core_9_win64.dll   # (or set ZAP_OODLE_DLL) add Oodle to the Package tab's comparison
+zap_viewer --export in.mp4 out.zapvid [-q 70]     # convert any Media Foundation video to .zapvid, then exit
 ```
 
 The view is split: drag the line to move it, zoom with the mouse wheel, pan with the right button. **Difference ×8** shows where the two sides disagree.
 
 - **Texture tab:** open any image WIC can read (PNG, JPEG, TIFF, BMP, …). Pick a format for each side (original RGBA8, BC1, BC3, BC7 or ASTC 4×4), each with its own RDO slider (BCn only). D3D11 can't sample ASTC, so the viewer shows zap's CPU decode of it. The table shows PSNR, GPU memory, size on disk after zap, bits per pixel and encode time for both sides. Re-encodes run in the background on all cores.
 - **Package tab:** add or drop files and folders. **Build .zappak** packs them with the chosen zap mode and block size on all cores, unpacks with one thread and with all threads, and checks that every file round-trips; the table shows sizes per file type, and **Save** writes the archive. **Run comparison** puts the same files, cut into the same blocks, through zap's modes, LZ4, LZ4-HC and zstd 1/3/9/19: compression runs on all cores, decompression is timed on one thread (best run) after a verified round trip. Untick codecs to skip them. **Load Oodle DLL...** adds Selkie, Mermaid, Kraken and Leviathan: Oodle is proprietary, so zap doesn't ship or download it; point the viewer at an `oo2core_*_win64.dll` you're licensed to use and it loads `OodleLZ_Compress` / `OodleLZ_Decompress` at run time (the same exports [Oodle.NET](https://github.com/NotOfficer/Oodle.NET) wraps). Decompression runs with Oodle's fuzz-safe checks on, like zap's.
-- **Video tab:** open any file Media Foundation can decode (MP4/MOV/MKV/AVI/WMV with H.264, HEVC, VP9 or AV1, if the codec is installed). Each frame is transcoded live through zap: the source is decoded on the left and zap's encode/decode is shown on the right. Live stats and plots cover bitrate for both, zap's PSNR against the source, decode time per frame for both, and zap's encode time. Quality, keyframe interval and stream packing can be changed while it plays.
+- **Video tab:** open any file Media Foundation can decode (MP4/MOV/MKV/AVI/WMV with H.264, HEVC, VP9 or AV1, if the codec is installed). Each frame is transcoded live through zap: the source is decoded on the left and zap's encode/decode is shown on the right. Live stats and plots cover bitrate for both, zap's PSNR against the source, decode time per frame for both, and zap's encode time. Quality, keyframe interval and stream packing can be changed while it plays. **Export .zapvid...** transcodes the whole file with those settings on all cores in the background, and `.zapvid` files open like any other video (decoded by zap on all threads, as the left-hand source).
 
 `--verify` result on an AMD Radeon RX 9060 XT:
 
@@ -258,6 +277,9 @@ The formats are `ZAP_BC1`, `ZAP_BC3`, `ZAP_BC4`, `ZAP_BC5` and `ZAP_BC7`. To loa
 | `zap_venc_threads(enc, n)` | With `ZAP_THREADS`: encode macroblock rows on `n` threads. The packets are byte-identical for any `n`. |
 | `zap_venc_frame(enc, y, u, v, ystride, uvstride, out, cap)` | Encode one frame. Returns the packet size, or 0 if `cap` is too small; a failed call doesn't advance the encoder. |
 | `zap_vdec_create(w, h)` / `zap_vdec_frame(dec, pkt, n)` | Decode one packet. Returns 0, or -1 if the packet is corrupt. |
+| `zap_vdec_threads(dec, n)` | With `ZAP_THREADS`: decode each packet's slices on `n` persistent threads. Output is identical for any `n`. |
+| `zap_vid_open(&v, buf, n)` / `zap_vid_frame(&v, i, &len, &key)` / `zap_vid_keyframe(&v, i)` | Read a `.zapvid` file in memory: open and validate, get frame `i`'s packet, find the keyframe to start from to show frame `i`. |
+| `zap_vid_write_header(hdr, w, h, fps_num, fps_den, frames, keyint, index_offset, color)` / `zap_vid_write_entry(e, offset, size, key)` | Write a `.zapvid`: header (48 bytes), packets, then one 16-byte index entry per frame. |
 | `zap_video_planes(v, &y, &u, &v, &ystride, &uvstride)` | The last decoded frame. Its planes stay valid until the next frame call. |
 | `zap_video_bound(v)` / `zap_video_destroy(v)` | Worst-case packet size / free the encoder or decoder. |
 
@@ -343,11 +365,26 @@ These are single runs on an AMD Ryzen 7 5800X (8 cores) with clang 18 `-O3 -marc
 | testsrc2 | H.264 (x264 medium) | 7170 | 56.2 dB | 410 |
 
 - **Compression:** zap now beats MPEG-4 Part 2 at the same bitrate, by 1.0 dB on pan and 1.7 dB on testsrc2. It is still far behind H.264.
-- **Rate-distortion encoder:** the encoder chooses coefficient levels and SKIP/INTER/INTRA per macroblock by distortion + λ·bits, with bit costs learned from the previous frame's streams, and its motion search charges for vector bits. Against the previous encoder that's **−24% bitrate on pan and −13% on testsrc2 at equal PSNR** (BD-rate over qualities 30–95). The format didn't change, so old decoders play the new files, and they decode 15–50% faster because there are fewer coefficients.
-- **Decode speed:** zap's SSE2 decoder is 2.5–2.7× its scalar path. It matches ffmpeg's hand-optimised MPEG-4 decoder and is about 5× faster than ffmpeg's H.264 decoder.
+- **Rate-distortion encoder:** the encoder chooses coefficient levels and SKIP/INTER/INTRA per macroblock by distortion + λ·bits, with bit costs learned from the previous frame's streams, and its motion search charges for vector bits. Against the previous encoder that's **−24% bitrate on pan and −13% on testsrc2 at equal PSNR** (BD-rate over qualities 30–95), and decoding is 15–50% faster because there are fewer coefficients.
+- **Decode speed:** zap's SSE2 decoder is 2.5–2.7× its scalar path and matches ffmpeg's hand-optimised MPEG-4 decoder on one thread. Against H.264 on all threads, see below.
 - **Bit-exact:** the SSE2 inverse transform and motion compensation produce identical output to the scalar code, which is tested on 20,000 random blocks. SSE2 is on by default for x64.
 - **Encode speed:** about 45–60 fps at 720p on one thread, and 150–290 fps with 8 threads (`zap_venc_threads`). Rows encode independently, so the output doesn't depend on the thread count.
 - **Why use it:** the appeal is a small, dependency-free decoder that's hardened against bad input, not the compression ratio.
+
+**zap vs H.264, decode and encode speed.** Same frames, same bitrate (x264 two-pass `medium` at zap's rate), decode timed on one thread and on all 16 hardware threads, zap and ffmpeg alternating over several rounds (best of each). Reproduce it on any clip with [`tools/video_vs_h264.py`](tools/video_vs_h264.py). These were measured while the machine was also running a game and a build, so absolute numbers are low; zap and H.264 ran under the same load.
+
+| Clip | Codec | kbit/s | PSNR-Y | Decode fps, 1 thread | Decode fps, 16 threads |
+|---|---|---|---|---|---|
+| 720p pan | **zap q70** | 3125 | 44.3 dB | **1633** | **3756** |
+| 720p pan | H.264 (x264 medium) | 3060 | 52.1 dB | 391 | 1685 |
+| 720p testsrc2 | **zap q70** | 7059 | 48.0 dB | **1957** | **2928** |
+| 720p testsrc2 | H.264 (x264 medium) | 7209 | 56.5 dB | 323 | 1579 |
+| 1080p testsrc2 | **zap q70** | 15955 | 48.8 dB | **484** | **1836** |
+| 1080p testsrc2 | H.264 (x264 medium) | 16103 | 57.1 dB | 166 | 649 |
+
+- **Decoding:** zap is 2.9–6.1× faster than ffmpeg's H.264 decoder on one thread and 1.9–2.8× faster with every thread in use. Each packet carries a slice table (about one slice per 4 macroblock rows), so slices decode in parallel on persistent threads. Unpacking the streams stays serial and is 6–11% of decode time, which limits the scaling.
+- **Encoding:** on 16 threads zap encoded the 720p pan clip at 193 fps and x264 `medium` at 70 fps.
+- **Quality:** H.264 is far better per bit: 8 dB higher PSNR at the same bitrate. zap buys speed and a small, hardened decoder with bitrate. Hardware H.264 decoders (DXVA, NVDEC and friends) weren't compared.
 
 ### zap vs LZ4 vs zstd
 
@@ -372,7 +409,21 @@ These results use the same 92.6 MB binary corpus, split into 4 MB blocks, on one
 - **Entropy mode:** it compresses smaller than zstd 9 at the same decode speed. zstd 19 still compresses smaller (2.73), because zap has no FSE/ANS entropy coder and no larger-scale parsing yet. zap's compressor is also much slower than zstd's at similar ratios.
 - **Plain format:** it compresses a little smaller than LZ4-HC, and LZ4 decodes about 1.3–1.5× faster. At matched ratio (`ZAP_FAST_DECODE`, 2.05 vs lz4hc 12's 2.02), zap decodes at about 78% of LZ4's speed.
 - **What's left of the plain gap:** an LZ4-format decoder written in zap's style runs about 14% slower than LZ4's own decoder on the same data. That's what zap's decoder hardening costs (every copy is bounds-checked and output is exact-size). The rest comes from zap's 8 MB match window and its 2- or 3-byte offsets.
-- **Oodle:** Oodle is proprietary and wasn't benchmarked here. You can measure it on your own content: `zap_viewer`'s Package tab compares Kraken, Mermaid, Selkie and Leviathan against zap, LZ4 and zstd once you point it at your own Oodle DLL. Going by Oodle's published figures, Kraken decodes at about 1–1.5 GB/s per core at ratios above zstd's middle levels. zap's entropy mode is now roughly in that range on this data; that's a comparison with published numbers, not a measurement.
+- **Oodle:** measured with `zap_viewer`'s Package tab on a 225 MB Source-engine VPK from Portal Revolution (uncompressed game data: textures, models, sounds), 4 MB blocks, with Oodle 2.8 (`oo2ext_8_win64.dll`) as shipped by a game. Ratios are exact. Decode speeds are single-thread and were measured while other work was running, so treat them as rough.
+
+  | Codec | Ratio | Decode (1 thread) |
+  |---|---|---|
+  | zap hc64 | 2.48 | 1.5 GB/s |
+  | zap hc64 `-x` | 2.41 | 1.8 GB/s |
+  | zap hc64 + entropy | 2.86 | 0.7 GB/s |
+  | lz4hc 12 | 2.49 | 2.3 GB/s |
+  | zstd 19 | 3.06 | 0.45 GB/s |
+  | Oodle Selkie (Optimal2) | 2.55 | 3.1 GB/s |
+  | Oodle Mermaid (Optimal2) | 3.02 | 1.6 GB/s |
+  | Oodle Kraken (Optimal2) | 3.27 | 0.6 GB/s |
+  | Oodle Leviathan (Optimal2) | 3.34 | 0.6 GB/s |
+
+  Oodle is ahead on this data. Selkie beats plain zap on both ratio and decode speed, and Mermaid decodes as fast as plain zap at a 3.02 ratio, 22% smaller than zap hc64. zap's entropy mode is closer to Kraken's ratio (2.86 vs 3.27) but not its speed class. Oodle is proprietary, so zap doesn't ship it; the Package tab loads your own DLL.
 
 ## Format
 
@@ -412,6 +463,40 @@ offset extra bits (LSB-first)
 - **Offset codes:** code 0 repeats the previous offset. Code c in 1..23 means an offset in [2^(c−1), 2^c), followed by c−1 extra bits.
 - **End of block:** literals left over after the last sequence end the block.
 
+### .zappak
+
+```
+"ZPAK" u32 version (1) u32 count u32 0 u64 toc_offset u64 toc_size
+zap frames, one per file, back to back
+toc: count x { u64 offset, u64 stored_size, u64 raw_size, u32 name_offset, u32 name_length } sorted by name (bytewise),
+     then the names (UTF-8, '/' separators, not NUL-terminated)
+```
+
+### .zapvid
+
+```
+"ZAPVID" u8 version (1) u8 colour (bit 0: BT.709 matrix, else BT.601; bit 1: full range, else limited)
+u16 width  u16 height  u32 fps_numerator  u32 fps_denominator  u32 frames  u32 keyframe_interval
+u64 index_offset  u64 index_size (16 x frames)  u32 0                                  -> 48 bytes
+packets, back to back
+index: frames x { u64 offset, u32 size, u32 flags (bit 0: keyframe) }
+```
+
+### Video packets
+
+```
+"ZV" u8 type ('I' or 'P') u8 quality u16 width u16 height
+u8 method[3] (modes, vectors, coefficients: 0 raw, 1 zap, 2 Huffman) u8 version (1)
+u32 raw_size[i], u32 stored_size[i] for the 3 streams                                  -> 36 bytes
+version 1: u8 slices, then per slice LEB128 vector_bytes, LEB128 coefficient_bytes
+the 3 streams
+```
+
+- **Modes:** one byte per 16×16 macroblock: mode (0 skip, 1 inter, 2 intra) | coded-block mask << 2.
+- **Vectors:** per inter macroblock, x and y half-pel deltas from the left neighbour (1 byte, or 0x80 + int16).
+- **Coefficients:** per coded 8×8 block, zigzag run/level tokens (0x00–0x7F: run 0–7, level ±1–8; 0x81+run: int16 level; 0x80 ends the block).
+- **Slices:** slice k covers macroblock rows [k·rows/slices, (k+1)·rows/slices). Its byte counts must tile both streams exactly, so it can be decoded on its own. Version 0 packets (zap 1.1) have no slice table and decode as one slice; zap 1.1 decoders can't read version 1 packets.
+
 ## Building and testing
 
 ```sh
@@ -419,7 +504,7 @@ cmake -B build && cmake --build build --config Release
 ctest --test-dir build -C Release          # self-test + fuzz
 ```
 
-Or build it yourself. `bench.c`, `tex_bench.c` and `video_bench.c` are the test suites and benchmarks, `zap.c` is the CLI, and `tools/compare.c` compares against LZ4 and zstd (it needs both libraries):
+Or build it yourself. `bench.c`, `tex_bench.c` and `video_bench.c` are the test suites and benchmarks, `zap.c` is the CLI, `tools/compare.c` compares against LZ4 and zstd (it needs both libraries), and `tools/video_vs_h264.py` compares zap video with H.264 on any clip (needs ffmpeg):
 
 ```sh
 cc -std=c11 -O2 -pthread bench.c -o zap_bench && ./zap_bench
@@ -449,7 +534,7 @@ On Windows, CMake builds `zap_viewer` and fetches Dear ImGui v1.92.7, LZ4 1.10.0
   - SIMD is SSE2 only; there's no NEON (ARM) path yet, so ARM uses the scalar code.
   - Motion vectors reach at most 64 pixels.
   - Chroma motion is rounded to half-pixel.
-  - The decoder is single-threaded (the encoder can use threads).
+  - Decoding scales to about 2–4× on many threads: the three streams are unpacked serially before the slices decode in parallel.
   - The format is not compatible with any standard codec, so play it with `zap_video.h`.
 - **zap_viewer:** Windows only. Its source decoder is Media Foundation, which may use several threads, so its per-frame source decode time isn't a like-for-like single-core comparison.
 

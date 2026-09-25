@@ -7,6 +7,7 @@
 //   zap_viewer --verify             GPU conformance: decode every BC format (BC1-BC7, BC6H) on the GPU and diff against zap
 //                                   Package tab: drop files/folders, build a .zappak and compare zap against LZ4 and zstd
 //                                   (ratio, compress and decompress speed, per file type).
+//   zap_viewer --export in.mp4 out.zapvid [-q quality]   convert any Media Foundation video to .zapvid, then exit
 //   --oodle path/oo2core_9_win64.dll (or env ZAP_OODLE_DLL): add Oodle to the Package tab's comparison
 //   zap_viewer --shot out [image] [--video file] [--pak folder]   render out_texture(...).png, out_video.png and
 //                                   out_package.png, then exit
@@ -357,7 +358,7 @@ static std::wstring pick_file(HWND owner, bool video) {
 	ComPtr<IFileOpenDialog> d;
 	if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return {};
 	COMDLG_FILTERSPEC f[2] = { { L"Images", L"*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.tiff;*.gif;*.webp;*.heic;*.jxr" }, { L"All files", L"*.*" } };
-	if (video) f[0] = { L"Video", L"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.wmv;*.ts;*.mts" };
+	if (video) f[0] = { L"Video", L"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.wmv;*.ts;*.mts;*.zapvid" };
 	d->SetFileTypes(2, f);
 	ComPtr<IShellItem> it;
 	PWSTR p = nullptr;
@@ -368,7 +369,7 @@ static std::wstring pick_file(HWND owner, bool video) {
 }
 
 static bool is_video_path(const std::wstring& p) {
-	static const wchar_t* ext[] = { L".mp4", L".m4v", L".mov", L".mkv", L".webm", L".avi", L".wmv", L".ts", L".mts" };
+	static const wchar_t* ext[] = { L".mp4", L".m4v", L".mov", L".mkv", L".webm", L".avi", L".wmv", L".ts", L".mts", L".zapvid" };
 	for (const wchar_t* e : ext) { size_t n = wcslen(e); if (p.size() > n && _wcsicmp(p.c_str() + p.size() - n, e) == 0) return true; }
 	return false;
 }
@@ -410,7 +411,9 @@ struct Series {
 };
 
 struct Video {
-	ComPtr<IMFSourceReader> rd;
+	bool open = false; // a source is loaded (Media Foundation or .zapvid)
+	std::wstring path;
+	UINT32 fps_num = 30, fps_den = 1;
 	std::string name, codec, status;
 	int w = 0, h = 0, fh = 0, bt709 = 0, full = 0;
 	double fps = 30, src_kbps = 0, duration_s = 0;
@@ -562,29 +565,68 @@ static std::string codec_name(const GUID& g) {
 	return cc;
 }
 
+/* A Media Foundation source converted to I420 frames: shared by live playback and .zapvid export */
+struct MFSrc {
+	ComPtr<IMFSourceReader> rd;
+	std::string codec, err;
+	int w = 0, h = 0, fh = 0, bt709 = 0, full = 0;
+	UINT32 fps_num = 30, fps_den = 1;
+	double fps = 30, src_kbps = 0, duration_s = 0;
+	LONGLONG t_first = -1, t_last = 0; // sample times (100 ns) of the frames read so far
+	// .zapvid files are read with zap itself instead of Media Foundation
+	std::shared_ptr<std::vector<uint8_t>> file;
+	zap_vid vid = {};
+	std::shared_ptr<zap_video> zdec;
+	uint32_t next = 0;
+};
+
+static MFSrc g_play; // the source being played in the Video tab
 static void video_close() {
 	Video& v = A.vid;
 	zap_video_destroy(v.enc); zap_video_destroy(v.dec);
 	v = Video();
+	g_play = MFSrc();
 }
 
-static bool open_video(const std::wstring& path) {
-	video_close();
-	Video& v = A.vid;
+static bool ends_with(const std::wstring& p, const wchar_t* e) { size_t n = wcslen(e); return p.size() > n && _wcsicmp(p.c_str() + p.size() - n, e) == 0; }
+
+static bool zapvid_open(const std::wstring& path, MFSrc& v) {
+	FILE* f = _wfopen(path.c_str(), L"rb");
+	if (!f) { v.err = "can't open " + file_name(path); return false; }
+	_fseeki64(f, 0, SEEK_END);
+	long long n = _ftelli64(f);
+	_fseeki64(f, 0, SEEK_SET);
+	v.file = std::make_shared<std::vector<uint8_t>>((size_t)std::max(0LL, n));
+	bool ok = n > 0 && fread(v.file->data(), 1, (size_t)n, f) == (size_t)n;
+	fclose(f);
+	if (!ok || zap_vid_open(&v.vid, v.file->data(), v.file->size())) { v.err = file_name(path) + " is not a valid .zapvid"; return false; }
+	v.zdec.reset(zap_vdec_create(v.vid.w, v.vid.h), zap_video_destroy);
+	if (!v.zdec) { v.err = "bad .zapvid size"; return false; }
+	zap_vdec_threads(v.zdec.get(), (int)std::max(1u, std::thread::hardware_concurrency()));
+	v.codec = "zapvid"; v.w = v.vid.w; v.h = v.vid.h; v.fh = v.vid.h;
+	v.bt709 = v.vid.color & ZAP_VID_BT709; v.full = (v.vid.color & ZAP_VID_FULL_RANGE) != 0;
+	v.fps_num = v.vid.fps_num; v.fps_den = v.vid.fps_den; v.fps = (double)v.fps_num / v.fps_den;
+	v.duration_s = v.vid.frames / v.fps;
+	v.src_kbps = v.duration_s > 0 ? v.file->size() * 8 / v.duration_s / 1000 : 0;
+	return true;
+}
+
+static bool mf_open(const std::wstring& path, MFSrc& v) {
+	if (ends_with(path, L".zapvid")) return zapvid_open(path, v);
 	ComPtr<IMFAttributes> attr;
 	MFCreateAttributes(&attr, 1);
 	attr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE); // lets any decoder's output be converted to NV12
-	if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), attr.Get(), &v.rd))) { v.status = "Media Foundation can't open " + file_name(path); return false; }
+	if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), attr.Get(), &v.rd))) { v.err = "Media Foundation can't open " + file_name(path); return false; }
 	v.rd->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
 	v.rd->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
 	ComPtr<IMFMediaType> native, want, cur;
-	if (FAILED(v.rd->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &native))) { v.status = "no video stream"; v.rd.Reset(); return false; }
+	if (FAILED(v.rd->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &native))) { v.err = "no video stream"; v.rd.Reset(); return false; }
 	GUID sub = {};
 	native->GetGUID(MF_MT_SUBTYPE, &sub);
 	v.codec = codec_name(sub);
 	UINT32 num = 0, den = 0;
-	if (SUCCEEDED(MFGetAttributeRatio(native.Get(), MF_MT_FRAME_RATE, &num, &den)) && num && den) v.fps = (double)num / den;
-	if (v.fps < 1 || v.fps > 240) v.fps = 30;
+	if (SUCCEEDED(MFGetAttributeRatio(native.Get(), MF_MT_FRAME_RATE, &num, &den)) && num && den) { v.fps = (double)num / den; v.fps_num = num; v.fps_den = den; }
+	if (v.fps < 1 || v.fps > 240) { v.fps = 30; v.fps_num = 30; v.fps_den = 1; }
 	v.src_kbps = MFGetAttributeUINT32(native.Get(), MF_MT_AVG_BITRATE, 0) / 1000.0;
 	v.bt709 = MFGetAttributeUINT32(native.Get(), MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709) == MFVideoTransferMatrix_BT709;
 	v.full = MFGetAttributeUINT32(native.Get(), MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235) == MFNominalRange_0_255;
@@ -600,7 +642,7 @@ static bool open_video(const std::wstring& path) {
 	want->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
 	if (FAILED(v.rd->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, want.Get())) ||
 		FAILED(v.rd->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur))) {
-		v.status = "no decoder for " + v.codec + " (codec extension missing?)"; v.rd.Reset(); return false;
+		v.err = "no decoder for " + v.codec + " (codec extension missing?)"; v.rd.Reset(); return false;
 	}
 	UINT32 fw = 0, fh = 0;
 	MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &fw, &fh);
@@ -608,7 +650,81 @@ static bool open_video(const std::wstring& path) {
 	int w = (int)fw, h = (int)fh;
 	if (SUCCEEDED(cur->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE, (UINT8*)&area, sizeof area, nullptr)) && area.Area.cx && area.Area.cy) { w = (int)area.Area.cx; h = (int)area.Area.cy; }
 	v.w = w & ~1; v.h = h & ~1; v.fh = (int)fh;
-	if (v.w < 16 || v.h < 16) { v.status = "video too small"; v.rd.Reset(); return false; }
+	if (v.w < 16 || v.h < 16) { v.err = "video too small"; v.rd.Reset(); return false; }
+	return true;
+}
+
+/* next frame as I420: 1, or 0 at the end (after rewinding when loop), or -1 on error */
+static int mf_read(MFSrc& v, uint8_t* py, uint8_t* pu, uint8_t* pv, bool loop) {
+	if (v.file) { /* .zapvid: decode the next packet (all threads) */
+		if (v.next >= v.vid.frames) { if (!loop || !v.vid.frames) return 0; v.next = 0; }
+		size_t len;
+		const void* pk = zap_vid_frame(&v.vid, v.next, &len, nullptr);
+		if (zap_vdec_frame(v.zdec.get(), pk, len)) { v.err = "corrupt frame " + std::to_string(v.next); return -1; }
+		v.t_last = (LONGLONG)(v.next * 1e7 * v.fps_den / v.fps_num);
+		if (v.t_first < 0) v.t_first = v.t_last;
+		v.next++;
+		const uint8_t* p[3]; int ys, cs;
+		zap_video_planes(v.zdec.get(), &p[0], &p[1], &p[2], &ys, &cs);
+		for (int y = 0; y < v.h; y++) memcpy(py + (size_t)y * v.w, p[0] + (size_t)y * ys, (size_t)v.w);
+		for (int y = 0; y < v.h / 2; y++) { memcpy(pu + (size_t)y * v.w / 2, p[1] + (size_t)y * cs, (size_t)v.w / 2); memcpy(pv + (size_t)y * v.w / 2, p[2] + (size_t)y * cs, (size_t)v.w / 2); }
+		return 1;
+	}
+	for (int tries = 0; tries < 64; tries++) {
+		DWORD idx, flags = 0;
+		LONGLONG ts;
+		ComPtr<IMFSample> s;
+		if (FAILED(v.rd->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &idx, &flags, &ts, &s))) { v.err = "source decode error"; return -1; }
+		if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
+			if (!loop) return 0;
+			PROPVARIANT p;
+			PropVariantInit(&p); p.vt = VT_I8; p.hVal.QuadPart = 0;
+			v.rd->SetCurrentPosition(GUID_NULL, p);
+			continue;
+		}
+		if (!s) continue;
+		ComPtr<IMFMediaBuffer> buf;
+		if (FAILED(s->ConvertToContiguousBuffer(&buf))) return -1;
+		ComPtr<IMF2DBuffer> b2;
+		BYTE* data = nullptr;
+		LONG pitch = 0;
+		DWORD len = 0;
+		bool locked2d = SUCCEEDED(buf.As(&b2)) && SUCCEEDED(b2->Lock2D(&data, &pitch));
+		if (!locked2d) { if (FAILED(buf->Lock(&data, nullptr, &len))) return -1; pitch = (LONG)(len * 2 / 3 / (DWORD)v.fh); }
+		if (pitch < v.w) { if (locked2d) b2->Unlock2D(); else buf->Unlock(); v.err = "unexpected frame layout"; return -1; }
+		for (int y = 0; y < v.h; y++) memcpy(py + (size_t)y * v.w, data + (size_t)y * pitch, (size_t)v.w);
+		const BYTE* uv = data + (size_t)pitch * v.fh; // NV12: interleaved chroma follows the (padded) luma plane
+		for (int y = 0; y < v.h / 2; y++)
+			for (int x = 0; x < v.w / 2; x++) { pu[(size_t)y * v.w / 2 + x] = uv[(size_t)y * pitch + 2 * x]; pv[(size_t)y * v.w / 2 + x] = uv[(size_t)y * pitch + 2 * x + 1]; }
+		if (locked2d) b2->Unlock2D(); else buf->Unlock();
+		if (v.t_first < 0) v.t_first = ts;
+		v.t_last = ts;
+		return 1;
+	}
+	return -1;
+}
+
+/* Some sources report the wrong rate (Media Foundation's MKV parser gave 15 for a 30 fps file): when the frames'
+   own timestamps disagree by more than 5%, use them, snapped to a standard rate within 0.5% */
+static void mf_fix_rate(MFSrc& s, uint32_t frames) {
+	if (frames < 2 || s.t_last <= s.t_first) return;
+	double m = (frames - 1) * 1e7 / (double)(s.t_last - s.t_first);
+	if (std::fabs(m - s.fps) <= s.fps * 0.05) return;
+	static const UINT32 R[][2] = { { 24000, 1001 }, { 24, 1 }, { 25, 1 }, { 30000, 1001 }, { 30, 1 }, { 50, 1 }, { 60000, 1001 }, { 60, 1 }, { 120, 1 } };
+	s.fps_num = (UINT32)(m * 1000 + 0.5); s.fps_den = 1000;
+	for (auto& r : R) if (std::fabs(m - (double)r[0] / r[1]) < m * 0.005) { s.fps_num = r[0]; s.fps_den = r[1]; }
+	s.fps = (double)s.fps_num / s.fps_den;
+}
+
+
+static bool open_video(const std::wstring& path) {
+	video_close();
+	Video& v = A.vid;
+	g_play = MFSrc();
+	if (!mf_open(path, g_play)) { v.status = g_play.err; return false; }
+	v.open = true; v.path = path; v.codec = g_play.codec;
+	v.w = g_play.w; v.h = g_play.h; v.fh = g_play.fh; v.bt709 = g_play.bt709; v.full = g_play.full;
+	v.fps = g_play.fps; v.fps_num = g_play.fps_num; v.fps_den = g_play.fps_den; v.src_kbps = g_play.src_kbps; v.duration_s = g_play.duration_s;
 	v.y.resize((size_t)v.w * v.h); v.u.resize((size_t)v.w * v.h / 4); v.v.resize(v.u.size());
 	for (int i = 0; i < 6; i++) v.srv[i] = make_tex(A.g.dev.Get(), DXGI_FORMAT_R8_UNORM, i % 3 ? v.w / 2 : v.w, i % 3 ? v.h / 2 : v.h, nullptr, 0, &v.tex[i]);
 	v.dec = zap_vdec_create(v.w, v.h);
@@ -619,41 +735,81 @@ static bool open_video(const std::wstring& path) {
 }
 
 static bool read_source_frame() {
-	Video& v = A.vid;
-	for (int tries = 0; tries < 64; tries++) {
-		DWORD idx, flags = 0;
-		LONGLONG ts;
-		ComPtr<IMFSample> s;
-		if (FAILED(v.rd->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &idx, &flags, &ts, &s))) { v.status = "source decode error"; return false; }
-		if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { // loop
-			PROPVARIANT p;
-			PropVariantInit(&p); p.vt = VT_I8; p.hVal.QuadPart = 0;
-			v.rd->SetCurrentPosition(GUID_NULL, p);
-			continue;
-		}
-		if (!s) continue;
-		ComPtr<IMFMediaBuffer> buf;
-		if (FAILED(s->ConvertToContiguousBuffer(&buf))) return false;
-		ComPtr<IMF2DBuffer> b2;
-		BYTE* data = nullptr;
-		LONG pitch = 0;
-		DWORD len = 0;
-		bool locked2d = SUCCEEDED(buf.As(&b2)) && SUCCEEDED(b2->Lock2D(&data, &pitch));
-		if (!locked2d) { if (FAILED(buf->Lock(&data, nullptr, &len))) return false; pitch = (LONG)(len * 2 / 3 / (DWORD)v.fh); }
-		if (pitch < v.w) { if (locked2d) b2->Unlock2D(); else buf->Unlock(); v.status = "unexpected frame layout"; return false; }
-		for (int y = 0; y < v.h; y++) memcpy(&v.y[(size_t)y * v.w], data + (size_t)y * pitch, (size_t)v.w);
-		const BYTE* uv = data + (size_t)pitch * v.fh; // NV12: interleaved chroma follows the (padded) luma plane
-		for (int y = 0; y < v.h / 2; y++)
-			for (int x = 0; x < v.w / 2; x++) { v.u[(size_t)y * v.w / 2 + x] = uv[(size_t)y * pitch + 2 * x]; v.v[(size_t)y * v.w / 2 + x] = uv[(size_t)y * pitch + 2 * x + 1]; }
-		if (locked2d) b2->Unlock2D(); else buf->Unlock();
-		return true;
+	int r = mf_read(g_play, A.vid.y.data(), A.vid.u.data(), A.vid.v.data(), true);
+	if (r < 0) A.vid.status = g_play.err;
+	return r > 0;
+}
+
+/* ---------------- .zapvid export: a second reader on the same file, transcoded on all cores in the background */
+static struct Export {
+	std::thread th;
+	std::atomic<bool> busy{ false }, cancel{ false };
+	std::atomic<float> progress{ 0 };
+	std::mutex m;
+	std::string status;
+} X;
+
+/* returns an empty string on success, else the error */
+static std::string export_zapvid(const std::wstring& src, const std::wstring& dst, int quality, int keyint, int depth, std::string* summary) {
+	MFSrc s;
+	if (!mf_open(src, s)) return s.err;
+	zap_video* e = zap_venc_create(s.w, s.h, quality, keyint, depth);
+	if (!e) return "can't create the encoder for this size";
+	zap_venc_threads(e, (int)std::max(1u, std::thread::hardware_concurrency()));
+	FILE* f = _wfopen(dst.c_str(), L"wb");
+	if (!f) { zap_video_destroy(e); return "can't write " + file_name(dst); }
+	std::vector<uint8_t> y((size_t)s.w * s.h), u(y.size() / 4), v(y.size() / 4), pkt(zap_video_bound(e)), index;
+	uint8_t hdr[ZAP_VID_HEADER] = { 0 };
+	bool ok = fwrite(hdr, 1, sizeof hdr, f) == sizeof hdr;
+	uint64_t off = ZAP_VID_HEADER;
+	uint32_t frames = 0;
+	double expect = std::max(1.0, s.duration_s * s.fps);
+	auto t0 = Clock::now();
+	int r = 0;
+	while (ok && !X.cancel && (r = mf_read(s, y.data(), u.data(), v.data(), false)) > 0) {
+		size_t n = zap_venc_frame(e, y.data(), u.data(), v.data(), s.w, s.w / 2, pkt.data(), pkt.size());
+		ok = n && fwrite(pkt.data(), 1, n, f) == n;
+		index.resize(index.size() + ZAP_VID_ENTRY);
+		zap_vid_write_entry(index.data() + index.size() - ZAP_VID_ENTRY, off, (uint32_t)n, pkt[2] == 'I');
+		off += n; frames++;
+		X.progress = (float)std::min(1.0, frames / expect);
 	}
-	return false;
+	double secs = ms_since(t0) / 1000;
+	zap_video_destroy(e);
+	if (r < 0) ok = false;
+	ok = ok && !X.cancel && fwrite(index.data(), 1, index.size(), f) == index.size();
+	mf_fix_rate(s, frames);
+	zap_vid_write_header(hdr, s.w, s.h, s.fps_num, s.fps_den, frames, (uint32_t)keyint, off, (s.bt709 ? ZAP_VID_BT709 : 0) | (s.full ? ZAP_VID_FULL_RANGE : 0));
+	ok = ok && _fseeki64(f, 0, SEEK_SET) == 0 && fwrite(hdr, 1, sizeof hdr, f) == sizeof hdr;
+	ok = fclose(f) == 0 && ok;
+	if (!ok) { _wremove(dst.c_str()); return X.cancel ? "export cancelled" : r < 0 ? s.err : "write failed"; }
+	char buf[256];
+	double dur = frames * (double)s.fps_den / s.fps_num;
+	snprintf(buf, sizeof buf, "exported %u frames (%dx%d) to %s: %.1f MB, %.0f kbit/s, encoded at %.0f fps", frames, s.w, s.h, file_name(dst).c_str(),
+		(off + index.size()) / 1e6, dur > 0 ? (off + index.size()) * 8 / dur / 1000 : 0.0, frames / std::max(secs, 1e-3));
+	if (summary) *summary = buf;
+	return {};
+}
+
+static void export_start(const std::wstring& dst) {
+	if (X.busy) return;
+	if (X.th.joinable()) X.th.join();
+	static const int depth[3] = { 0, 8, 16 };
+	std::wstring src = A.vid.path;
+	int q = A.vid.quality, k = A.vid.keyint, d = depth[A.vid.packing];
+	X.busy = true; X.cancel = false; X.progress = 0;
+	X.th = std::thread([=] {
+		CoInitializeEx(nullptr, COINIT_MULTITHREADED); // Media Foundation needs COM on this thread
+		std::string sum, err = export_zapvid(src, dst, q, k, d, &sum);
+		{ std::lock_guard<std::mutex> l(X.m); X.status = err.empty() ? sum : err; }
+		CoUninitialize();
+		X.busy = false;
+		});
 }
 
 static void video_step() {
 	Video& v = A.vid;
-	if (!v.rd) return;
+	if (!v.open) return;
 	if (v.rebuild) {
 		static const int depth[3] = { 0, 8, 16 };
 		zap_video_destroy(v.enc);
@@ -951,8 +1107,14 @@ static void pak_build() {
 		set_status("timing unpack...");
 		auto unpack = [&](int threads) { /* best of 3: entries striped over threads, one scratch buffer each */
 			double best = 1e30;
+			std::vector<uint8_t> one(big ? big : 1);
 			for (int rep = 0; rep < 3 && ok; rep++) {
 				auto t = Clock::now();
+				if (threads > 1 && cnt < (size_t)threads) { /* few (big) entries: decode each one's blocks in parallel */
+					for (size_t i = 0; i < cnt; i++) zap_pak_read_mt(&k, i, one.data(), one.size(), threads);
+					best = std::min(best, ms_since(t));
+					continue;
+				}
 				std::vector<std::thread> th;
 				for (int ti = 0; ti < threads; ti++)
 					th.emplace_back([&, ti] {
@@ -1107,13 +1269,14 @@ static std::vector<std::wstring> pick_files(HWND owner) {
 	return r;
 }
 
-static std::wstring pick_save(HWND owner) {
+static std::wstring pick_save(HWND owner, const wchar_t* what = L"zap package", const wchar_t* pattern = L"*.zappak", const wchar_t* ext = L"zappak",
+	const std::wstring& name = L"content.zappak") {
 	ComPtr<IFileSaveDialog> d;
 	if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return {};
-	COMDLG_FILTERSPEC f[1] = { { L"zap package", L"*.zappak" } };
+	COMDLG_FILTERSPEC f[1] = { { what, pattern } };
 	d->SetFileTypes(1, f);
-	d->SetDefaultExtension(L"zappak");
-	d->SetFileName(L"content.zappak");
+	d->SetDefaultExtension(ext);
+	d->SetFileName(name.c_str());
 	ComPtr<IShellItem> it;
 	PWSTR p = nullptr;
 	if (FAILED(d->Show(owner)) || FAILED(d->GetResult(&it)) || FAILED(it->GetDisplayName(SIGDN_FILESYSPATH, &p))) return {};
@@ -1186,7 +1349,7 @@ static void plot(const char* label, const Series& s, float lo, float hi, const c
 static void ui_video() {
 	Video& v = A.vid;
 	if (ImGui::Button("Open video...")) { std::wstring p = pick_file(A.hwnd, true); if (!p.empty()) open_video(p); }
-	if (!v.rd) {
+	if (!v.open) {
 		ImGui::SameLine();
 		ImGui::TextDisabled("%s", v.status.empty() ? "MP4 / MOV / MKV / AVI / WMV: anything Media Foundation decodes" : v.status.c_str());
 		return;
@@ -1202,6 +1365,21 @@ static void ui_video() {
 	if (ImGui::SliderInt("Keyframe every", &v.keyint, 1, 300, "%d frames")) v.rebuild = true;
 	const char* packs[3] = { "fast", "hc depth 8", "hc depth 16" };
 	if (ImGui::Combo("Stream packing", &v.packing, packs, 3)) v.rebuild = true;
+	if (X.busy) {
+		ImGui::ProgressBar(X.progress, ImVec2(ImGui::GetFontSize() * 16, 0), "exporting .zapvid...");
+		ImGui::SameLine();
+		if (ImGui::Button("Cancel export")) X.cancel = true;
+	} else {
+		if (ImGui::Button("Export .zapvid...")) {
+			std::wstring stem = v.path.substr(v.path.find_last_of(L"\\/") + 1);
+			stem = stem.substr(0, stem.find_last_of(L'.'));
+			std::wstring dst = pick_save(A.hwnd, L"zap video", L"*.zapvid", L"zapvid", stem + L".zapvid");
+			if (!dst.empty()) export_start(dst);
+		}
+		ImGui::SameLine();
+		ImGui::TextDisabled("whole file, these settings, all cores");
+	}
+	{ std::lock_guard<std::mutex> l(X.m); if (!X.status.empty()) ImGui::TextDisabled("%s", X.status.c_str()); }
 	double zk = v.kbps.avg((int)v.fps), dec = v.dec_ms.avg(30), src = v.src_ms.avg(30), enc = v.enc_ms.avg(30);
 	if (ImGui::BeginTable("vstats", 3, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchSame)) {
 		ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 9);
@@ -1225,7 +1403,8 @@ static void ui_video() {
 		ImGui::TableNextColumn(); ImGui::Text("%.2f ms", enc);
 		ImGui::EndTable();
 	}
-	ImGui::TextDisabled("Source decode: Media Foundation (may use several threads, includes demux).");
+	if (v.codec == "zapvid") ImGui::TextDisabled("Source decode: the .zapvid itself, zap on %u threads.", std::max(1u, std::thread::hardware_concurrency()));
+	else ImGui::TextDisabled("Source decode: Media Foundation (may use several threads, includes demux).");
 	ImGui::TextDisabled("zap decode: 1 thread, SSE2.");
 	double budget = 1000.0 / v.fps, pipe = src + enc + dec;
 	ImGui::TextColored(pipe <= budget ? ImVec4(0.4f, 1, 0.5f, 1) : ImVec4(1, 0.7f, 0.3f, 1), "Live pipeline %.1f ms/frame, budget %.1f ms%s", pipe, budget,
@@ -1462,7 +1641,7 @@ static void render_scene(ID3D11RenderTargetView* rtv) {
 		ID3D11ShaderResourceView* srv[2] = { A.side[0].srv.Get(), A.side[1].srv.Get() };
 		draw(A.g, A.g.ps_tex.Get(), srv, 2, cb, A.ww, A.wh, rtv, smp);
 	}
-	else if (A.tab == 1 && A.vid.rd && A.vid.frames) {
+	else if (A.tab == 1 && A.vid.open && A.vid.frames) {
 		view_xf(A.vid.w, A.vid.h, cb);
 		cb[8] = (float)A.vid.bt709; cb[9] = (float)A.vid.full;
 		ID3D11ShaderResourceView* srv[6];
@@ -1473,7 +1652,7 @@ static void render_scene(ID3D11RenderTargetView* rtv) {
 
 static void frame(ID3D11RenderTargetView* rtv) {
 	tex_update();
-	if (A.tab == 1 && A.vid.rd && !A.vid.paused && Clock::now() >= A.vid.next) {
+	if (A.tab == 1 && A.vid.open && !A.vid.paused && Clock::now() >= A.vid.next) {
 		video_step();
 		A.vid.next += std::chrono::microseconds((long long)(1e6 / A.vid.fps));
 		if (Clock::now() - A.vid.next > std::chrono::milliseconds(250)) A.vid.next = Clock::now(); // fell behind: don't spiral
@@ -1543,19 +1722,28 @@ static void shots(const std::wstring& prefix, bool have_video, const std::wstrin
 // ----------------------------------------------------------------
 
 int wmain(int argc, wchar_t** argv) {
-	std::wstring path, shot, video, pak;
+	std::wstring path, shot, video, pak, exp_in, exp_out;
+	int exp_q = 70;
 	for (int i = 1; i < argc; i++) {
 		std::wstring a = argv[i];
 		if (a == L"--verify") return verify();
 		if (a == L"--shot" && i + 1 < argc) shot = argv[++i];
 		else if (a == L"--video" && i + 1 < argc) video = argv[++i];
 		else if (a == L"--pak" && i + 1 < argc) pak = argv[++i];
+		else if (a == L"--export" && i + 2 < argc) { exp_in = argv[++i]; exp_out = argv[++i]; }
+		else if (a == L"-q" && i + 1 < argc) exp_q = _wtoi(argv[++i]);
 		else if (a == L"--oodle" && i + 1 < argc) { if (!oodle_load(argv[++i])) fprintf(stderr, "can't load Oodle from %ls\n", argv[i]); }
 		else path = a;
 	}
 	if (!O.h) { wchar_t env[MAX_PATH]; if (GetEnvironmentVariableW(L"ZAP_OODLE_DLL", env, MAX_PATH)) oodle_load(env); }
 	CHECK(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
 	CHECK(MFStartup(MF_VERSION, MFSTARTUP_LITE));
+	if (!exp_in.empty()) { // headless: any Media Foundation video -> .zapvid
+		std::string sum, err = export_zapvid(exp_in, exp_out, exp_q, 60, 16, &sum);
+		printf("%s\n", err.empty() ? sum.c_str() : err.c_str());
+		MFShutdown();
+		return err.empty() ? 0 : 1;
+	}
 	ImGui_ImplWin32_EnableDpiAwareness();
 	float dpi = ImGui_ImplWin32_GetDpiScaleForMonitor(MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY));
 	A.ww = (int)(1600 * dpi); A.wh = (int)(900 * dpi);
@@ -1594,7 +1782,7 @@ int wmain(int argc, wchar_t** argv) {
 	if (path.empty() || !open_image(path)) open_image(L"C:\\Windows\\Web\\Wallpaper\\Windows\\img0.jpg");
 	if (!video.empty()) { open_video(video); A.want_tab = 1; }
 
-	if (!shot.empty()) shots(shot, A.vid.rd != nullptr, pak);
+	if (!shot.empty()) shots(shot, A.vid.open, pak);
 	else {
 		ShowWindow(A.hwnd, SW_SHOW);
 		for (bool quit = false; !quit;) {
@@ -1612,6 +1800,8 @@ int wmain(int argc, wchar_t** argv) {
 	for (auto& j : A.jobs) j.join();
 	P.cancel = true;
 	if (P.job.joinable()) P.job.join();
+	X.cancel = true;
+	if (X.th.joinable()) X.th.join();
 	video_close();
 	ImGui_ImplDX11_Shutdown();
 	ImGui_ImplWin32_Shutdown();

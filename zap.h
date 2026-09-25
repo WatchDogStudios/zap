@@ -35,7 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ZAP_VERSION "1.1.0"
+#define ZAP_VERSION "1.2.0"
 
 #define ZAP_HLOG 16
 #define ZAP_HC_HLOG 17
@@ -1020,12 +1020,34 @@ static inline int zap__tramp(void *p) { zap__task *k = (zap__task *)p; k->fn(k->
 typedef thrd_t zap__thread;
 #define ZAP__START(th, k) (thrd_create(&(th), zap__tramp, (k)) == thrd_success)
 #define ZAP__JOIN(th) thrd_join((th), NULL)
+typedef mtx_t zap__mtx;
+typedef cnd_t zap__cnd;
+#define ZAP__MINIT(m) (mtx_init(&(m), mtx_plain) == thrd_success)
+#define ZAP__CINIT(c) (cnd_init(&(c)) == thrd_success)
+#define ZAP__MFREE(m) mtx_destroy(&(m))
+#define ZAP__CFREE(c) cnd_destroy(&(c))
+#define ZAP__LOCK(m) mtx_lock(&(m))
+#define ZAP__UNLOCK(m) mtx_unlock(&(m))
+#define ZAP__WAIT(c, m) cnd_wait(&(c), &(m))
+#define ZAP__WAKE(c) cnd_signal(&(c))
+#define ZAP__WAKEALL(c) cnd_broadcast(&(c))
 #else
 #include <pthread.h>
 static inline void *zap__tramp(void *p) { zap__task *k = (zap__task *)p; k->fn(k->ctx, k->t, k->n); return NULL; }
 typedef pthread_t zap__thread;
 #define ZAP__START(th, k) (pthread_create(&(th), NULL, zap__tramp, (k)) == 0)
 #define ZAP__JOIN(th) pthread_join((th), NULL)
+typedef pthread_mutex_t zap__mtx;
+typedef pthread_cond_t zap__cnd;
+#define ZAP__MINIT(m) (pthread_mutex_init(&(m), NULL) == 0)
+#define ZAP__CINIT(c) (pthread_cond_init(&(c), NULL) == 0)
+#define ZAP__MFREE(m) pthread_mutex_destroy(&(m))
+#define ZAP__CFREE(c) pthread_cond_destroy(&(c))
+#define ZAP__LOCK(m) pthread_mutex_lock(&(m))
+#define ZAP__UNLOCK(m) pthread_mutex_unlock(&(m))
+#define ZAP__WAIT(c, m) pthread_cond_wait(&(c), &(m))
+#define ZAP__WAKE(c) pthread_cond_signal(&(c))
+#define ZAP__WAKEALL(c) pthread_cond_broadcast(&(c))
 #endif
 enum { ZAP__MAXT = 64 };
 
@@ -1033,6 +1055,79 @@ static inline int zap__threads(int want, size_t jobs) {
     if (want > ZAP__MAXT) want = ZAP__MAXT;
     if ((size_t)want > jobs) want = (int)jobs;
     return want < 1 ? 1 : want;
+}
+
+/* Persistent workers for work that repeats every few hundred microseconds (video frames), where starting threads
+   per call costs more than it saves. zap__pool_run(p, fn, ctx) runs fn(ctx, t, n) for t in [0, n), t = 0 on the
+   caller, and returns when all are done. */
+typedef struct zap__pool zap__pool;
+typedef struct { zap__pool *p; int t; } zap__pw;
+struct zap__pool {
+    int n, started, quit, pending;
+    unsigned gen;
+    void (*fn)(void *, int, int);
+    void *ctx;
+    zap__mtx m;
+    zap__cnd go, done;
+    zap__thread th[ZAP__MAXT];
+    zap__pw w[ZAP__MAXT];
+    zap__task k[ZAP__MAXT];
+};
+static inline void zap__pool_worker(void *arg, int t, int n) {
+    zap__pw *w = (zap__pw *)arg;
+    zap__pool *p = w->p;
+    unsigned seen = 0;
+    (void)t; (void)n;
+    for (;;) {
+        ZAP__LOCK(p->m);
+        while (p->gen == seen && !p->quit) ZAP__WAIT(p->go, p->m);
+        if (p->quit) { ZAP__UNLOCK(p->m); return; }
+        seen = p->gen;
+        void (*fn)(void *, int, int) = p->fn;
+        void *ctx = p->ctx;
+        ZAP__UNLOCK(p->m);
+        fn(ctx, w->t, p->n);
+        ZAP__LOCK(p->m);
+        if (--p->pending == 0) ZAP__WAKE(p->done);
+        ZAP__UNLOCK(p->m);
+    }
+}
+static inline void zap__pool_free(zap__pool *p) {
+    if (!p) return;
+    ZAP__LOCK(p->m); p->quit = 1; ZAP__WAKEALL(p->go); ZAP__UNLOCK(p->m);
+    for (int t = 1; t < p->started; t++) ZAP__JOIN(p->th[t]);
+    ZAP__MFREE(p->m); ZAP__CFREE(p->go); ZAP__CFREE(p->done);
+    free(p);
+}
+/* NULL if n < 2 or on failure: callers then run the work on one thread */
+static inline zap__pool *zap__pool_new(int n) {
+    if (n > ZAP__MAXT) n = ZAP__MAXT;
+    if (n < 2) return NULL;
+    zap__pool *p = (zap__pool *)calloc(1, sizeof *p);
+    if (!p) return NULL;
+    if (!ZAP__MINIT(p->m)) { free(p); return NULL; }
+    if (!ZAP__CINIT(p->go)) { ZAP__MFREE(p->m); free(p); return NULL; }
+    if (!ZAP__CINIT(p->done)) { ZAP__CFREE(p->go); ZAP__MFREE(p->m); free(p); return NULL; }
+    p->started = 1;
+    for (int t = 1; t < n; t++) {
+        p->w[t].p = p; p->w[t].t = t;
+        p->k[t].fn = zap__pool_worker; p->k[t].ctx = &p->w[t]; p->k[t].t = t; p->k[t].n = n;
+        if (!ZAP__START(p->th[t], &p->k[t])) break;
+        p->started = t + 1;
+    }
+    p->n = p->started;
+    if (p->n < 2) { zap__pool_free(p); return NULL; }
+    return p;
+}
+static inline void zap__pool_run(zap__pool *p, void (*fn)(void *, int, int), void *ctx) {
+    ZAP__LOCK(p->m);
+    p->fn = fn; p->ctx = ctx; p->pending = p->n - 1; p->gen++;
+    ZAP__WAKEALL(p->go);
+    ZAP__UNLOCK(p->m);
+    fn(ctx, 0, p->n);
+    ZAP__LOCK(p->m);
+    while (p->pending) ZAP__WAIT(p->done, p->m);
+    ZAP__UNLOCK(p->m);
 }
 
 static inline void zap__par(int n, void (*fn)(void *, int, int), void *ctx) {

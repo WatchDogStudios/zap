@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(zap VERSION 1.1.0 LANGUAGES C)
+project(zap VERSION 1.2.0 LANGUAGES C)
 
 # header-only: target_link_libraries(your_game PRIVATE zap::zap)
 add_library(zap INTERFACE)

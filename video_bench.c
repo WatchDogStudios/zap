@@ -76,6 +76,55 @@ static void simd_test(void) {
     }
 }
 
+/* slices: threaded decode == single-thread decode == encoder; version-0 packets (no slice table) still decode;
+   .zapvid round trip, truncation and fuzz */
+static void slice_test(void) {
+    enum { W = 320, H = 256, F = 8 };
+    static uint8_t yb[W * H], ub[W * H / 4], vb[W * H / 4];
+    zap_video *e = zap_venc_create(W, H, 60, 4, 0), *d1 = zap_vdec_create(W, H), *d4 = zap_vdec_create(W, H), *d0 = zap_vdec_create(W, H);
+    assert(e && d1 && d4 && d0);
+    zap_vdec_threads(d4, 4);
+    size_t cap = zap_video_bound(e), fl = ZAP_VID_HEADER;
+    uint8_t *pkt = malloc(cap), *v0 = malloc(cap), *file = malloc(ZAP_VID_HEADER + (size_t)F * (cap + ZAP_VID_ENTRY)), idx[F * ZAP_VID_ENTRY];
+    for (int f = 0; f < F; f++) {
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) yb[y * W + x] = (uint8_t)((x * 7 + y * 3 + f * 9) ^ (x * y >> 5)) + (uint8_t)(rand() % 4);
+        for (int i = 0; i < W * H / 4; i++) { ub[i] = (uint8_t)(i * 3 + f); vb[i] = (uint8_t)(200 - i % 77); }
+        size_t n = zap_venc_frame(e, yb, ub, vb, W, W / 2, pkt, cap);
+        assert(n && pkt[11] == 1 && pkt[ZAP__VHDR] == zap__vslices(H / 16) && pkt[ZAP__VHDR] > 1);
+        assert(zap_vdec_frame(d1, pkt, n) == 0 && zap_vdec_frame(d4, pkt, n) == 0);
+        same(e, d1, W, H); same(e, d4, W, H);
+        /* rebuild as a version-0 packet: header + streams, no slice table */
+        const uint8_t *q = pkt + ZAP__VHDR + 1;
+        for (int k = 0; k < pkt[ZAP__VHDR] * 2; k++) while (*q++ & 0x80) {}
+        size_t tl = (size_t)(q - (pkt + ZAP__VHDR));
+        memcpy(v0, pkt, ZAP__VHDR); v0[11] = 0; memcpy(v0 + ZAP__VHDR, pkt + ZAP__VHDR + tl, n - ZAP__VHDR - tl);
+        assert(zap_vdec_frame(d0, v0, n - tl) == 0);
+        same(e, d0, W, H);
+        memcpy(file + fl, pkt, n);
+        zap_vid_write_entry(idx + (size_t)f * ZAP_VID_ENTRY, fl, (uint32_t)n, pkt[2] == 'I');
+        fl += n;
+    }
+    memcpy(file + fl, idx, sizeof idx);
+    zap_vid_write_header(file, W, H, 30000, 1001, F, 4, fl, ZAP_VID_BT709);
+    size_t total = fl + sizeof idx;
+    zap_vid v;
+    assert(zap_vid_open(&v, file, total) == 0 && v.w == W && v.h == H && v.frames == F && v.fps_den == 1001 && v.color == ZAP_VID_BT709);
+    assert(zap_vid_keyframe(&v, 6) == 4 && zap_vid_keyframe(&v, 3) == 0);
+    zap_video *dv = zap_vdec_create(W, H);
+    for (uint32_t i = 0; i < v.frames; i++) { size_t len; int key; const void *pk = zap_vid_frame(&v, i, &len, &key); assert(key == (i % 4 == 0) && zap_vdec_frame(dv, pk, len) == 0); }
+    same(e, dv, W, H);
+    assert(zap_vid_open(&v, file, total - 1) != 0); /* truncated index */
+    uint8_t *bad = malloc(total);
+    for (int t = 0; t < 3000; t++) { /* corrupt files fail cleanly */
+        memcpy(bad, file, total);
+        bad[t < 1000 ? (size_t)rand() % ZAP_VID_HEADER : (size_t)rand() % total] ^= (uint8_t)(1 + rand() % 255);
+        if (zap_vid_open(&v, bad, total) == 0)
+            for (uint32_t i = 0; i < v.frames; i++) { size_t len; const void *pk = zap_vid_frame(&v, i, &len, NULL); zap_vdec_frame(d4, pk, len); }
+    }
+    free(pkt); free(v0); free(file); free(bad);
+    zap_video_destroy(e); zap_video_destroy(d1); zap_video_destroy(d4); zap_video_destroy(d0); zap_video_destroy(dv);
+}
+
 static void selftest(void) {
     huff_test();
     simd_test();
@@ -126,6 +175,7 @@ static void selftest(void) {
         zap_video_destroy(e); zap_video_destroy(d); zap_video_destroy(fz);
     }
     assert(!zap_vdec_create(3, 4) && !zap_venc_create(0, 2, 50, 1, 0)); /* odd / empty sizes rejected */
+    slice_test();
     printf("video selftest ok\n");
 }
 

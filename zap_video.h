@@ -5,11 +5,13 @@
  *   zap_venc_threads(e, 8);                                   optional, with ZAP_THREADS; output is identical
  *   size_t n = zap_venc_frame(e, y, u, v, ystride, uvstride, pkt, zap_video_bound(e));
  *   zap_video *d = zap_vdec_create(w, h);
+ *   zap_vdec_threads(d, 8);                                   optional, with ZAP_THREADS; output is identical
  *   if (zap_vdec_frame(d, pkt, n) == 0) zap_video_planes(d, &y, &u, &v, &ystride, &uvstride);
  *   zap_video_destroy(e); zap_video_destroy(d);
  *
- * Input/output is 8-bit YUV 4:2:0 (I420), even width/height. Each packet is one frame; store them in
- * whatever container you have. Packets must be decoded in order; I-frames are independent.
+ * Input/output is 8-bit YUV 4:2:0 (I420), even width/height. Each packet is one frame; store them in a .zapvid
+ * file (zap_vid_* below, with a seek index) or any container you have. Packets must be decoded in order from a
+ * keyframe; I-frames are independent.
  *
  * Design: 16x16 macroblocks, modes SKIP / INTER (half-pel motion vector + residual) / INTRA,
  * 8x8 DCT with a bit-exact integer inverse (no drift across compilers or platforms), byte-aligned
@@ -52,6 +54,7 @@ typedef struct {
     int enc, quality, keyint, depth;
     uint8_t *src[3], *tmp;
     int threads;
+    void *pool;                    /* zap__pool when threads > 1 (ZAP_THREADS) */
     size_t *rowlen;                /* per macroblock row: mv bytes, coef bytes */
     int16_t *pmv;                  /* previous frame's vectors: search seeds that keep rows independent */
     float bits[4][256];            /* estimated bits per byte: [0] I coefs, [1] P coefs, [2] modes, [3] mvs (from the last frame) */
@@ -97,6 +100,9 @@ static inline uint8_t *zap__vplane(const zap_video *v, int f, int p) {
 
 static inline void zap_video_destroy(zap_video *v) {
     if (!v) return;
+#ifdef ZAP_THREADS
+    zap__pool_free((zap__pool *)v->pool);
+#endif
     for (int f = 0; f < 2; f++) for (int p = 0; p < 3; p++) free(v->mem[f][p]);
     for (int p = 0; p < 3; p++) free(v->src[p]);
     free(v->tmp);
@@ -108,6 +114,7 @@ static inline zap_video *zap__vcreate(int w, int h) {
     if (w < 2 || h < 2 || (w | h) & 1 || w > 16384 || h > 16384) return NULL;
     zap_video *v = (zap_video *)calloc(1, sizeof *v);
     if (!v) return NULL;
+    v->threads = 1;
     v->w = w; v->h = h; v->mbw = (w + 15) / 16; v->mbh = (h + 15) / 16; v->nmb = v->mbw * v->mbh;
     v->cw = v->mbw * 16; v->ch = v->mbh * 16;
     v->ys = v->cw + 2 * ZAP__VPAD; v->cs = v->cw / 2 + 2 * ZAP__VCPAD;
@@ -144,7 +151,23 @@ static inline zap_video *zap_venc_create(int w, int h, int quality, int keyint, 
     return v;
 }
 
-static inline size_t zap_video_bound(const zap_video *v) { return ZAP__VHDR + (size_t)v->nmb + v->cap_mvs + v->cap_coefs; }
+/* packet version 1 adds a slice table after the header: u8 count, then per slice two LEB128 byte counts (its share
+   of the mv and coef streams). Slice k covers macroblock rows [k * mbh / count, (k + 1) * mbh / count), so the
+   decoder can reconstruct slices in parallel. Version 0 packets are one slice. */
+enum { ZAP__VMAXSLICE = 64 };
+static inline int zap__vslices(int mbh) { int s = mbh / 4; return s < 1 ? 1 : s > 32 ? 32 : s; }
+static inline size_t zap_video_bound(const zap_video *v) { return ZAP__VHDR + 1 + 10 * ZAP__VMAXSLICE + (size_t)v->nmb + v->cap_mvs + v->cap_coefs; }
+static inline uint8_t *zap__vputu(uint8_t *p, uint32_t x) { while (x >= 0x80) { *p++ = (uint8_t)(x | 0x80); x >>= 7; } *p++ = (uint8_t)x; return p; }
+static inline int zap__vgetu(const uint8_t **pp, const uint8_t *e, uint32_t *x) {
+    uint32_t r = 0;
+    for (int sh = 0; sh < 35; sh += 7) {
+        if (*pp >= e) return -1;
+        uint8_t b = *(*pp)++;
+        r |= (uint32_t)(b & 0x7F) << sh;
+        if (!(b & 0x80)) { *x = r; return 0; }
+    }
+    return -1;
+}
 
 /* last decoded (or encoded) frame; planes are valid until the next zap_*_frame call */
 static inline void zap_video_planes(const zap_video *v, const uint8_t **y, const uint8_t **u, const uint8_t **vp, int *ystride, int *uvstride) {
@@ -670,8 +693,13 @@ static inline void zap__vrow(zap__vjob *j, int my) {
 
 #ifdef ZAP_THREADS
 static inline void zap__vrows(void *p, int t, int n) { zap__vjob *j = (zap__vjob *)p; for (int r = t; r < j->v->mbh; r += n) zap__vrow(j, r); }
+static inline void zap__vset_threads(zap_video *v, int n) {
+    zap__pool_free((zap__pool *)v->pool);
+    v->pool = zap__pool_new(n);
+    v->threads = v->pool ? ((zap__pool *)v->pool)->n : 1;
+}
 /* encode with up to n threads (default 1). Output is identical for any thread count. */
-static inline void zap_venc_threads(zap_video *v, int n) { v->threads = n < 1 ? 1 : n; }
+static inline void zap_venc_threads(zap_video *v, int n) { zap__vset_threads(v, n); }
 #endif
 
 static inline size_t zap_venc_frame(zap_video *v, const uint8_t *y, const uint8_t *u, const uint8_t *vp, int ystride,
@@ -696,7 +724,7 @@ static inline size_t zap_venc_frame(zap_video *v, const uint8_t *y, const uint8_
     j.lam = ZAP__VLAMBDA * (float)j.steps[2][0] * (float)j.steps[2][0]; j.lm = ZAP__VLM * sqrtf(j.lam);
     for (int p = 0; p < 3; p++) { j.rec[p] = zap__vplane(v, v->cur, p); j.ref[p] = zap__vplane(v, v->cur ^ 1, p); }
 #ifdef ZAP_THREADS
-    if (v->threads > 1) zap__par(zap__threads(v->threads, (size_t)v->mbh), zap__vrows, &j);
+    if (v->pool) zap__pool_run((zap__pool *)v->pool, zap__vrows, &j);
     else
 #endif
     for (int r = 0; r < v->mbh; r++) zap__vrow(&j, r);
@@ -711,8 +739,17 @@ static inline size_t zap_venc_frame(zap_video *v, const uint8_t *y, const uint8_
     /* header: "ZV" type quality w h, 3 method bytes, pad, then (raw, stored) sizes for modes / mvs / coefs */
     out[0] = 'Z'; out[1] = 'V'; out[2] = (uint8_t)(key ? 'I' : 'P'); out[3] = (uint8_t)v->quality;
     out[4] = (uint8_t)v->w; out[5] = (uint8_t)(v->w >> 8); out[6] = (uint8_t)v->h; out[7] = (uint8_t)(v->h >> 8);
-    out[11] = 0;
+    out[11] = 1; /* packet version: slice table follows the header */
+    int ns = zap__vslices(v->mbh);
     size_t pos = ZAP__VHDR, c;
+    if (cap - pos < 1 + 10 * (size_t)ns) return 0;
+    out[pos++] = (uint8_t)ns;
+    for (int k = 0; k < ns; k++) {
+        size_t mv = 0, cf = 0;
+        for (int r = k * v->mbh / ns; r < (k + 1) * v->mbh / ns; r++) { mv += v->rowlen[2 * r]; cf += v->rowlen[2 * r + 1]; }
+        uint8_t *q = zap__vputu(zap__vputu(out + pos, (uint32_t)mv), (uint32_t)cf);
+        pos = (size_t)(q - out);
+    }
     const uint8_t *streams[3] = { v->modes, v->mvs, v->coefs };
     size_t lens[3] = { (size_t)(pm - v->modes), (size_t)(pv - v->mvs), (size_t)(pc - v->coefs) };
     for (int s = 0; s < 3; s++) {
@@ -729,30 +766,20 @@ static inline size_t zap_venc_frame(zap_video *v, const uint8_t *y, const uint8_
 
 /* ---------------- decoder */
 
-static inline int zap__vdec(zap_video *v, const void *pkt_, size_t n) {
-    const uint8_t *pkt = (const uint8_t *)pkt_;
-    if (n < ZAP__VHDR || pkt[0] != 'Z' || pkt[1] != 'V' || (pkt[2] != 'I' && pkt[2] != 'P')) return -1;
-    if ((pkt[4] | pkt[5] << 8) != v->w || (pkt[6] | pkt[7] << 8) != v->h) return -1;
-    int key = pkt[2] == 'I';
-    if (!key && !v->have_ref) return -1;
-    uint8_t *bufs[3] = { v->modes, v->mvs, v->coefs };
-    size_t caps[3] = { (size_t)v->nmb, v->cap_mvs, v->cap_coefs }, lens[3], pos = ZAP__VHDR;
-    for (int s = 0; s < 3; s++) {
-        size_t raw = zap__r32(pkt + 12 + 8 * s), c = zap__r32(pkt + 16 + 8 * s);
-        int m = pkt[8 + s];
-        if (raw > caps[s] || c > n - pos || (s == 0 && raw != (size_t)v->nmb)) return -1;
-        if (m == 0) { if (c != raw) return -1; memcpy(bufs[s], pkt + pos, raw); }
-        else if (m == 1) { if (c >= raw || zap_decompress(pkt + pos, c, bufs[s], raw, NULL) != (ptrdiff_t)raw) return -1; }
-        else if (m == 2) { if (zap__hdec(pkt + pos, c, bufs[s], raw)) return -1; }
-        else return -1;
-        lens[s] = raw; pos += c;
-    }
-    uint8_t steps[3][64];
-    zap__vsteps(pkt[3], steps);
-    uint8_t *rec[3], *ref[3];
-    for (int p = 0; p < 3; p++) { rec[p] = zap__vplane(v, v->cur, p); ref[p] = zap__vplane(v, v->cur ^ 1, p); }
-    const uint8_t *pv = v->mvs, *pve = v->mvs + lens[1], *pc = v->coefs, *pce = v->coefs + lens[2];
-    for (int my = 0; my < v->mbh; my++)
+typedef struct {
+    zap_video *v;
+    int key, ns, err[ZAP__VMAXSLICE];
+    uint8_t steps[3][64], *rec[3], *ref[3];
+    const uint8_t *mv[ZAP__VMAXSLICE + 1], *cf[ZAP__VMAXSLICE + 1]; /* slice k's stream ranges: [mv[k], mv[k + 1]) */
+} zap__vdjob;
+
+/* reconstruct slice k; it must consume exactly its share of both streams */
+static inline int zap__vdec_slice(zap__vdjob *j, int k) {
+    zap_video *v = j->v;
+    int key = j->key;
+    uint8_t (*steps)[64] = j->steps, **rec = j->rec, **ref = j->ref;
+    const uint8_t *pv = j->mv[k], *pve = j->mv[k + 1], *pc = j->cf[k], *pce = j->cf[k + 1];
+    for (int my = k * v->mbh / j->ns; my < (k + 1) * v->mbh / j->ns; my++)
         for (int mx = 0; mx < v->mbw; mx++) {
             int i = my * v->mbw + mx, x = mx * 16, yy = my * 16, mode = v->modes[i] & 3, cbp = v->modes[i] >> 2, mvx = 0, mvy = 0;
             if (mode == 3 || (key && mode != ZAP__INTRA) || (mode == ZAP__SKIP && cbp)) return -1;
@@ -779,7 +806,58 @@ static inline int zap__vdec(zap_video *v, const void *pkt_, size_t n) {
                 else zap__vfill(dst, rs, 8);
             }
         }
-    if (pv != pve || pc != pce) return -1;
+    return pv == pve && pc == pce ? 0 : -1;
+}
+
+#ifdef ZAP_THREADS
+static inline void zap__vdslices(void *p, int t, int n) { zap__vdjob *j = (zap__vdjob *)p; for (int k = t; k < j->ns; k += n) j->err[k] = zap__vdec_slice(j, k); }
+/* decode with up to n threads (default 1); slices are independent, so the output is the same for any n */
+static inline void zap_vdec_threads(zap_video *v, int n) { zap__vset_threads(v, n); }
+#endif
+
+static inline int zap__vdec(zap_video *v, const void *pkt_, size_t n) {
+    const uint8_t *pkt = (const uint8_t *)pkt_;
+    if (n < ZAP__VHDR || pkt[0] != 'Z' || pkt[1] != 'V' || (pkt[2] != 'I' && pkt[2] != 'P') || pkt[11] > 1) return -1;
+    if ((pkt[4] | pkt[5] << 8) != v->w || (pkt[6] | pkt[7] << 8) != v->h) return -1;
+    zap__vdjob j;
+    j.v = v; j.key = pkt[2] == 'I';
+    if (!j.key && !v->have_ref) return -1;
+    size_t pos = ZAP__VHDR, lens[3];
+    uint32_t sl[ZAP__VMAXSLICE][2];
+    j.ns = 1;
+    if (pkt[11] == 1) { /* slice table */
+        const uint8_t *p = pkt + pos, *e = pkt + n;
+        if (p >= e || !(j.ns = *p++) || j.ns > ZAP__VMAXSLICE || j.ns > v->mbh) return -1;
+        for (int k = 0; k < j.ns; k++) if (zap__vgetu(&p, e, &sl[k][0]) || zap__vgetu(&p, e, &sl[k][1])) return -1;
+        pos = (size_t)(p - pkt);
+    }
+    uint8_t *bufs[3] = { v->modes, v->mvs, v->coefs };
+    size_t caps[3] = { (size_t)v->nmb, v->cap_mvs, v->cap_coefs };
+    for (int s = 0; s < 3; s++) {
+        size_t raw = zap__r32(pkt + 12 + 8 * s), c = zap__r32(pkt + 16 + 8 * s);
+        int m = pkt[8 + s];
+        if (raw > caps[s] || c > n - pos || (s == 0 && raw != (size_t)v->nmb)) return -1;
+        if (m == 0) { if (c != raw) return -1; memcpy(bufs[s], pkt + pos, raw); }
+        else if (m == 1) { if (c >= raw || zap_decompress(pkt + pos, c, bufs[s], raw, NULL) != (ptrdiff_t)raw) return -1; }
+        else if (m == 2) { if (zap__hdec(pkt + pos, c, bufs[s], raw)) return -1; }
+        else return -1;
+        lens[s] = raw; pos += c;
+    }
+    if (pkt[11] == 0) { sl[0][0] = (uint32_t)lens[1]; sl[0][1] = (uint32_t)lens[2]; }
+    j.mv[0] = v->mvs; j.cf[0] = v->coefs;
+    for (int k = 0; k < j.ns; k++) { /* the slices must tile both streams exactly */
+        if (sl[k][0] > (size_t)(v->mvs + lens[1] - j.mv[k]) || sl[k][1] > (size_t)(v->coefs + lens[2] - j.cf[k])) return -1;
+        j.mv[k + 1] = j.mv[k] + sl[k][0]; j.cf[k + 1] = j.cf[k] + sl[k][1];
+    }
+    if (j.mv[j.ns] != v->mvs + lens[1] || j.cf[j.ns] != v->coefs + lens[2]) return -1;
+    zap__vsteps(pkt[3], j.steps);
+    for (int p = 0; p < 3; p++) { j.rec[p] = zap__vplane(v, v->cur, p); j.ref[p] = zap__vplane(v, v->cur ^ 1, p); }
+#ifdef ZAP_THREADS
+    if (v->pool && j.ns > 1) zap__pool_run((zap__pool *)v->pool, zap__vdslices, &j);
+    else
+#endif
+        for (int k = 0; k < j.ns; k++) j.err[k] = zap__vdec_slice(&j, k);
+    for (int k = 0; k < j.ns; k++) if (j.err[k]) return -1;
     zap__vextend(v, v->cur);
     v->cur ^= 1;
     return 0;
@@ -790,6 +868,68 @@ static inline int zap_vdec_frame(zap_video *v, const void *pkt, size_t n) {
     int r = v->enc ? -1 : zap__vdec(v, pkt, n);
     v->have_ref = r == 0;
     return r;
+}
+
+/* ---------------- .zapvid files
+ *
+ *   header  48 bytes: "ZAPVID" u8 version (1) u8 colour (ZAP_VID_BT709 | ZAP_VID_FULL_RANGE; 0 = BT.601 limited range),
+ *                     u16 width, u16 height, u32 fps numerator, u32 fps denominator,
+ *                     u32 frame count, u32 keyframe interval, u64 index offset, u64 index size (16 x frames), u64 0
+ *   frames  zap_venc_frame packets, back to back from offset 48
+ *   index   per frame: u64 offset, u32 size, u32 flags (bit 0: keyframe)
+ * All little-endian. Writers put the index last, so a file can be written in one pass and the header patched at the
+ * end; readers get random access and seeking from the index. zap_vid_open checks the header and every index entry,
+ * so a truncated or corrupt file fails there (or in zap_vdec_frame), never by reading outside the buffer. */
+enum { ZAP_VID_HEADER = 48, ZAP_VID_ENTRY = 16, ZAP_VID_BT709 = 1, ZAP_VID_FULL_RANGE = 2 };
+
+typedef struct {
+    const uint8_t *p, *index;
+    size_t n;
+    int w, h, color;
+    uint32_t fps_num, fps_den, frames, keyint;
+} zap_vid;
+
+static inline void zap_vid_write_header(uint8_t hdr[ZAP_VID_HEADER], int w, int h, uint32_t fps_num, uint32_t fps_den,
+                                        uint32_t frames, uint32_t keyint, uint64_t index_offset, int color) {
+    memset(hdr, 0, ZAP_VID_HEADER);
+    memcpy(hdr, "ZAPVID", 6); hdr[6] = 1; hdr[7] = (uint8_t)(color & 3);
+    hdr[8] = (uint8_t)w; hdr[9] = (uint8_t)(w >> 8); hdr[10] = (uint8_t)h; hdr[11] = (uint8_t)(h >> 8);
+    zap__w32(hdr + 12, fps_num); zap__w32(hdr + 16, fps_den); zap__w32(hdr + 20, frames); zap__w32(hdr + 24, keyint);
+    zap__w64(hdr + 28, index_offset); zap__w64(hdr + 36, (uint64_t)frames * ZAP_VID_ENTRY);
+}
+static inline void zap_vid_write_entry(uint8_t e[ZAP_VID_ENTRY], uint64_t offset, uint32_t size, int key) {
+    zap__w64(e, offset); zap__w32(e + 8, size); zap__w32(e + 12, key ? 1u : 0u);
+}
+
+static inline int zap_vid_open(zap_vid *v, const void *p_, size_t n) {
+    const uint8_t *p = (const uint8_t *)p_;
+    if (n < ZAP_VID_HEADER || memcmp(p, "ZAPVID", 6) || p[6] != 1 || p[7] > 3) return -1;
+    v->p = p; v->n = n; v->color = p[7];
+    v->w = p[8] | p[9] << 8; v->h = p[10] | p[11] << 8;
+    v->fps_num = zap__r32(p + 12); v->fps_den = zap__r32(p + 16); v->frames = zap__r32(p + 20); v->keyint = zap__r32(p + 24);
+    uint64_t io = zap__r64(p + 28), is = zap__r64(p + 36);
+    if (v->w < 2 || v->h < 2 || (v->w | v->h) & 1 || !v->fps_num || !v->fps_den) return -1;
+    if (io < ZAP_VID_HEADER || io > n || is != (uint64_t)v->frames * ZAP_VID_ENTRY || is > n - io) return -1;
+    v->index = p + io;
+    for (uint32_t i = 0; i < v->frames; i++) {
+        const uint8_t *e = v->index + (size_t)i * ZAP_VID_ENTRY;
+        uint64_t off = zap__r64(e), sz = zap__r32(e + 8);
+        if (off < ZAP_VID_HEADER || off > io || sz > io - off) return -1;
+    }
+    if (v->frames && !(zap__r32(v->index + 12) & 1)) return -1; /* the first frame must be a keyframe */
+    return 0;
+}
+/* packet of frame i (i < frames) */
+static inline const void *zap_vid_frame(const zap_vid *v, uint32_t i, size_t *len, int *key) {
+    const uint8_t *e = v->index + (size_t)i * ZAP_VID_ENTRY;
+    *len = zap__r32(e + 8);
+    if (key) *key = (int)(zap__r32(e + 12) & 1);
+    return v->p + zap__r64(e);
+}
+/* the keyframe to start decoding from to show frame i */
+static inline uint32_t zap_vid_keyframe(const zap_vid *v, uint32_t i) {
+    while (i && !(zap__r32(v->index + (size_t)i * ZAP_VID_ENTRY + 12) & 1)) i--;
+    return i;
 }
 
 #endif
