@@ -5,7 +5,7 @@ Single-header C compression for games:
 | Header | What it does |
 |---|---|
 | `zap.h` | Fast LZ77 compressor for **asset packaging** and **network packets**, with an optional Huffman-coded **entropy mode** |
-| `zap_tex.h` | GPU texture block compression (**BC1/BC3/BC4/BC5/BC7**, plus **BC6H** for HDR) with rate-distortion optimisation tuned for `zap.h`, and **mipmap** generation |
+| `zap_tex.h` | GPU texture block compression (**BC1/BC3/BC4/BC5/BC7**, **BC6H** for HDR, and **ASTC 4×4** for mobile) with rate-distortion optimisation tuned for `zap.h`, and **mipmap** generation |
 | `zap_video.h` | Simple, fast-decoding **video codec** for cutscenes and UI video (SSE2 decoder) |
 | `samples/dx11` | **zap_viewer**: D3D11 + Dear ImGui app that compares encodings of your own images and videos side by side, with stats |
 
@@ -124,8 +124,12 @@ for (int l = 0; l < zap_mip_levels(w, h); l++) {
 
 /* HDR: float RGBA in, BC6H (DXGI_FORMAT_BC6H_UF16) out, same size as BC7 */
 zap_bc6h_encode(rgba_float, w, h, w * 4 /* floats per row */, out);
+
+/* mobile: ASTC 4x4 LDR (16 bytes per block, same size as BC7) */
+zap_astc_encode(rgba, w, h, w * 4, out);
 ```
 - `zap_bc_decode` converts BCn back to RGBA8 for tools and tests.
+- ASTC 4×4 uses one or two partitions, luminance/RGB or RGBA endpoints, and a search over weight and endpoint precisions. Its output is standard ASTC: ARM's `astcenc` 5.7.0 decodes it bit-identically to `zap_astc_decode`. zap's encoder is simple and slower than `astcenc -fastest`, so use `astcenc` when shipping quality matters (see Benchmarks).
 
 ### Video
 
@@ -152,7 +156,7 @@ if (zap_vdec_frame(dec, packet, n) == 0) {
 zap c [-e] [-x] [-l depth] [-b block_kb] [-t threads] [-D dict] in out   # pack (depth 0 = fast, >= 32 optimal parse, default 64; -e entropy, -x faster decode)
 zap d [-t threads] [-D dict] in out                            # unpack
 zap train [-s dict_bytes] dict.bin samples...                  # train a packet dictionary
-zap tex [-f bc1|bc3|bc4|bc5|bc7] [-r rdo] [-m] [-S] w h in.rgba out.dds  # raw RGBA8 -> DDS (-m mip chain, -S sRGB)
+zap tex [-f bc1|bc3|bc4|bc5|bc7|astc] [-r rdo] [-m] [-S] w h in.rgba out.dds  # raw RGBA8 -> DDS (-m mip chain, -S sRGB); -f astc writes a .astc file
 zap venc [-q quality] [-k keyint] [-F fps] w h in.yuv out.zv   # raw I420 -> .zv video
 zap vdec in.zv out.yuv                                         # .zv -> raw I420
 ```
@@ -169,7 +173,7 @@ zap_viewer --shot out [image] [--video clip.mp4]   # render the screenshots abov
 
 The view is split: drag the line to move it, zoom with the mouse wheel, pan with the right button. **Difference ×8** shows where the two sides disagree.
 
-- **Texture tab:** open any image WIC can read (PNG, JPEG, TIFF, BMP, …). Pick a format for each side (original RGBA8, BC1, BC3 or BC7), each with its own RDO slider. The table shows PSNR, GPU memory, size on disk after zap, bits per pixel and encode time for both sides. Re-encodes run in the background on all cores.
+- **Texture tab:** open any image WIC can read (PNG, JPEG, TIFF, BMP, …). Pick a format for each side (original RGBA8, BC1, BC3, BC7 or ASTC 4×4), each with its own RDO slider (BCn only). D3D11 can't sample ASTC, so the viewer shows zap's CPU decode of it. The table shows PSNR, GPU memory, size on disk after zap, bits per pixel and encode time for both sides. Re-encodes run in the background on all cores.
 - **Video tab:** open any file Media Foundation can decode (MP4/MOV/MKV/AVI/WMV with H.264, HEVC, VP9 or AV1, if the codec is installed). Each frame is transcoded live through zap: the source is decoded on the left and zap's encode/decode is shown on the right. Live stats and plots cover bitrate for both, zap's PSNR against the source, decode time per frame for both, and zap's encode time. Quality, keyframe interval and stream packing can be changed while it plays.
 
 `--verify` result on an AMD Radeon RX 9060 XT:
@@ -204,6 +208,7 @@ Memory: `zap_state` is 256 KB, `zap_dict` is 256 KB plus the dictionary data, an
 | `zap_bc_split / zap_bc_merge(in, n, fmt, out)` | Lossless: gathers endpoints and indices into separate planes, so zap finds longer matches. |
 
 | `zap_bc6h_encode(rgba_float, w, h, stride, out)` / `zap_bc6h_decode(bc, w, h, rgba_half, stride)` | HDR to BC6H (unsigned) and back. Input is 4 floats per pixel, and negatives are clamped to 0. Output size is `zap_bc_size(w, h, ZAP_BC7)`. The decoder writes half-float bits. |
+| `zap_astc_encode(rgba, w, h, stride, out)` / `zap_astc_decode(bc, w, h, rgba, stride)` | RGBA8 to ASTC 4×4 LDR (UNORM) and back, 16 bytes per block. The decoder reads what zap writes plus void-extent blocks; blocks outside that subset decode to magenta. |
 | `zap_mip_levels(w, h)` | Number of levels in a full mip chain, down to 1×1. |
 | `zap_mip_next(src, w, h, stride, srgb, dst, dst_stride)` | Next mip level of an RGBA8 image with a 2×2 box filter. With `srgb`, color is averaged in linear light (alpha is always linear). |
 | `zap_mip_next_f(src, w, h, stride, dst, dst_stride)` | The same for float (linear or HDR) images. |
@@ -267,6 +272,16 @@ These are single runs on an AMD Ryzen 7 5800X (8 cores) with clang 18 `-O3 -marc
   |---|---|---|---|
   | Cutout alpha with detailed color | 40.42 dB | **44.52 dB** | 40.83 dB |
   | Smooth independent alpha ramp | 48.02 dB | 48.05 dB | 43.78 dB |
+
+- **ASTC 4×4 vs ARM astcenc 5.7.0:** PSNR over RGBA on two synthetic images, single thread. MT/s is millions of texels per second.
+
+  | Encoder | Mandelbrot render | RGBA with alpha | Speed |
+  |---|---|---|---|
+  | zap | 37.07 dB | 40.43 dB | 1.6 MT/s |
+  | astcenc `-fastest` | 39.05 dB | 42.25 dB | 7.5 MT/s |
+  | astcenc `-medium` | 40.52 dB | 44.00 dB | slower |
+
+  astcenc is 2 dB better and about 5× faster. zap's ASTC exists so the whole pipeline works with no dependencies; for shipping, run astcenc and pack its blocks with zap.
 
 **Video:** 1280×720, 150 frames, 30 fps, single thread. The pan clip is a slow zoom and pan across a photo; the second clip is ffmpeg's `testsrc2` pattern. zap uses hc depth 16. The other codecs were encoded with ffmpeg at a matched bitrate and decoded by ffmpeg (`-threads 1`). PSNR is measured on the Y channel by the same code for every codec.
 
@@ -376,7 +391,7 @@ On Windows, CMake builds `zap_viewer` and fetches Dear ImGui v1.92.7 with FetchC
 - **No stored sizes:** the raw block API doesn't record sizes, so store them yourself. Frames do record them.
 - **MSVC:** `ZAP_THREADS` needs MSVC 17.8+ for `<threads.h>`. You can skip it and use `zap_frame_decode_block` from your own threads instead.
 - **Textures:**
-  - There's no ASTC yet.
+  - ASTC is 4×4 LDR UNORM only: no other block sizes, no HDR, no sRGB-specific encoding, no dual-plane, and at most two partitions (tried only for opaque blocks). The decoder only reads that subset, so it can't read every ASTC file. It's about 2 dB behind astcenc.
   - BC6H is unsigned mode 11 only: one region, 10-bit endpoints. The decoder reads only mode 11 (other modes decode to 0), so it can't read BC6H files from other encoders. There's no signed BC6H.
   - The BC7 encoder uses modes 6, 5 and 1. The three-subset modes (0, 2) and modes 3, 4 and 7 are decode-only.
   - Mipmaps use a 2×2 box filter, and odd sizes drop the last row or column. A wider filter (Kaiser or Lanczos) would keep more detail, and there's no alpha-weighted (premultiplied) filtering.

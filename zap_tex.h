@@ -17,6 +17,7 @@
  * index bytes of recent mode-6 blocks.
  *
  *   zap_bc6h_encode(rgba_float, w, h, stride, out) / zap_bc6h_decode   HDR (BC6H unsigned, mode 11)
+ *   zap_astc_encode(rgba, w, h, stride, out) / zap_astc_decode           ASTC 4x4 LDR (mobile), 16 bytes per block
  *   zap_mip_levels(w, h), zap_mip_next(src, w, h, stride, srgb, dst, dst_stride), zap_mip_next_f(...)   mipmaps
  * Decoded BC4 is (r,0,0,255) and BC5 is (r,g,0,255), like GPU sampling.
  * Any width/height; partial edge blocks replicate the edge pixels.
@@ -922,6 +923,381 @@ static inline void zap_bc6h_decode(const void *bc_, int w, int h, uint16_t *rgba
             for (int i = 0; i < 16; i++) {
                 int x = bx * 4 + (i & 3), y = by * 4 + (i >> 2);
                 if (x < w && y < h) memcpy(rgba + (size_t)y * stride + (size_t)x * 4, px[i], 8);
+            }
+        }
+}
+
+/* ---------------- ASTC 4x4, LDR, linear (UNORM) decode. 4x4 weight grid, no dual plane, 1 or 2 partitions.
+ * Each block tries these and keeps the best (the endpoint range isn't stored: decoders infer it from the bits
+ * left over, so it's whatever the spec's rule picks):
+ *   1 partition, opaque (CEM 8, RGB direct):   weights 16 levels / endpoints 192 | 8 / 256 | 32 / 32
+ *   1 partition, alpha  (CEM 12, RGBA direct): weights 16 / endpoints 48 | 8 / 192 | 4 / 256
+ *   2 partitions, opaque (CEM 8): weights 8 / endpoints 16 | 4 / 40; the partition is picked by 2-means
+ *     clustering, then the best-matching of the 1024 partition patterns are fitted fully
+ * zap_astc_decode reads exactly this subset plus constant-color (void-extent) blocks; anything else decodes to
+ * magenta. Verified bit-exact against ARM astcenc's decoder. */
+
+typedef struct { uint16_t levels; uint8_t trit, quint, bits; } zap__iser;
+static const zap__iser ZAP__ISE[21] = {
+    { 2, 0, 0, 1 }, { 3, 1, 0, 0 }, { 4, 0, 0, 2 }, { 5, 0, 1, 0 }, { 6, 1, 0, 1 }, { 8, 0, 0, 3 }, { 10, 0, 1, 1 },
+    { 12, 1, 0, 2 }, { 16, 0, 0, 4 }, { 20, 0, 1, 2 }, { 24, 1, 0, 3 }, { 32, 0, 0, 5 }, { 40, 0, 1, 3 }, { 48, 1, 0, 4 },
+    { 64, 0, 0, 6 }, { 80, 0, 1, 4 }, { 96, 1, 0, 5 }, { 128, 0, 0, 7 }, { 160, 0, 1, 5 }, { 192, 1, 0, 6 }, { 256, 0, 0, 8 } };
+
+static inline int zap__ise_bits(const zap__iser *r, int n) { return n * r->bits + (r->trit ? (8 * n + 4) / 5 : r->quint ? (7 * n + 2) / 3 : 0); }
+
+/* the spec's rule: the largest color range (>= 6 levels) whose encoding fits in the bits left */
+static inline const zap__iser *zap__astc_crange(int nvals, int avail) {
+    for (int i = 20; i >= 4; i--) if (zap__ise_bits(&ZAP__ISE[i], nvals) <= avail) return &ZAP__ISE[i];
+    return NULL;
+}
+
+static inline int zap__rep(int v, int n, int to) { /* bit replication of an n-bit value to `to` bits */
+    int x = 0;
+    for (int sh = to - n; sh > -n; sh -= n) x |= sh >= 0 ? v << sh : v >> -sh;
+    return x & ((1 << to) - 1);
+}
+
+/* color endpoint unquantization to 0..255 */
+static inline int zap__astc_cunq(const zap__iser *r, int v) {
+    if (!r->trit && !r->quint) return zap__rep(v, r->bits, 8);
+    int n = r->bits, m = v & ((1 << n) - 1), D = v >> n;
+    int a = m & 1, b = m >> 1 & 1, c = m >> 2 & 1, d = m >> 3 & 1, e = m >> 4 & 1, f = m >> 5 & 1, A = a ? 0x1FF : 0, B = 0, C = 0;
+    switch (r->levels) {
+    case 6: C = 204; break;
+    case 10: C = 113; break;
+    case 12: B = b << 8 | b << 4 | b << 2 | b << 1; C = 93; break;
+    case 20: B = b << 8 | b << 3 | b << 2; C = 54; break;
+    case 24: B = c << 8 | b << 7 | c << 3 | b << 2 | c << 1 | b; C = 44; break;
+    case 40: B = c << 8 | b << 7 | c << 2 | b << 1 | c; C = 26; break;
+    case 48: B = d << 8 | c << 7 | b << 6 | d << 2 | c << 1 | b; C = 22; break;
+    case 80: B = d << 8 | c << 7 | b << 6 | d << 1 | c; C = 13; break;
+    case 96: B = e << 8 | d << 7 | c << 6 | b << 5 | e << 1 | d; C = 11; break;
+    case 160: B = e << 8 | d << 7 | c << 6 | b << 5 | e; C = 6; break;
+    case 192: B = f << 8 | e << 7 | d << 6 | c << 5 | b << 4 | f; C = 5; break;
+    }
+    int T = (D * C + B) ^ A;
+    return (A & 0x80) | (T >> 2);
+}
+
+/* weights (power-of-two ranges only): n-bit index -> 0..64 */
+static inline int zap__astc_wunq(int w, int n) { int x = zap__rep(w, n, 6); return x > 32 ? x + 1 : x; }
+
+static inline void zap__trits(int T, int t[5]) { /* 8 bits -> 5 trits (spec C.2.12) */
+    int C;
+    if ((T >> 2 & 7) == 7) { C = (T >> 5 & 7) << 2 | (T & 3); t[4] = 2; t[3] = 2; }
+    else {
+        C = T & 31;
+        if ((T >> 5 & 3) == 3) { t[4] = 2; t[3] = T >> 7 & 1; } else { t[4] = T >> 7 & 1; t[3] = T >> 5 & 3; }
+    }
+    if ((C & 3) == 3) { t[2] = 2; t[1] = C >> 4 & 1; t[0] = (C >> 3 & 1) << 1 | ((C >> 2 & 1) & ~(C >> 3) & 1); }
+    else if ((C >> 2 & 3) == 3) { t[2] = 2; t[1] = 2; t[0] = C & 3; }
+    else { t[2] = C >> 4 & 1; t[1] = C >> 2 & 3; t[0] = (C >> 1 & 1) << 1 | ((C & 1) & ~(C >> 1) & 1); }
+}
+
+static inline void zap__quints(int Q, int q[3]) { /* 7 bits -> 3 quints (spec C.2.12) */
+    if ((Q >> 1 & 3) == 3 && (Q >> 5 & 3) == 0) {
+        q[2] = (Q & 1) << 2 | ((Q >> 4 & 1) & ~Q & 1) << 1 | ((Q >> 3 & 1) & ~Q & 1); q[1] = 4; q[0] = 4;
+        return;
+    }
+    int C;
+    if ((Q >> 1 & 3) == 3) { q[2] = 4; C = (Q >> 3 & 3) << 3 | (~(Q >> 5) & 3) << 1 | (Q & 1); }
+    else { q[2] = Q >> 5 & 3; C = Q & 31; }
+    if ((C & 7) == 5) { q[1] = 4; q[0] = C >> 3 & 3; } else { q[1] = C >> 3 & 3; q[0] = C & 7; }
+}
+
+static const int ZAP__TBITS[5] = { 2, 2, 1, 2, 1 }; /* trit block bits after each value: T[1:0] T[3:2] T[4] T[6:5] T[7] */
+static const int ZAP__QBITS[3] = { 3, 2, 2 };       /* quint block bits after each value: Q[2:0] Q[4:3] Q[6:5] */
+
+/* ISE tables: trit/quint combination -> packed code (inverse of the decoders above) */
+typedef struct { uint8_t t[243], q[125]; } zap__isetab;
+static inline void zap__isetab_init(zap__isetab *k) {
+    for (int T = 255; T >= 0; T--) { int t[5]; zap__trits(T, t); k->t[t[0] + 3 * t[1] + 9 * t[2] + 27 * t[3] + 81 * t[4]] = (uint8_t)T; }
+    for (int Q = 127; Q >= 0; Q--) { int q[3]; zap__quints(Q, q); k->q[q[0] + 5 * q[1] + 25 * q[2]] = (uint8_t)Q; }
+}
+
+static inline void zap__ise_get(const uint8_t *b, int *pos, const zap__iser *r, int n, int *v) {
+    int gs = r->trit ? 5 : r->quint ? 3 : 1;
+    const int *xb = r->trit ? ZAP__TBITS : ZAP__QBITS;
+    for (int g = 0; g < n; g += gs) {
+        int cnt = n - g < gs ? n - g : gs, m[5], X = 0, xp = 0, t[5];
+        for (int k = 0; k < cnt; k++) {
+            m[k] = (int)zap__bits(b, pos, r->bits);
+            if (gs > 1) { X |= (int)zap__bits(b, pos, xb[k]) << xp; xp += xb[k]; }
+        }
+        if (r->trit) zap__trits(X, t);
+        else if (r->quint) zap__quints(X, t);
+        for (int k = 0; k < cnt; k++) v[g + k] = gs > 1 ? t[k] << r->bits | m[k] : m[k];
+    }
+}
+
+static inline void zap__ise_put(uint8_t *b, int *pos, const zap__iser *r, int n, const int *v, const zap__isetab *tab) {
+    int gs = r->trit ? 5 : r->quint ? 3 : 1, base = r->trit ? 3 : 5;
+    const int *xb = r->trit ? ZAP__TBITS : ZAP__QBITS;
+    for (int g = 0; g < n; g += gs) {
+        int cnt = n - g < gs ? n - g : gs, X = 0, xp = 0;
+        if (gs > 1) {
+            int idx = 0;
+            for (int k = gs - 1; k >= 0; k--) idx = idx * base + (k < cnt ? v[g + k] >> r->bits : 0);
+            X = r->trit ? tab->t[idx] : tab->q[idx];
+        }
+        for (int k = 0; k < cnt; k++) {
+            zap__putbits(b, pos, (unsigned)(v[g + k] & ((1 << r->bits) - 1)), r->bits);
+            if (gs > 1) { zap__putbits(b, pos, (unsigned)(X >> xp), xb[k]); xp += xb[k]; }
+        }
+    }
+}
+
+/* partition of texel (x, y) for a 2..4 partition pattern `seed` (spec C.2.21; 4x4 is a "small block") */
+static inline uint32_t zap__hash52(uint32_t p) {
+    p ^= p >> 15; p -= p << 17; p += p << 7; p += p << 4; p ^= p >> 5; p += p << 16; p ^= p >> 7; p ^= p >> 3; p ^= p << 6; p ^= p >> 17;
+    return p;
+}
+static inline int zap__astc_part(int seed, int x, int y, int count) {
+    x <<= 1; y <<= 1; /* fewer than 31 texels */
+    seed += (count - 1) * 1024;
+    uint32_t rnum = zap__hash52((uint32_t)seed);
+    int s[12] = { (int)(rnum & 15), (int)(rnum >> 4 & 15), (int)(rnum >> 8 & 15), (int)(rnum >> 12 & 15), (int)(rnum >> 16 & 15), (int)(rnum >> 20 & 15),
+                  (int)(rnum >> 24 & 15), (int)(rnum >> 28 & 15), (int)(rnum >> 18 & 15), (int)(rnum >> 22 & 15), (int)(rnum >> 26 & 15), (int)((rnum >> 30 | rnum << 2) & 15) };
+    for (int i = 0; i < 12; i++) s[i] *= s[i];
+    int sh1, sh2;
+    if (seed & 1) { sh1 = seed & 2 ? 4 : 5; sh2 = count == 3 ? 6 : 5; }
+    else { sh1 = count == 3 ? 6 : 5; sh2 = seed & 2 ? 4 : 5; }
+    int sh3 = seed & 0x10 ? sh1 : sh2;
+    for (int i = 0; i < 8; i++) s[i] >>= i & 1 ? sh2 : sh1;
+    for (int i = 8; i < 12; i++) s[i] >>= sh3;
+    int a = (s[0] * x + s[1] * y + (int)(rnum >> 14)) & 0x3F, b = (s[2] * x + s[3] * y + (int)(rnum >> 10)) & 0x3F;
+    int c = (s[4] * x + s[5] * y + (int)(rnum >> 6)) & 0x3F, d = (s[6] * x + s[7] * y + (int)(rnum >> 2)) & 0x3F;
+    if (count < 4) d = 0;
+    if (count < 3) c = 0;
+    return a >= b && a >= c && a >= d ? 0 : b >= c && b >= d ? 1 : c >= d ? 2 : 3;
+}
+
+static inline void zap__astc_bluec(int *e) { e[0] = (e[0] + e[2]) >> 1; e[1] = (e[1] + e[2]) >> 1; } /* blue contraction */
+
+/* decoded 8-bit RGBA endpoints of a CEM 8 / 12 partition from its unquantized values v (order r0 r1 g0 g1 b0 b1 [a0 a1]) */
+static inline void zap__astc_endpoints(int cem, const int *v, int e0[4], int e1[4]) {
+    int a0 = cem == 12 ? v[6] : 255, a1 = cem == 12 ? v[7] : 255;
+    if (v[1] + v[3] + v[5] >= v[0] + v[2] + v[4]) { e0[0] = v[0]; e0[1] = v[2]; e0[2] = v[4]; e0[3] = a0; e1[0] = v[1]; e1[1] = v[3]; e1[2] = v[5]; e1[3] = a1; }
+    else { e0[0] = v[1]; e0[1] = v[3]; e0[2] = v[5]; e0[3] = a1; e1[0] = v[0]; e1[1] = v[2]; e1[2] = v[4]; e1[3] = a0; zap__astc_bluec(e0); zap__astc_bluec(e1); }
+}
+
+static inline int zap__astc_lerp(int a, int b, int w) { /* UNORM decode: 16-bit endpoints, 8-bit result */
+    return (((a * 257) * (64 - w) + (b * 257) * w + 32) >> 6) >> 8;
+}
+
+static inline void zap__astc_dec(const uint8_t *b, uint8_t px[16][4]) {
+    int pos = 0, mode = (int)zap__bits(b, &pos, 11);
+    for (int i = 0; i < 16; i++) { px[i][0] = 255; px[i][1] = 0; px[i][2] = 255; px[i][3] = 255; } /* unsupported: magenta */
+    if ((mode & 0x1FF) == 0x1FC) { /* void extent: constant color, 16-bit UNORM at bits 64..127 */
+        int p2 = 64;
+        for (int c = 0; c < 4; c++) { int x = (int)zap__bits(b, &p2, 16) >> 8; for (int i = 0; i < 16; i++) px[i][c] = (uint8_t)x; }
+        return;
+    }
+    int R = (mode & 1) << 1 | (mode >> 1 & 1) << 2 | (mode >> 4 & 1), H = mode >> 9 & 1;
+    if (!(mode & 3) || (mode >> 2 & 3) || (mode >> 5 & 3) != 2 || (mode >> 7 & 3) || (mode >> 10 & 1)) return; /* not a 4x4 grid */
+    static const int WL[2][8] = { { 0, 0, 2, 3, 4, 5, 6, 8 }, { 0, 0, 10, 12, 16, 20, 24, 32 } };
+    int levels = WL[H][R], wb = levels == 2 ? 1 : levels == 4 ? 2 : levels == 8 ? 3 : levels == 16 ? 4 : levels == 32 ? 5 : 0;
+    int parts = (int)zap__bits(b, &pos, 2) + 1, seed = 0, cem;
+    if (!wb || parts > 2) return; /* power-of-two weight ranges, 1 or 2 partitions */
+    if (parts == 2) {
+        seed = (int)zap__bits(b, &pos, 10);
+        int cf = (int)zap__bits(b, &pos, 6);
+        if (cf & 3) return; /* both partitions must share one endpoint mode */
+        cem = cf >> 2;
+    } else cem = (int)zap__bits(b, &pos, 4);
+    int nv = cem == 8 ? 6 : cem == 12 ? 8 : 0, v[16], e[2][2][4];
+    if (!nv) return;
+    const zap__iser *r = zap__astc_crange(nv * parts, 128 - pos - 16 * wb);
+    if (!r) return;
+    zap__ise_get(b, &pos, r, nv * parts, v);
+    for (int i = 0; i < nv * parts; i++) v[i] = zap__astc_cunq(r, v[i]);
+    for (int k = 0; k < parts; k++) zap__astc_endpoints(cem, v + k * nv, e[k][0], e[k][1]);
+    for (int i = 0; i < 16; i++) {
+        int w = 0, k = parts == 2 ? zap__astc_part(seed, i & 3, i >> 2, 2) : 0;
+        for (int j = 0; j < wb; j++) { int bit = 127 - (i * wb + j); w |= (b[bit >> 3] >> (bit & 7) & 1) << j; }
+        w = zap__astc_wunq(w, wb);
+        for (int c = 0; c < 4; c++) px[i][c] = (uint8_t)zap__astc_lerp(e[k][0][c], e[k][1][c], w);
+    }
+}
+
+typedef struct { const zap__iser *r; int wb, cem, nv, parts; uint8_t q[256]; } zap__astc_cfg; /* q: 8-bit target -> best ISE value */
+
+static inline void zap__astc_cfg_init(zap__astc_cfg *c, int cem, int wb, int parts) {
+    c->cem = cem; c->wb = wb; c->nv = cem == 8 ? 6 : 8; c->parts = parts;
+    c->r = zap__astc_crange(c->nv * parts, 128 - (parts == 1 ? 17 : 29) - 16 * wb);
+    for (int x = 0; x < 256; x++) {
+        int best = 0, bd = 1 << 30;
+        for (int v = 0; v < c->r->levels; v++) { int d = zap__astc_cunq(c->r, v) - x; d = d < 0 ? -d : d; if (d < bd) { bd = d; best = v; } }
+        c->q[x] = (uint8_t)best;
+    }
+}
+
+/* float endpoints (lo -> v0/v2/v4/v6, hi -> v1/v3/v5/v7) quantized; hi keeps the larger RGB sum so no blue contraction */
+static inline void zap__astc_quant(const zap__astc_cfg *c, const float lo[4], const float hi[4], int *ise, int *uv) {
+    float s0 = lo[0] + lo[1] + lo[2], s1 = hi[0] + hi[1] + hi[2];
+    const float *a = s1 >= s0 ? lo : hi, *b = s1 >= s0 ? hi : lo;
+    for (int k = 0; k < c->nv / 2; k++) {
+        int x0 = (int)(a[k] + 0.5f), x1 = (int)(b[k] + 0.5f);
+        x0 = x0 < 0 ? 0 : x0 > 255 ? 255 : x0; x1 = x1 < 0 ? 0 : x1 > 255 ? 255 : x1;
+        ise[2 * k] = c->q[x0]; ise[2 * k + 1] = c->q[x1];
+        uv[2 * k] = zap__astc_cunq(c->r, ise[2 * k]); uv[2 * k + 1] = zap__astc_cunq(c->r, ise[2 * k + 1]);
+    }
+    if (uv[1] + uv[3] + uv[5] < uv[0] + uv[2] + uv[4]) /* quantization flipped the order: swap endpoints back */
+        for (int k = 0; k < c->nv / 2; k++) { int t = ise[2 * k]; ise[2 * k] = ise[2 * k + 1]; ise[2 * k + 1] = t; t = uv[2 * k]; uv[2 * k] = uv[2 * k + 1]; uv[2 * k + 1] = t; }
+}
+
+/* weights for fixed endpoints (part[i] picks each texel's partition); returns SSE over nc channels */
+static inline int zap__astc_fitw(const uint8_t px[16][4], const zap__astc_cfg *c, const int *uv, const int *part, int nc, int w[16]) {
+    int L = 1 << c->wb, pal[2][32][4], err = 0;
+    for (int k = 0; k < c->parts; k++) {
+        int e0[4], e1[4];
+        zap__astc_endpoints(c->cem, uv + k * c->nv, e0, e1);
+        for (int j = 0; j < L; j++) { int wt = zap__astc_wunq(j, c->wb); for (int ch = 0; ch < 4; ch++) pal[k][j][ch] = zap__astc_lerp(e0[ch], e1[ch], wt); }
+    }
+    for (int i = 0; i < 16; i++) {
+        int bj = 0, be = 1 << 30, k = part[i];
+        for (int j = 0; j < L; j++) { int d = 0; for (int ch = 0; ch < nc; ch++) { int x = px[i][ch] - pal[k][j][ch]; d += x * x; } if (d < be) { be = d; bj = j; } }
+        w[i] = bj; err += be;
+    }
+    return err;
+}
+
+static inline int zap__astc_try(const uint8_t px[16][4], const zap__astc_cfg *c, const int *part, int ise[16], int w[16]) {
+    int nc = c->cem == 12 ? 4 : 3, uv[16], ti[16], tuv[16], tw[16];
+    for (int k = 0; k < c->parts; k++) {
+        int sel[16], cnt = 0;
+        float lo[4], hi[4];
+        for (int i = 0; i < 16; i++) if (part[i] == k) sel[cnt++] = i;
+        if (!cnt) { sel[0] = 0; cnt = 1; }
+        zap__bc7_pca(px, sel, cnt, nc, lo, hi);
+        zap__astc_quant(c, lo, hi, ise + k * c->nv, uv + k * c->nv);
+    }
+    int err = zap__astc_fitw(px, c, uv, part, nc, w);
+    for (int it = 0; it < 3 && err > 0; it++) { /* least squares per partition on the chosen weights */
+        memcpy(ti, ise, sizeof ti); memcpy(tuv, uv, sizeof tuv);
+        for (int k = 0; k < c->parts; k++) {
+            float aa = 0, ab = 0, bb = 0, xa[4] = { 0, 0, 0, 0 }, xb[4] = { 0, 0, 0, 0 }, nlo[4], nhi[4];
+            for (int i = 0; i < 16; i++) {
+                if (part[i] != k) continue;
+                float f = zap__astc_wunq(w[i], c->wb) / 64.0f, g = 1 - f;
+                aa += g * g; ab += g * f; bb += f * f;
+                for (int ch = 0; ch < nc; ch++) { xa[ch] += g * px[i][ch]; xb[ch] += f * px[i][ch]; }
+            }
+            float det = aa * bb - ab * ab;
+            if (det < 1e-6f && det > -1e-6f) continue;
+            for (int ch = 0; ch < nc; ch++) { nlo[ch] = (xa[ch] * bb - xb[ch] * ab) / det; nhi[ch] = (xb[ch] * aa - xa[ch] * ab) / det; }
+            for (int ch = nc; ch < 4; ch++) nlo[ch] = nhi[ch] = 255;
+            zap__astc_quant(c, nlo, nhi, ti + k * c->nv, tuv + k * c->nv);
+        }
+        int e = zap__astc_fitw(px, c, tuv, part, nc, tw);
+        if (e >= err) break;
+        err = e; memcpy(ise, ti, sizeof ti); memcpy(uv, tuv, sizeof tuv); memcpy(w, tw, sizeof tw);
+    }
+    return err;
+}
+
+static inline void zap__astc_pack(const zap__astc_cfg *c, int seed, const int *ise, const int w[16], const zap__isetab *tab, uint8_t out[16]) {
+    static const int RH[6][2] = { { 0, 0 }, { 0, 0 }, { 4, 0 }, { 7, 0 }, { 4, 1 }, { 7, 1 } }; /* weight bits -> (R, H) */
+    int R = RH[c->wb][0], H = RH[c->wb][1], pos = 0;
+    unsigned mode = (unsigned)((R >> 1 & 1) | (R >> 2 & 1) << 1 | (R & 1) << 4 | 2 << 5 | H << 9);
+    uint8_t wbits[16] = { 0 };
+    memset(out, 0, 16);
+    zap__putbits(out, &pos, mode, 11);
+    zap__putbits(out, &pos, (unsigned)(c->parts - 1), 2);
+    if (c->parts == 2) { zap__putbits(out, &pos, (unsigned)seed, 10); zap__putbits(out, &pos, (unsigned)c->cem << 2, 6); }
+    else zap__putbits(out, &pos, (unsigned)c->cem, 4);
+    zap__ise_put(out, &pos, c->r, c->nv * c->parts, ise, tab);
+    int wp = 0;
+    for (int i = 0; i < 16; i++) zap__putbits(wbits, &wp, (unsigned)w[i], c->wb);
+    for (int i = 0; i < wp; i++) if (wbits[i >> 3] >> (i & 7) & 1) out[(127 - i) >> 3] |= (uint8_t)(1 << ((127 - i) & 7)); /* weights run down from bit 127 */
+}
+
+/* 2-means on the block's colors: bit i set = texel i in cluster 1 */
+static inline unsigned zap__astc_2means(const uint8_t px[16][4]) {
+    float c[2][3];
+    int lo = 0, hi = 0;
+    for (int i = 1; i < 16; i++) { int s = px[i][0] + px[i][1] + px[i][2]; if (s < px[lo][0] + px[lo][1] + px[lo][2]) lo = i; if (s > px[hi][0] + px[hi][1] + px[hi][2]) hi = i; }
+    for (int k = 0; k < 3; k++) { c[0][k] = px[lo][k]; c[1][k] = px[hi][k]; }
+    unsigned m = 0;
+    for (int it = 0; it < 4; it++) {
+        float sum[2][3] = { { 0 } };
+        int n[2] = { 0, 0 };
+        m = 0;
+        for (int i = 0; i < 16; i++) {
+            float d0 = 0, d1 = 0;
+            for (int k = 0; k < 3; k++) { float a = px[i][k] - c[0][k], b = px[i][k] - c[1][k]; d0 += a * a; d1 += b * b; }
+            int s = d1 < d0;
+            m |= (unsigned)s << i; n[s]++;
+            for (int k = 0; k < 3; k++) sum[s][k] += px[i][k];
+        }
+        for (int s = 0; s < 2; s++) if (n[s]) for (int k = 0; k < 3; k++) c[s][k] = sum[s][k] / n[s];
+    }
+    return m;
+}
+
+static inline int zap__popc16(unsigned x) { int n = 0; while (x) { n += x & 1; x >>= 1; } return n; }
+
+/* RGBA8 -> ASTC 4x4 blocks (16 bytes each, zap_bc_size(w, h, ZAP_BC7) bytes). Decode as UNORM (not sRGB). */
+static inline void zap_astc_encode(const uint8_t *rgba, int w, int h, size_t stride, void *out_) {
+    uint8_t *out = (uint8_t *)out_;
+    zap__isetab tab;
+    zap__astc_cfg cfg[8];
+    uint16_t pmask[1024]; /* 2-partition patterns: bit i set = texel i in partition 1 */
+    zap__isetab_init(&tab);
+    zap__astc_cfg_init(&cfg[0], 8, 4, 1); zap__astc_cfg_init(&cfg[1], 8, 3, 1); zap__astc_cfg_init(&cfg[2], 8, 5, 1);
+    zap__astc_cfg_init(&cfg[3], 12, 4, 1); zap__astc_cfg_init(&cfg[4], 12, 3, 1); zap__astc_cfg_init(&cfg[5], 12, 2, 1);
+    zap__astc_cfg_init(&cfg[6], 8, 3, 2); zap__astc_cfg_init(&cfg[7], 8, 2, 2);
+    for (int sd = 0; sd < 1024; sd++) { unsigned m = 0; for (int i = 0; i < 16; i++) m |= (unsigned)zap__astc_part(sd, i & 3, i >> 2, 2) << i; pmask[sd] = (uint16_t)m; }
+    int bw = (w + 3) / 4, bh = (h + 3) / 4;
+    for (int by = 0; by < bh; by++)
+        for (int bx = 0; bx < bw; bx++) {
+            uint8_t px[16][4];
+            int opaque = 1, part0[16] = { 0 };
+            for (int i = 0; i < 16; i++) {
+                int x = bx * 4 + (i & 3), y = by * 4 + (i >> 2);
+                if (x >= w) x = w - 1;
+                if (y >= h) y = h - 1;
+                memcpy(px[i], rgba + (size_t)y * stride + (size_t)x * 4, 4);
+                opaque &= px[i][3] == 255;
+            }
+            int best = 1 << 30, bc = 0, bseed = 0, bi[16], bwt[16], ise[16], wt[16];
+            for (int k = opaque ? 0 : 3; k < (opaque ? 3 : 6); k++) {
+                int e = zap__astc_try((const uint8_t(*)[4])px, &cfg[k], part0, ise, wt);
+                if (e < best) { best = e; bc = k; memcpy(bi, ise, sizeof ise); memcpy(bwt, wt, sizeof wt); }
+            }
+            if (opaque && best > 16 * 3 * 4) { /* 2 partitions: patterns closest to the 2-means split, fully fitted */
+                unsigned km = zap__astc_2means((const uint8_t(*)[4])px);
+                int cand[4] = { -1, -1, -1, -1 }, cd[4] = { 99, 99, 99, 99 };
+                for (int sd = 0; sd < 1024; sd++) {
+                    int pc = zap__popc16(pmask[sd]);
+                    if (pc == 0 || pc == 16) continue; /* degenerate pattern */
+                    int dd = zap__popc16(pmask[sd] ^ km), di = 16 - dd;
+                    int dist = dd < di ? dd : di;
+                    for (int j = 0; j < 4; j++) if (dist < cd[j]) { for (int t = 3; t > j; t--) { cd[t] = cd[t - 1]; cand[t] = cand[t - 1]; } cd[j] = dist; cand[j] = sd; break; }
+                }
+                for (int j = 0; j < 4 && cand[j] >= 0; j++) {
+                    int part[16];
+                    for (int i = 0; i < 16; i++) part[i] = pmask[cand[j]] >> i & 1;
+                    for (int k = 6; k < 8; k++) {
+                        int e = zap__astc_try((const uint8_t(*)[4])px, &cfg[k], part, ise, wt);
+                        if (e < best) { best = e; bc = k; bseed = cand[j]; memcpy(bi, ise, sizeof ise); memcpy(bwt, wt, sizeof wt); }
+                    }
+                }
+            }
+            zap__astc_pack(&cfg[bc], bseed, bi, bwt, &tab, out + ((size_t)by * (size_t)bw + (size_t)bx) * 16);
+        }
+}
+
+static inline void zap_astc_decode(const void *bc_, int w, int h, uint8_t *rgba, size_t stride) {
+    const uint8_t *bc = (const uint8_t *)bc_;
+    int bw = (w + 3) / 4, bh = (h + 3) / 4;
+    for (int by = 0; by < bh; by++)
+        for (int bx = 0; bx < bw; bx++) {
+            uint8_t px[16][4];
+            zap__astc_dec(bc + ((size_t)by * (size_t)bw + (size_t)bx) * 16, px);
+            for (int i = 0; i < 16; i++) {
+                int x = bx * 4 + (i & 3), y = by * 4 + (i >> 2);
+                if (x < w && y < h) memcpy(rgba + (size_t)y * stride + (size_t)x * 4, px[i], 4);
             }
         }
 }

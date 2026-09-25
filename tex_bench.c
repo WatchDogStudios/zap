@@ -100,8 +100,50 @@ static void hdr_mip_test(void) {
     assert(fo[0] == 4 && fo[3] == 4);
 }
 
+static void astc_test(void) {
+    /* integer sequence encoding round-trips for every kind of range (bits, trits, quints) */
+    zap__isetab tab;
+    zap__isetab_init(&tab);
+    for (int ri = 0; ri < 21; ri++)
+        for (int n = 1; n <= 16; n++) {
+            const zap__iser *r = &ZAP__ISE[ri];
+            int v[16], got[16], pos = 0, rpos = 0;
+            uint8_t b[32] = { 0 };
+            for (int i = 0; i < n; i++) v[i] = rand() % r->levels;
+            zap__ise_put(b, &pos, r, n, v, &tab);
+            assert(pos == zap__ise_bits(r, n));
+            zap__ise_get(b, &rpos, r, n, got);
+            assert(rpos == pos && !memcmp(v, got, sizeof(int) * (size_t)n));
+        }
+    /* the 1024 two-partition patterns (checksum of the implementation verified against ARM astcenc) */
+    uint32_t hsh = 2166136261u;
+    for (int sd = 0; sd < 1024; sd++) for (int i = 0; i < 16; i++) { hsh ^= (uint32_t)zap__astc_part(sd, i & 3, i >> 2, 2); hsh *= 16777619u; }
+    assert(hsh == 0x5d5fc459u);
+    /* void-extent (constant color) block */
+    uint8_t ve[16] = { 0xFC, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x40, 0x00, 0x80, 0x00, 0xC0, 0xFF, 0xFF }, vo[16 * 4];
+    zap_astc_decode(ve, 4, 4, vo, 16);
+    assert(vo[0] == 0x40 && vo[1] == 0x80 && vo[2] == 0xC0 && vo[3] == 0xFF);
+    /* encode / decode: opaque edges (exercises 2 partitions) and alpha */
+    enum { W = 64, H = 48 };
+    static uint8_t img[W * H * 4], out[W * H * 4];
+    for (int k = 0; k < 2; k++) {
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            uint8_t *p = img + (y * W + x) * 4;
+            int edge = (x + 2 * y) % 13 < 6;
+            p[0] = (uint8_t)(edge ? 220 : 30 + x); p[1] = (uint8_t)(edge ? 40 : 200 - y); p[2] = (uint8_t)(x * 3); p[3] = (uint8_t)(k ? (x * 5 + y * 3) & 255 : 255);
+        }
+        uint8_t *bc = malloc(zap_bc_size(W, H, ZAP_BC7));
+        zap_astc_encode(img, W, H, W * 4, bc);
+        zap_astc_decode(bc, W, H, out, W * 4);
+        assert(psnr(img, out, W * H, 15) > (k ? 26 : 41)); /* k=1: sawtooth alpha, hard for single-partition alpha */
+        free(bc);
+    }
+    zap_astc_encode(img, 3, 2, W * 4, out); /* partial block */
+}
+
 static void selftest(void) {
     hdr_mip_test();
+    astc_test();
     enum { W = 67, H = 45 };
     static uint8_t img[W * H * 4], out[W * H * 4];
     srand(3);

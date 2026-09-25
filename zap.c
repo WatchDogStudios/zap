@@ -2,7 +2,7 @@
  *   zap c [-e] [-x] [-l depth] [-b block_kb] [-t threads] [-D dict] in out   pack (depth 0 = fast, >= 32 optimal parse, default 64; -e entropy mode, -x faster decode)
  *   zap d [-t threads] [-D dict] in out                            unpack
  *   zap train [-s dict_bytes] out samples...                       train a packet dictionary (default 16384)
- *   zap tex [-f bc1|bc3|bc4|bc5|bc7] [-r rdo] [-m] [-S] w h in.rgba out.dds  GPU block-compress raw RGBA8 to DDS (-m mips, -S sRGB)
+ *   zap tex [-f bc1|bc3|bc4|bc5|bc7|astc] [-r rdo] [-m] [-S] w h in.rgba out.dds|.astc  GPU block-compress raw RGBA8 to DDS (-m mips, -S sRGB)
  *   zap venc [-q quality] [-k keyint] [-F fps] w h in.yuv out.zv   encode raw I420 video
  *   zap vdec in.zv out.yuv                                         decode to raw I420
  */
@@ -47,7 +47,7 @@ static int usage(void) {
     fprintf(stderr, "zap c [-e] [-x] [-l depth] [-b block_kb] [-t threads] [-D dict] in out\n"
                     "zap d [-t threads] [-D dict] in out\n"
                     "zap train [-s bytes] out samples...\n"
-                    "zap tex [-f bc1|bc3|bc4|bc5|bc7] [-r rdo] [-m] [-S] w h in.rgba out.dds\n"
+                    "zap tex [-f bc1|bc3|bc4|bc5|bc7|astc] [-r rdo] [-m] [-S] w h in.rgba out.dds|.astc\n"
                     "zap venc [-q quality] [-k keyint] [-F fps] w h in.yuv out.zv\n"
                     "zap vdec in.zv out.yuv\n");
     return 1;
@@ -105,6 +105,20 @@ static int tex(int w, int h, const char *fmt, float rdo, int mips, int srgb, con
     static const char *NAMES[] = { "bc1", "bc3", "bc4", "bc5", "bc7" }, *CC[] = { "DXT1", "DXT5", "BC4U", "BC5U", "DX10" };
     static const uint32_t DXGI[5] = { 71, 77, 80, 83, 98 }; /* BC1..BC7 UNORM; +1 = _SRGB for BC1, BC3, BC7 */
     int f = 0;
+    if (!strcmp(fmt, "astc")) { /* .astc container (one level, 4x4 blocks, UNORM) */
+        size_t n, bn = zap_bc_size(w, h, ZAP_BC7);
+        uint8_t *img = load(in, &n), *bc = malloc(bn), hd[16] = { 0x13, 0xAB, 0xA1, 0x5C, 4, 4, 1 };
+        if (n < (size_t)w * h * 4) { fprintf(stderr, "%s: expected %dx%d RGBA8\n", in, w, h); return 1; }
+        if (mips) fprintf(stderr, "note: .astc holds one level; -m ignored\n");
+        zap_astc_encode(img, w, h, (size_t)w * 4, bc);
+        for (int k = 0; k < 3; k++) { hd[7 + k] = (uint8_t)(w >> (8 * k)); hd[10 + k] = (uint8_t)(h >> (8 * k)); }
+        hd[13] = 1; /* depth 1 */
+        FILE *fo = create(outp);
+        if (fwrite(hd, 1, 16, fo) != 16 || fwrite(bc, 1, bn, fo) != bn || fclose(fo)) { perror(outp); return 1; }
+        printf("%dx%d astc 4x4 -> %zu bytes\n", w, h, bn + 16);
+        (void)rdo; (void)srgb;
+        return 0;
+    }
     while (f < 5 && strcmp(fmt, NAMES[f])) f++;
     if (f == 5 || w < 1 || h < 1) return usage();
     if (f == ZAP_BC4 || f == ZAP_BC5) srgb = 0; /* channel data, never sRGB */

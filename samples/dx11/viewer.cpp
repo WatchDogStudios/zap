@@ -351,8 +351,9 @@ static std::string file_name(const std::wstring &w) {
 
 // ---------------------------------------------------------------- texture tab
 
-static const char *kTexFmt[4] = { "Original RGBA8", "BC1", "BC3", "BC7" };
-static const zap_bc_format kTexBC[4] = { ZAP_BC1, ZAP_BC1, ZAP_BC3, ZAP_BC7 };
+static const char *kTexFmt[5] = { "Original RGBA8", "BC1", "BC3", "BC7", "ASTC 4x4" };
+static const zap_bc_format kTexBC[5] = { ZAP_BC1, ZAP_BC1, ZAP_BC3, ZAP_BC7, ZAP_BC7 }; /* ASTC 4x4 is 16 bytes per block, like BC7 */
+enum { kASTC = 4 };
 
 struct TexResult { int gen = 0, w = 0, h = 0, fmt = 0; std::vector<uint8_t> data; double psnr = 0, ms = 0; size_t gpu = 0, disk = 0; };
 
@@ -414,13 +415,17 @@ static struct App {
 } A;
 
 /* blocks are independent (RDO only looks back ZAP_TEX_WINDOW blocks), so encode horizontal bands in parallel */
-static void bc_encode_mt(const uint8_t *img, int w, int h, zap_bc_format f, float rdo, uint8_t *out) {
+static void bc_encode_mt(const uint8_t *img, int w, int h, zap_bc_format f, float rdo, uint8_t *out, bool astc = false) {
     int rows = h / 4, n = (int)std::min<unsigned>(std::max(1u, std::thread::hardware_concurrency()), 16u);
     size_t row_bytes = (size_t)(w / 4) * zap_bc_block_bytes(f);
     std::vector<std::thread> th;
     for (int t = 0; t < n; t++) {
         int b0 = rows * t / n, b1 = rows * (t + 1) / n;
-        if (b1 > b0) th.emplace_back([=] { zap_bc_encode(img + (size_t)b0 * 4 * w * 4, w, (b1 - b0) * 4, (size_t)w * 4, f, rdo, out + b0 * row_bytes); });
+        if (b1 > b0) th.emplace_back([=] {
+            const uint8_t *src = img + (size_t)b0 * 4 * w * 4;
+            if (astc) zap_astc_encode(src, w, (b1 - b0) * 4, (size_t)w * 4, out + b0 * row_bytes);
+            else zap_bc_encode(src, w, (b1 - b0) * 4, (size_t)w * 4, f, rdo, out + b0 * row_bytes);
+        });
     }
     for (auto &x : th) x.join();
 }
@@ -441,15 +446,18 @@ static void tex_job(std::shared_ptr<const std::vector<uint8_t>> img, int w, int 
         std::vector<uint8_t> dec((size_t)w * h * 4), planes(n), z(zap_bound(n));
         r->data.resize(n);
         auto t0 = Clock::now();
-        bc_encode_mt(img->data(), w, h, f, rdo, r->data.data());
+        bc_encode_mt(img->data(), w, h, f, rdo, r->data.data(), fmt == kASTC);
         r->ms = ms_since(t0);
-        zap_bc_decode(r->data.data(), w, h, f, dec.data(), (size_t)w * 4);
+        if (fmt == kASTC) zap_astc_decode(r->data.data(), w, h, dec.data(), (size_t)w * 4);
+        else zap_bc_decode(r->data.data(), w, h, f, dec.data(), (size_t)w * 4);
         double se = 0;
         for (size_t k = 0; k < dec.size(); k++) if ((k & 3) != 3) { double d = (double)dec[k] - (*img)[k]; se += d * d; }
         r->psnr = se > 0 ? 10 * log10(255.0 * 255.0 * (double)w * h * 3 / se) : INFINITY;
-        zap_bc_split(r->data.data(), n, f, planes.data());
+        if (fmt == kASTC) memcpy(planes.data(), r->data.data(), n); /* no field split for ASTC */
+        else zap_bc_split(r->data.data(), n, f, planes.data());
         r->gpu = n;
         r->disk = zap_compress_hc(planes.data(), n, z.data(), z.size(), hc, nullptr, 32);
+        if (fmt == kASTC) r->data.swap(dec); /* D3D11 can't sample ASTC: show zap's decode */
     }
     free(hc);
     std::lock_guard<std::mutex> lk(A.mtx);
@@ -460,7 +468,7 @@ static void tex_update() {
     if (!A.img) return;
     for (int s = 0; s < 2; s++) {
         TexSide &t = A.side[s];
-        float rdo = t.fmt ? t.rdo : 0;
+        float rdo = t.fmt && t.fmt != kASTC ? t.rdo : 0;
         if (t.fmt != t.want_fmt || rdo != t.want_rdo) {
             t.want_fmt = t.fmt; t.want_rdo = rdo; t.busy = true;
             int gen;
@@ -471,7 +479,7 @@ static void tex_update() {
         { std::lock_guard<std::mutex> lk(A.mtx); r.swap(t.ready); }
         if (r) {
             zap_bc_format f = kTexBC[r->fmt];
-            t.srv = r->fmt ? make_tex(A.g.dev.Get(), kDxgi[f], r->w, r->h, r->data.data(), bc_pitch(r->w, f))
+            t.srv = r->fmt && r->fmt != kASTC ? make_tex(A.g.dev.Get(), kDxgi[f], r->w, r->h, r->data.data(), bc_pitch(r->w, f))
                            : make_tex(A.g.dev.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, r->w, r->h, r->data.data(), (UINT)r->w * 4);
             r->data.clear(); r->data.shrink_to_fit();
             t.shown = std::move(*r);
@@ -726,11 +734,11 @@ static void ui_texture() {
         ImGui::TableSetupColumn("Right");
         ImGui::TableHeadersRow();
         label_col("Format");
-        for (int s = 0; s < 2; s++) { ImGui::TableNextColumn(); ImGui::PushID(s); ImGui::SetNextItemWidth(-1); ImGui::Combo("##fmt", &A.side[s].fmt, kTexFmt, 4); ImGui::PopID(); }
+        for (int s = 0; s < 2; s++) { ImGui::TableNextColumn(); ImGui::PushID(s); ImGui::SetNextItemWidth(-1); ImGui::Combo("##fmt", &A.side[s].fmt, kTexFmt, 5); ImGui::PopID(); }
         label_col("RDO");
         for (int s = 0; s < 2; s++) {
             ImGui::TableNextColumn(); ImGui::PushID(s + 10); ImGui::SetNextItemWidth(-1);
-            if (A.side[s].fmt) ImGui::SliderFloat("##rdo", &A.side[s].rdo, 0, 200, A.side[s].rdo > 0 ? "%.0f" : "off", ImGuiSliderFlags_Logarithmic);
+            if (A.side[s].fmt && A.side[s].fmt != kASTC) ImGui::SliderFloat("##rdo", &A.side[s].rdo, 0, 200, A.side[s].rdo > 0 ? "%.0f" : "off", ImGuiSliderFlags_Logarithmic);
             else ImGui::TextDisabled("-");
             ImGui::PopID();
         }
@@ -753,7 +761,7 @@ static void ui_texture() {
         ImGui::EndTable();
     }
     ImGui::TextDisabled("On disk: BC blocks split + zap hc. Original: RGBA8 + zap hc (lossless).");
-    ImGui::TextDisabled("Ratios are against uncompressed RGBA8.");
+    ImGui::TextDisabled("Ratios are against uncompressed RGBA8. ASTC is decoded on the CPU for display (D3D11 has no ASTC).");
     ui_view_controls();
 }
 
@@ -914,6 +922,9 @@ static void shots(const std::wstring &prefix, bool have_video) {
     settle();
     grab(L"_texture_diff.png");
     A.diff = false;
+    A.side[0].fmt = 3; A.side[1].fmt = kASTC; // BC7 | ASTC 4x4
+    settle();
+    grab(L"_texture_astc.png");
     if (have_video) {
         A.want_tab = 1;
         frame(rtv.Get());
