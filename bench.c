@@ -22,7 +22,28 @@ static void fuzz(const uint8_t *c, size_t cn, size_t n, const zap_dict *d) {
     free(o); free(f);
 }
 
+/* entropy blocks: round trip with and without caller scratch, exact-size checks, corrupt input */
+static void e_roundtrip(const uint8_t *src, size_t n, const zap_dict *d, int depth) {
+    size_t cap = 2 * n + 1024, sc = zap_entropy_scratch(n);
+    uint8_t *c = malloc(cap), *o = malloc(n + 1), *scratch = malloc(sc), *f = malloc(cap);
+    size_t cn = zap_compress_entropy(src, n, c, cap, depth ? (void *)hc : (void *)&st, depth, d);
+    assert(cn > 0);
+    assert(zap_decompress_entropy(c, cn, o, n, d, NULL, 0) == (ptrdiff_t)n && memcmp(src, o, n) == 0);
+    memset(o, 0, n);
+    assert(zap_decompress_entropy(c, cn, o, n, d, scratch, sc) == (ptrdiff_t)n && memcmp(src, o, n) == 0);
+    assert(zap_decompress_entropy(c, cn, o, n + 1, d, scratch, sc) == -1);
+    if (n) assert(zap_decompress_entropy(c, cn, o, n - 1, d, NULL, 0) == -1);
+    assert(zap_compress_entropy(src, n, c, cn - 1, depth ? (void *)hc : (void *)&st, depth, d) == 0);
+    for (int i = 0; i < 200; i++) { /* corrupt input must fail or succeed, never crash */
+        memcpy(f, c, cn);
+        f[rand() % cn] ^= (uint8_t)(1 + rand() % 255);
+        zap_decompress_entropy(f, cn - (i & 1) * (rand() % cn), o, n, d, i & 2 ? scratch : NULL, sc);
+    }
+    free(c); free(o); free(scratch); free(f);
+}
+
 static size_t roundtrip(const uint8_t *src, size_t n, const zap_dict *d, int depth) {
+    e_roundtrip(src, n, d, depth);
     size_t cap = zap_bound(n);
     uint8_t *c = malloc(cap), *o = malloc(n + 1);
     size_t cn = depth ? zap_compress_hc(src, n, c, cap, hc, d, depth) : zap_compress(src, n, c, cap, &st, d);
@@ -54,9 +75,11 @@ static void selftest(void) {
         memcpy(pkt, buf + 4990, 10); memmove(pkt + 10, pkt, 590);              /* dict match running into src */
         roundtrip(pkt, sizeof pkt, &dict, depth);
     }
-    /* frames: mixed compressible / raw blocks, odd tail */
-    for (size_t i = 0; i < N; i++) buf[i] = i < N / 2 ? (uint8_t)(i / 100) : (uint8_t)rand();
-    for (int depth = 0; depth <= 16; depth += 16) {
+    /* frames: mixed compressible / raw blocks, odd tail; version 1 and version 2 (entropy) */
+    for (size_t i = 0; i < N; i++) buf[i] = i < N / 2 ? (uint8_t)(i / 100 + (i % 7 == 0) * (i >> 9)) : (uint8_t)rand();
+    static const int depths[4] = { 0, 16, ZAP_ENTROPY, 16 | ZAP_ENTROPY };
+    for (int di = 0; di < 4; di++) {
+        int depth = depths[di];
         size_t n = N - 123, cap = zap_frame_bound(n, 65536);
         uint8_t *c = malloc(cap), *o = malloc(n);
         size_t cn = zap_frame_compress(buf, n, c, cap, 65536, depth, 0);
@@ -70,6 +93,7 @@ static void selftest(void) {
         assert(zap_frame_compress(buf, n, c2, cap, 0, depth, 0) == 0 && zap_frame_compress_mt(buf, n, c2, cap, 0, depth, 0, 4) == 0);
         assert(zap_frame_compress_mt(buf, n, c2, cn - 1, 65536, depth, 0, 4) == 0); /* too-small cap fails cleanly */
         free(c2);
+        if (depth & ZAP_ENTROPY) assert(zap__r32(c) == ZAP_FRAME_MAGIC2); else assert(zap__r32(c) == ZAP_FRAME_MAGIC);
         fuzz(c, cn, n, 0);
         free(c); free(o);
     }
@@ -128,9 +152,11 @@ static void bench_packets(int phased) {
 static void bench_file(const uint8_t *src, size_t n, int threads) {
     struct { const char *name; size_t bs; int depth; } cfg[] = {
         { "fast, 256KB blocks", 256 << 10, 0 }, { "fast, 4MB blocks", 4 << 20, 0 },
-        { "hc16, 4MB blocks", 4 << 20, 16 }, { "hc64, 4MB blocks", 4 << 20, 64 } };
+        { "hc16, 4MB blocks", 4 << 20, 16 }, { "hc64, 4MB blocks", 4 << 20, 64 },
+        { "fast+entropy, 4MB", 4 << 20, ZAP_ENTROPY }, { "hc16+entropy, 4MB", 4 << 20, 16 | ZAP_ENTROPY },
+        { "hc64+entropy, 4MB", 4 << 20, 64 | ZAP_ENTROPY } };
     printf("\nfile: %.1f MB\n", n / 1e6);
-    for (int k = 0; k < 4; k++) {
+    for (int k = 0; k < (int)(sizeof cfg / sizeof cfg[0]); k++) {
         size_t cap = zap_frame_bound(n, cfg[k].bs);
         uint8_t *c = malloc(cap), *o = malloc(n);
         double t0 = now();

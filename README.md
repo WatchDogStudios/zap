@@ -4,7 +4,7 @@ Single-header C compression for games:
 
 | Header | What it does |
 |---|---|
-| `zap.h` | Fast LZ77 compressor for **asset packaging** and **network packets** |
+| `zap.h` | Fast LZ77 compressor for **asset packaging** and **network packets**, with an optional Huffman-coded **entropy mode** |
 | `zap_tex.h` | GPU texture block compression (**BC1/BC3/BC4/BC5/BC7**) with rate-distortion optimisation tuned for `zap.h` |
 | `zap_video.h` | Simple, fast-decoding **video codec** for cutscenes and UI video (SSE2 decoder) |
 | `samples/dx11` | **zap_viewer**: D3D11 + Dear ImGui app that compares encodings of your own images and videos side by side, with stats |
@@ -34,6 +34,7 @@ Fractal zooms are close to worst-case content for zap. Here zap needs about 4× 
 - **One header, no dependencies.** Drop `zap.h` into your project.
 - **Fast decode.** About 1.5–2 GB/s per core, and 5–8 GB/s across 8 threads on packaged data.
 - **Two compressors, one format.** `fast` runs at hundreds of MB/s for runtime use. `hc` is slower but gives smaller files for offline packaging. The same decoder reads both.
+- **Entropy mode.** It re-codes the matches as Huffman streams, with a repeat-offset code. On the benchmark data it compresses about 15% smaller (ratio 2.09 → 2.41) and decodes at about 0.7–0.85 GB/s, the same class as zstd levels 3–9.
 - **Safe on untrusted input.** Every read and write in the decoder is bounds-checked, and it only writes inside the output buffer you give it. It's fuzzed under AddressSanitizer and UBSan in CI.
 - **Packet dictionaries.** Train a shared dictionary once, then compress 50–200 byte packets that would otherwise barely shrink.
 - **Parallel frames.** Packaging frames hold independent blocks. Compress or decode them on built-in threads, or hand single blocks to your own job system.
@@ -51,6 +52,7 @@ Fractal zooms are close to worst-case content for zap. Here zap needs about 4× 
 size_t cap = zap_frame_bound(n, 4 << 20);
 void  *out = malloc(cap);
 size_t size = zap_frame_compress_mt(asset, n, out, cap, 4 << 20 /* block */, 64 /* hc depth, 0 = fast */, NULL, 8);
+/* smaller files, ~half the decode speed: 64 | ZAP_ENTROPY (writes a version-2 frame; same decode calls) */
 
 /* decompress (at runtime) */
 zap_frame f;
@@ -61,6 +63,8 @@ if (zap_frame_open(&f, data, size) == 0) {          /* validates the header */
 ```
 
 To decode with your engine's job system instead of zap's threads, call `zap_frame_open` once, then run `zap_frame_decode_block(&f, i, raw, NULL)` for `i` in `[0, f.nb)`. Each call is independent and thread-safe.
+
+Entropy blocks need scratch memory while decoding. `zap_frame_decode_block` allocates it for each call. For best speed, give each job thread one buffer of `zap_entropy_scratch(f.bs)` bytes and call `zap_frame_decode_block_ex(&f, i, raw, NULL, scratch, size)` instead.
 
 ### Networking
 
@@ -127,7 +131,7 @@ if (zap_vdec_frame(dec, packet, n) == 0) {
 ### Command-line tool
 
 ```sh
-zap c [-l depth] [-b block_kb] [-t threads] [-D dict] in out   # pack   (depth 0 = fast, default 64)
+zap c [-e] [-l depth] [-b block_kb] [-t threads] [-D dict] in out   # pack   (depth 0 = fast, default 64; -e entropy mode)
 zap d [-t threads] [-D dict] in out                            # unpack
 zap train [-s dict_bytes] dict.bin samples...                  # train a packet dictionary
 zap tex [-f bc1|bc3|bc4|bc5|bc7] [-r rdo] w h in.rgba out.dds  # raw RGBA8 -> DDS
@@ -163,6 +167,9 @@ The view is split: drag the line to move it, zoom with the mouse wheel, pan with
 | `zap_frame_compress[_mt](...)` | Self-describing frame of independent blocks. The `_mt` version produces byte-identical output. |
 | `zap_frame_open / zap_frame_decode_block` | Validate a frame, then decode its blocks one at a time. |
 | `zap_frame_decode[_mt](...)` | Decode a whole frame. |
+| `zap_compress_entropy(src, n, dst, cap, state, depth, dict)` | Entropy-mode block. `state` is a `zap_state` when `depth` is 0, otherwise a `zap_hc_state`. Meant for blocks of about 16 KB and up. |
+| `zap_decompress_entropy(src, n, dst, raw_size, dict, scratch, cap)` | Decodes an entropy block. Pass `zap_entropy_scratch(raw_size)` bytes of scratch, or NULL to have it allocate. |
+| `ZAP_ENTROPY` | OR it into a frame's `depth` to get entropy blocks. The frame becomes `ZAP2`, and each block keeps whichever of raw, plain or entropy is smallest. |
 | `zap_dict_train(samples, n, out, cap)` | Build a dictionary from concatenated sample packets. |
 | `zap_dict_init(&dict, data, len)` | Prepare a dictionary. The last 8 MB of `data` is used, and `data` must stay alive while the dictionary is in use. |
 
@@ -246,15 +253,26 @@ These are single runs on an AMD Ryzen 7 5800X (8 cores) with clang 18 `-O3 -marc
 - **Encode speed:** zap encodes at about 270 fps at 720p.
 - **Why use it:** the appeal is a small, dependency-free decoder that's hardened against bad input, not the compression ratio.
 
-### Compared to Oodle
+### zap vs LZ4 vs zstd
 
-Oodle is proprietary and **was not benchmarked**. Going by its published figures, Kraken decodes at roughly 1–1.5 GB/s per core and compresses noticeably better than zlib. zap is a byte-oriented LZ with no entropy coding, which is the LZ4/Selkie class of design:
+These results use the same 92.6 MB binary corpus, split into 4 MB blocks, on one thread, taking the best of several runs. Reproduce them with [`tools/compare.c`](tools/compare.c). The machine had another heavy program running at the time, so absolute speeds are low for every codec; compare the rows against each other. zstd 1.5.2 was built from source without its x64 assembly Huffman decoder, which may cost its decompressor some speed.
 
-- Single-threaded, zap decodes at about the same speed as Kraken.
-- zap produces **larger** files than Kraken.
-- zap's lead is in multi-threaded decoding, simplicity, and a hardened decoder.
+| Codec | Ratio | Compress | Decompress |
+|---|---|---|---|
+| lz4 1.9.4 | 1.62 | 518 MB/s | 3092 MB/s |
+| lz4hc 12 | 2.02 | 8 MB/s | 2961 MB/s |
+| zap fast | 1.77 | 227 MB/s | 1551 MB/s |
+| zap hc64 | 2.09 | 2 MB/s | 1223 MB/s |
+| zstd 1 | 2.02 | 331 MB/s | 821 MB/s |
+| zstd 3 | 2.26 | 147 MB/s | 754 MB/s |
+| zstd 9 | 2.47 | 37 MB/s | 678 MB/s |
+| zstd 19 | 2.73 | 2 MB/s | 547 MB/s |
+| zap fast + entropy | 2.10 | 132 MB/s | 651 MB/s |
+| zap hc64 + entropy | 2.41 | 2 MB/s | 696 MB/s |
 
-If your bottleneck is disk space or download size rather than decode time, use Kraken or zstd.
+- **Plain format:** it compresses a little smaller than LZ4 and LZ4-HC, but LZ4's decoder is about 2× faster. Some of that gap is zap's larger match window (8 MB, against LZ4's 64 KB) and its hardened decoder. The rest is decoder tuning still to do.
+- **Entropy mode:** it sits on the zstd curve, between zstd 3 and zstd 9 on both ratio and decode speed. It doesn't beat zstd. What zap adds is everything else in one header: dictionaries, parallel frames, textures and video.
+- **Oodle:** Oodle is proprietary and wasn't benchmarked. Going by its published figures, Kraken decodes at about 1–1.5 GB/s per core with ratios around or above zstd's middle levels, so zap's entropy mode doesn't match Kraken yet.
 
 ## Format
 
@@ -279,6 +297,21 @@ A frame looks like this (all fields little-endian):
 
 A block whose stored size equals its raw size is stored uncompressed.
 
+With `ZAP_ENTROPY`, the magic is `"ZAP2"` and each block starts with a method byte: 0 raw, 1 plain, 2 entropy. An entropy block is laid out like this:
+
+```
+u32 n_literals  u32 n_sequences  u32 n_length_bytes  u32 n_extra_bytes
+4 streams: literals, tokens, length bytes, offset codes
+   each: u8 method (0 raw, 1 Huffman) + u32 size + data
+   Huffman = 128 bytes of 4-bit code lengths (max 11), u32 sizes of sub-streams 0-2, then 4 bitstreams
+   (the symbols split into 4 contiguous quarters, decoded in parallel)
+offset extra bits (LSB-first)
+```
+
+- **Tokens:** same as the plain format (4-bit literal length, 4-bit match length − 4, with 15 continuing as 255-runs in the length stream).
+- **Offset codes:** code 0 repeats the previous offset. Code c in 1..23 means an offset in [2^(c−1), 2^c), followed by c−1 extra bits.
+- **End of block:** literals left over after the last sequence end the block.
+
 ## Building and testing
 
 ```sh
@@ -286,7 +319,7 @@ cmake -B build && cmake --build build --config Release
 ctest --test-dir build -C Release          # self-test + fuzz
 ```
 
-Or build it yourself. `bench.c`, `tex_bench.c` and `video_bench.c` are the test suites and benchmarks, and `zap.c` is the CLI:
+Or build it yourself. `bench.c`, `tex_bench.c` and `video_bench.c` are the test suites and benchmarks, `zap.c` is the CLI, and `tools/compare.c` compares against LZ4 and zstd (it needs both libraries):
 
 ```sh
 cc -std=c11 -O2 -pthread bench.c -o zap_bench && ./zap_bench
@@ -298,7 +331,8 @@ On Windows, CMake builds `zap_viewer` and fetches Dear ImGui v1.92.7 with FetchC
 
 ## Limitations
 
-- **Compression ratio:** there's no entropy coding (Huffman/ANS) and no optimal parsing, so files are smaller than zlib-fast but larger than zlib-6, zstd or Kraken.
+- **Compression ratio:** the plain format has no entropy coding. Entropy mode adds Huffman coding, but there's no optimal parsing or finite-state entropy coding (FSE/ANS) yet, so ratios are below zstd's high levels and Kraken's.
+- **Decode speed:** the plain decoder is about half LZ4's speed on the comparison above.
 - **hc speed:** hc compression is slow and limited by memory latency. It's meant for offline builds, where the `_mt` variant helps.
 - **Match distance:** matches reach at most 8 MB back. Blocks can be up to 2 GB.
 - **No stored sizes:** the raw block API doesn't record sizes, so store them yourself. Frames do record them.
@@ -315,8 +349,8 @@ On Windows, CMake builds `zap_viewer` and fetches Dear ImGui v1.92.7 with FetchC
   - Motion vectors reach at most 64 pixels.
   - Chroma motion is rounded to half-pixel.
   - The encoder and decoder are single-threaded.
-- **zap_viewer:** Windows only. Its source decoder is Media Foundation, which may use several threads, so its per-frame source decode time isn't a like-for-like single-core comparison.
   - The format is not compatible with any standard codec, so play it with `zap_video.h`.
+- **zap_viewer:** Windows only. Its source decoder is Media Foundation, which may use several threads, so its per-frame source decode time isn't a like-for-like single-core comparison.
 
 ## License
 

@@ -6,8 +6,12 @@
  *   size_t    zap_compress_hc(src, n, dst, cap, zap_hc_state*, dict, depth); // slow, smaller, same format
  *   ptrdiff_t zap_decompress (src, n, dst, raw_size, dict);                 // -1 = corrupt / wrong size
  *
+ * Entropy mode (packaging: smaller files, Huffman-coded streams, blocks >= ~16KB):
+ *   size_t    zap_compress_entropy  (src, n, dst, cap, state, depth, dict);   // state: zap_state (depth 0) or zap_hc_state
+ *   ptrdiff_t zap_decompress_entropy(src, n, dst, raw_size, dict, scratch, scratch_cap); // scratch may be NULL (mallocs)
+ *
  * Frames (packaging: self-describing, independent blocks, parallel decode):
- *   zap_frame_compress(src, n, dst, cap, block_size, depth /0 = fast/, dict)
+ *   zap_frame_compress(src, n, dst, cap, block_size, depth /0 = fast/ [| ZAP_ENTROPY], dict)
  *   zap_frame_open + zap_frame_decode_block(f, i, dst, dict)  -> call from your job system
  *   zap_frame_decode(...)  single thread
  *   #define ZAP_THREADS for zap_frame_compress_mt / zap_frame_decode_mt (pthreads, or C11 threads on Windows)
@@ -31,7 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ZAP_VERSION "1.0.0"
+#define ZAP_VERSION "1.1.0"
 
 #define ZAP_HLOG 16
 #define ZAP_HC_HLOG 17
@@ -57,17 +61,28 @@ static inline uint32_t zap__r32(const uint8_t *p) { /* little-endian load */
     return v;
 }
 static inline uint64_t zap__r64n(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; } /* native */
+static inline uint64_t zap__r64(const uint8_t *p) { /* little-endian load */
+    uint64_t v = zap__r64n(p);
+#ifdef ZAP_BIG_ENDIAN
+    v = __builtin_bswap64(v);
+#endif
+    return v;
+}
 static inline void zap__w32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
 static inline uint32_t zap__hash(uint32_t v, int hlog) { return (v * 2654435761u) >> (32 - hlog); }
 
 /* index of the first differing byte in memory order, given x = load(a) ^ load(b) != 0 */
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
+static inline int zap__log2(uint32_t v) { unsigned long i; _BitScanReverse(&i, v); return (int)i; } /* v > 0 */
 static inline unsigned zap__nb(uint64_t x) { unsigned long i; _BitScanForward64(&i, x); return (unsigned)i >> 3; }
-#elif defined(ZAP_BIG_ENDIAN)
+#else
+static inline int zap__log2(uint32_t v) { return 31 - __builtin_clz(v); } /* v > 0 */
+#if defined(ZAP_BIG_ENDIAN)
 static inline unsigned zap__nb(uint64_t x) { return (unsigned)__builtin_clzll(x) >> 3; }
 #else
 static inline unsigned zap__nb(uint64_t x) { return (unsigned)__builtin_ctzll(x) >> 3; }
+#endif
 #endif
 
 /* common prefix length of a and b, a bounded by aend */
@@ -278,8 +293,10 @@ static inline ptrdiff_t zap_decompress(const void *src_, size_t n, void *dst_, s
         if (lit < 15 && (tok & 15) < 15 && iend - ip >= 32 && oend - op >= 32) {
             memcpy(op, ip, 16);
             op += lit; ip += lit;
-            size_t off = (size_t)ip[0] | ((size_t)ip[1] << 8), ml = (tok & 15) + 4;
-            if (off & 0x8000) { off = (off & 0x7FFF) | ((size_t)ip[2] << 15); ip += 3; } else ip += 2;
+            /* branch-free 2/3-byte offset: near/far offsets mix unpredictably in big blocks */
+            size_t v = (size_t)ip[0] | ((size_t)ip[1] << 8), far = v >> 15, ml = (tok & 15) + 4;
+            size_t off = (v & 0x7FFF) | (((size_t)ip[2] << 15) & (size_t)0 - far);
+            ip += 2 + far;
             size_t have = (size_t)(op - ostart);
             if (off >= 16 && off <= have) {
                 memcpy(op, op - off, 16);
@@ -319,12 +336,355 @@ static inline ptrdiff_t zap_decompress(const void *src_, size_t n, void *dst_, s
     return op == oend ? op - ostart : -1;
 }
 
+/* ---------------- canonical Huffman (order-0, max code length 11, LSB-first bits)
+ * layout: 128 bytes of 4-bit code lengths (symbol 2k in the low nibble), then the bitstream */
+enum { ZAP__HMAX = 11 };
+
+static inline void zap__hlens(const uint32_t *freq, uint8_t len[256]) {
+    uint32_t f[256], w[512];
+    int sym[256], parent[512], d[512];
+    memcpy(f, freq, sizeof f);
+    for (;;) {
+        int n = 0;
+        memset(len, 0, 256);
+        for (int i = 0; i < 256; i++) if (f[i]) sym[n++] = i;
+        if (n == 0) return;
+        if (n == 1) { len[sym[0]] = 1; return; }
+        for (int i = 1; i < n; i++) /* sort leaves by weight */
+            for (int j = i; j && f[sym[j - 1]] > f[sym[j]]; j--) { int t = sym[j]; sym[j] = sym[j - 1]; sym[j - 1] = t; }
+        for (int i = 0; i < n; i++) w[i] = f[sym[i]];
+        int li = 0, ii = n, next = n; /* two-queue construction: internal nodes come out in weight order */
+        for (int k = 0; k < n - 1; k++) {
+            int ab[2];
+            for (int t = 0; t < 2; t++) ab[t] = li < n && (ii >= next || w[li] <= w[ii]) ? li++ : ii++;
+            w[next] = w[ab[0]] + w[ab[1]]; parent[ab[0]] = parent[ab[1]] = next; next++;
+        }
+        int maxd = 0;
+        d[next - 1] = 0;
+        for (int i = next - 2; i >= 0; i--) { d[i] = d[parent[i]] + 1; if (i < n && d[i] > maxd) maxd = d[i]; }
+        if (maxd <= ZAP__HMAX) { for (int i = 0; i < n; i++) len[sym[i]] = (uint8_t)d[i]; return; }
+        for (int i = 0; i < 256; i++) if (f[i]) f[i] = (f[i] >> 1) | 1; /* flatten and retry */
+    }
+}
+
+/* LSB-first codes: canonical code, bit-reversed */
+static inline void zap__hcodes(const uint8_t len[256], uint16_t code[256]) {
+    int count[16] = { 0 }, next[16] = { 0 };
+    for (int i = 0; i < 256; i++) count[len[i]]++;
+    count[0] = 0;
+    for (int l = 1, c = 0; l < 16; l++) { c = (c + count[l - 1]) << 1; next[l] = c; }
+    for (int i = 0; i < 256; i++) {
+        if (!len[i]) continue;
+        int c = next[len[i]]++, r = 0;
+        for (int b = 0; b < len[i]; b++) r |= ((c >> b) & 1) << (len[i] - 1 - b);
+        code[i] = (uint16_t)r;
+    }
+}
+
+/* returns coded size, 0 if it doesn't fit in cap */
+static inline size_t zap__henc(const uint8_t *src, size_t n, uint8_t *out, size_t cap) {
+    uint32_t freq[256] = { 0 };
+    uint8_t len[256];
+    uint16_t code[256];
+    if (cap < 128) return 0;
+    for (size_t i = 0; i < n; i++) freq[src[i]]++;
+    zap__hlens(freq, len);
+    zap__hcodes(len, code);
+    for (int i = 0; i < 128; i++) out[i] = (uint8_t)(len[2 * i] | len[2 * i + 1] << 4);
+    uint8_t *o = out + 128, *oe = out + cap;
+    uint64_t acc = 0;
+    int nb = 0;
+    for (size_t i = 0; i < n; i++) {
+        acc |= (uint64_t)code[src[i]] << nb; nb += len[src[i]];
+        while (nb >= 8) { if (o >= oe) return 0; *o++ = (uint8_t)acc; acc >>= 8; nb -= 8; }
+    }
+    if (nb) { if (o >= oe) return 0; *o++ = (uint8_t)acc; }
+    return (size_t)(o - out);
+}
+
+/* decode table from the 128-byte length header: entry = symbol | length << 8, 0 = unused code. 0 ok, -1 corrupt. */
+static inline int zap__htable(const uint8_t *in, uint16_t table[1 << ZAP__HMAX]) {
+    uint8_t len[256];
+    uint16_t code[256];
+    uint32_t kraft = 0;
+    for (int i = 0; i < 128; i++) { len[2 * i] = in[i] & 15; len[2 * i + 1] = in[i] >> 4; }
+    for (int i = 0; i < 256; i++) {
+        if (len[i] > ZAP__HMAX) return -1;
+        if (len[i]) kraft += 1u << (ZAP__HMAX - len[i]);
+    }
+    if (kraft > 1u << ZAP__HMAX) return -1; /* over-subscribed code */
+    zap__hcodes(len, code);
+    memset(table, 0, sizeof(uint16_t) << ZAP__HMAX);
+    for (int i = 0; i < 256; i++)
+        if (len[i]) for (int j = code[i]; j < 1 << ZAP__HMAX; j += 1 << len[i]) table[j] = (uint16_t)(i | len[i] << 8);
+    return 0;
+}
+
+/* bit reader. Invariant: bit nb of acc is bit 0 of *p. */
+typedef struct { const uint8_t *p, *e; uint64_t acc; int nb; } zap__hbits;
+
+/* careful path: byte refills, bounds-checked; used for stream tails */
+static inline int zap__hrun(const uint16_t *table, zap__hbits *b, uint8_t *out, size_t cnt) {
+    const unsigned mask = (1u << ZAP__HMAX) - 1;
+    for (size_t i = 0; i < cnt; i++) {
+        while (b->nb <= 56 && b->p < b->e) { b->acc |= (uint64_t)*b->p++ << b->nb; b->nb += 8; }
+        int t = table[b->acc & mask], l = t >> 8;
+        if (!l || l > b->nb) return -1; /* unused code, or ran past the end */
+        out[i] = (uint8_t)t; b->acc >>= l; b->nb -= l;
+    }
+    return 0;
+}
+
+/* one 64-bit refill (needs 8 readable bytes): at least 56 valid bits, enough for 4 symbols */
+#define ZAP__HREFILL(b) do { (b).acc |= zap__r64((b).p) << (b).nb; (b).p += (63 - (b).nb) >> 3; (b).nb |= 56; } while (0)
+/* fast-path symbol: no validity check. An unused code (length 0) just repeats a symbol without consuming bits;
+   output stays in bounds, and the caller's structural checks reject the result. Tails are fully checked. */
+#define ZAP__HSYM(b, dst) do { int t_ = table[(b).acc & mask], l_ = t_ >> 8; \
+    (dst) = (uint8_t)t_; (b).acc >>= l_; (b).nb -= l_; } while (0)
+
+/* single-stream Huffman (video streams); decodes exactly raw symbols. 0 ok, -1 corrupt. */
+static inline int zap__hdec(const uint8_t *in, size_t n, uint8_t *out, size_t raw) {
+    uint16_t table[1 << ZAP__HMAX];
+    const unsigned mask = (1u << ZAP__HMAX) - 1;
+    if (n < 128 || zap__htable(in, table)) return -1;
+    zap__hbits b = { in + 128, in + n, 0, 0 };
+    size_t i = 0;
+    while (raw - i >= 4 && b.e - b.p >= 8) {
+        ZAP__HREFILL(b);
+        for (int k = 0; k < 4; k++) ZAP__HSYM(b, out[i + k]);
+        i += 4;
+    }
+    return zap__hrun(table, &b, out + i, raw - i);
+}
+
+/* 4-stream Huffman (entropy mode): symbols split into 4 contiguous quarters, each its own bitstream, so the
+ * decoder runs 4 independent dependency chains. Layout: 128-byte lengths, u32 size of streams 0..2, 4 streams. */
+static inline size_t zap__henc4(const uint8_t *src, size_t n, uint8_t *out, size_t cap) {
+    uint32_t freq[256] = { 0 };
+    uint8_t len[256];
+    uint16_t code[256];
+    if (cap < 140) return 0;
+    for (size_t i = 0; i < n; i++) freq[src[i]]++;
+    zap__hlens(freq, len);
+    zap__hcodes(len, code);
+    for (int i = 0; i < 128; i++) out[i] = (uint8_t)(len[2 * i] | len[2 * i + 1] << 4);
+    uint8_t *o = out + 140, *oe = out + cap;
+    size_t q = (n + 3) / 4;
+    for (int k = 0; k < 4; k++) {
+        size_t lo = (size_t)k * q < n ? (size_t)k * q : n, hi = lo + q < n ? lo + q : n;
+        uint8_t *start = o;
+        uint64_t acc = 0;
+        int nb = 0;
+        for (size_t i = lo; i < hi; i++) {
+            acc |= (uint64_t)code[src[i]] << nb; nb += len[src[i]];
+            while (nb >= 8) { if (o >= oe) return 0; *o++ = (uint8_t)acc; acc >>= 8; nb -= 8; }
+        }
+        if (nb) { if (o >= oe) return 0; *o++ = (uint8_t)acc; }
+        if (k < 3) zap__w32(out + 128 + 4 * k, (uint32_t)(o - start));
+    }
+    return (size_t)(o - out);
+}
+
+static inline int zap__hdec4(const uint8_t *in, size_t n, uint8_t *out, size_t raw) {
+    uint16_t table[1 << ZAP__HMAX];
+    const unsigned mask = (1u << ZAP__HMAX) - 1;
+    if (n < 140 || zap__htable(in, table)) return -1;
+    size_t sz[3] = { zap__r32(in + 128), zap__r32(in + 132), zap__r32(in + 136) }, avail = n - 140;
+    if (sz[0] > avail || sz[1] > avail - sz[0] || sz[2] > avail - sz[0] - sz[1]) return -1;
+    const uint8_t *s0 = in + 140, *s1 = s0 + sz[0], *s2 = s1 + sz[1], *s3 = s2 + sz[2];
+    zap__hbits b0 = { s0, s1, 0, 0 }, b1 = { s1, s2, 0, 0 }, b2 = { s2, s3, 0, 0 }, b3 = { s3, in + n, 0, 0 };
+    size_t q = (raw + 3) / 4, c3 = raw > 3 * q ? raw - 3 * q : 0, i = 0; /* quarters 0-2 have q symbols, 3 has c3 <= q */
+    uint8_t *o0 = out, *o1 = out + q, *o2 = out + 2 * q, *o3 = out + 3 * q;
+    if (raw < 4 * q && raw < 3 * q) { /* tiny input: some quarters are short or empty */
+        zap__hbits *bs[4] = { &b0, &b1, &b2, &b3 };
+        for (int k = 0; k < 4; k++) {
+            size_t lo = (size_t)k * q < raw ? (size_t)k * q : raw, hi = lo + q < raw ? lo + q : raw;
+            if (zap__hrun(table, bs[k], out + lo, hi - lo)) return -1;
+        }
+        return 0;
+    }
+    while (c3 - i >= 5 && b0.e - b0.p >= 8 && b1.e - b1.p >= 8 && b2.e - b2.p >= 8 && b3.e - b3.p >= 8) {
+        ZAP__HREFILL(b0); ZAP__HREFILL(b1); ZAP__HREFILL(b2); ZAP__HREFILL(b3);
+        for (int k = 0; k < 5; k++) { /* 5 x 11 bits <= 56 */
+            ZAP__HSYM(b0, o0[i + k]); ZAP__HSYM(b1, o1[i + k]); ZAP__HSYM(b2, o2[i + k]); ZAP__HSYM(b3, o3[i + k]);
+        }
+        i += 5;
+    }
+    if (zap__hrun(table, &b0, o0 + i, q - i) || zap__hrun(table, &b1, o1 + i, q - i) ||
+        zap__hrun(table, &b2, o2 + i, q - i) || zap__hrun(table, &b3, o3 + i, c3 - i)) return -1;
+    return 0;
+}
+#undef ZAP__HREFILL
+#undef ZAP__HSYM
+
+/* ---------------- entropy mode: the LZ parse re-coded as Huffman streams. For packaging blocks (>= ~16KB);
+ * small packets should stay on the plain format (5 x 128-byte code tables would outweigh the gain).
+ * Block layout (little-endian):
+ *   u32 n_lits, u32 n_seq, u32 n_lens, u32 n_extra
+ *   4 streams - literals, tokens, length bytes, offset codes - each: u8 method (0 raw, 1 4-way Huffman) + u32 size + data
+ *   n_extra bytes of offset extra bits (LSB-first)
+ * Sequence i: token = literal nibble | (match - 4) nibble, 15 continues as 255-runs in the length stream;
+ * offset code 0 = repeat the previous offset, c in 1..23 = offset in [2^(c-1), 2^c) plus c - 1 extra bits.
+ * Literals left over after the last sequence end the block. */
+#define ZAP_ENTROPY (1 << 16) /* OR into a frame's depth: entropy blocks, version-2 frame */
+
+/* decoder scratch that always suffices for a block of raw bytes */
+static inline size_t zap_entropy_scratch(size_t raw) { return 2 * raw + raw / 255 + 128; }
+
+static inline uint8_t *zap__e_stream(uint8_t *op, uint8_t *oend, const uint8_t *s, size_t n) {
+    if (!op || oend - op < 5) return NULL;
+    size_t room = (size_t)(oend - op) - 5, h = 0;
+    if (n > 64) h = zap__henc4(s, n, op + 5, room < n - 1 ? room : n - 1);
+    if (h) { *op = 1; zap__w32(op + 1, (uint32_t)h); return op + 5 + h; }
+    if (room < n) return NULL;
+    *op = 0; zap__w32(op + 1, (uint32_t)n); memcpy(op + 5, s, n);
+    return op + 5 + n;
+}
+
+/* re-code a (trusted, self-produced) plain block of raw bytes; 0 = doesn't fit in cap */
+static inline size_t zap__e_encode(const uint8_t *lz, size_t lzn, size_t raw, uint8_t *dst, size_t cap) {
+    size_t maxseq = raw / 4 + 2, nl = 0, ns = 0, nlen = 0, rep = 0;
+    uint8_t *buf = (uint8_t *)malloc(raw + 5 * maxseq + lzn + 16);
+    if (!buf || cap < 16) { free(buf); return 0; }
+    uint8_t *lits = buf, *toks = lits + raw, *offc = toks + maxseq, *xb = offc + maxseq, *lens = xb + 3 * maxseq + 16, *xp = xb;
+    uint64_t acc = 0;
+    int nb = 0;
+    for (const uint8_t *ip = lz, *ie = lz + lzn;;) {
+        unsigned tok = *ip++;
+        size_t ll = tok >> 4, mark = nlen;
+        if (ll == 15) { uint8_t b; do { b = *ip++; lens[nlen++] = b; ll += b; } while (b == 255); }
+        memcpy(lits + nl, ip, ll); nl += ll; ip += ll;
+        if (ip >= ie) { nlen = mark; break; } /* trailing literals: implied by n_lits */
+        size_t off = (size_t)ip[0] | ((size_t)ip[1] << 8);
+        ip += 2;
+        if (off & 0x8000) off = (off & 0x7FFF) | ((size_t)*ip++ << 15);
+        if ((tok & 15) == 15) { uint8_t b; do { b = *ip++; lens[nlen++] = b; } while (b == 255); }
+        toks[ns] = (uint8_t)tok;
+        if (off == rep) offc[ns] = 0;
+        else {
+            int k = zap__log2((uint32_t)off);
+            offc[ns] = (uint8_t)(k + 1);
+            acc |= (uint64_t)(off - ((size_t)1 << k)) << nb; nb += k;
+            while (nb >= 8) { *xp++ = (uint8_t)acc; acc >>= 8; nb -= 8; }
+            rep = off;
+        }
+        ns++;
+    }
+    if (nb) *xp++ = (uint8_t)acc;
+    size_t nx = (size_t)(xp - xb);
+    uint8_t *op = dst, *oend = dst + cap;
+    zap__w32(op, (uint32_t)nl); zap__w32(op + 4, (uint32_t)ns); zap__w32(op + 8, (uint32_t)nlen); zap__w32(op + 12, (uint32_t)nx);
+    op = zap__e_stream(op + 16, oend, lits, nl);
+    op = zap__e_stream(op, oend, toks, ns);
+    op = zap__e_stream(op, oend, lens, nlen);
+    op = zap__e_stream(op, oend, offc, ns);
+    size_t r = 0;
+    if (op && (size_t)(oend - op) >= nx) { memcpy(op, xb, nx); r = (size_t)(op + nx - dst); }
+    free(buf);
+    return r;
+}
+
+/* depth 0: fast parse (state = zap_state*), else hc chain depth (state = zap_hc_state*). 0 = doesn't fit in cap. */
+static inline size_t zap_compress_entropy(const void *src, size_t n, void *dst, size_t cap, void *state, int depth, const zap_dict *d) {
+    size_t lcap = zap_bound(n), r = 0;
+    uint8_t *lz = (uint8_t *)malloc(lcap);
+    if (!lz) return 0;
+    depth &= 0xFFFF;
+    size_t ln = depth ? zap_compress_hc(src, n, lz, lcap, (zap_hc_state *)state, d, depth) : zap_compress(src, n, lz, lcap, (zap_state *)state, d);
+    if (ln) r = zap__e_encode(lz, ln, n, (uint8_t *)dst, cap);
+    free(lz);
+    return r;
+}
+
+/* raw_size must be exact. scratch: zap_entropy_scratch(raw_size) bytes, or NULL to malloc. Returns raw_size or -1. */
+static inline ptrdiff_t zap_decompress_entropy(const void *src_, size_t n, void *dst_, size_t raw_size, const zap_dict *d, void *scratch, size_t scratch_cap) {
+    const uint8_t *ip = (const uint8_t *)src_, *iend = ip + n;
+    if (n < 16) return -1;
+    size_t nl = zap__r32(ip), ns = zap__r32(ip + 4), nlen = zap__r32(ip + 8), nx = zap__r32(ip + 12);
+    ip += 16;
+    if (nl > raw_size || ns > raw_size / 4 + 1 || nlen > 2 * ns + raw_size / 255 + 1 || nx > 3 * ns + 8) return -1;
+    size_t need = nl + 2 * ns + nlen, cnt[4] = { nl, ns, nlen, ns };
+    uint8_t *mem = (uint8_t *)scratch, *own = NULL;
+    if (!mem || scratch_cap < need) { if (!(mem = own = (uint8_t *)malloc(need ? need : 1))) return -1; }
+    const uint8_t *st[4];
+    uint8_t *w = mem;
+    ptrdiff_t r = -1;
+    for (int k = 0; k < 4; k++) {
+        if (iend - ip < 5) goto out;
+        int m = ip[0];
+        size_t sz = zap__r32(ip + 1);
+        ip += 5;
+        if (sz > (size_t)(iend - ip)) goto out;
+        if (m == 0) { if (sz != cnt[k]) goto out; st[k] = ip; }
+        else if (m == 1) { if (zap__hdec4(ip, sz, w, cnt[k])) goto out; st[k] = w; w += cnt[k]; }
+        else goto out;
+        ip += sz;
+    }
+    if ((size_t)(iend - ip) != nx) goto out;
+    {
+        const uint8_t *lp = st[0], *le = lp + nl, *tp = st[1], *lnp = st[2], *lne = lnp + nlen, *oc = st[3], *xp = ip;
+        uint8_t *op = (uint8_t *)dst_, *ostart = op, *oend = op + raw_size;
+        size_t rep = 0, dlen = d ? d->len : 0;
+        uint64_t xacc = 0;
+        int xnb = 0, err = 0;
+        for (size_t i = 0; i < ns; i++) {
+            unsigned tok = tp[i], c = oc[i];
+            size_t ll = tok >> 4, ml = tok & 15, off;
+            if (c == 0) { if (!rep) goto out; off = rep; }
+            else {
+                int k = (int)c - 1;
+                if (c > 23) goto out;
+                if (xnb < k) { /* 64-bit refill while 8 bytes remain, bytewise at the end */
+                    if (iend - xp >= 8) { xacc |= zap__r64(xp) << xnb; xp += (63 - xnb) >> 3; xnb |= 56; }
+                    else while (xnb < k) { if (xp >= iend) goto out; xacc |= (uint64_t)*xp++ << xnb; xnb += 8; }
+                }
+                off = ((size_t)1 << k) + (size_t)(xacc & (((uint64_t)1 << k) - 1));
+                xacc >>= k; xnb -= k;
+            }
+            rep = off;
+            /* hot path, as in zap_decompress: short literals + short match with headroom -> fixed-size copies */
+            if (ll < 15 && ml < 15 && le - lp >= 16 && oend - op >= 32) {
+                memcpy(op, lp, 16);
+                op += ll; lp += ll; ml += 4;
+                size_t have = (size_t)(op - ostart);
+                if (off >= 16 && off <= have) { memcpy(op, op - off, 16); memcpy(op + 16, op - off + 16, 2); }
+                else if (off > have + dlen) goto out;
+                else zap__dict_copy(op, ostart, oend, d, off, ml);
+                op += ml;
+                continue;
+            }
+            if (ll == 15) { ll += zap__ext(&lnp, lne, &err); if (err) goto out; }
+            if (ll > (size_t)(le - lp) || ll > (size_t)(oend - op)) goto out;
+            if ((size_t)(le - lp) >= ll + 16 && (size_t)(oend - op) >= ll + 16) {
+                const uint8_t *s = lp; uint8_t *o = op, *e = op + ll;
+                while (o < e) { memcpy(o, s, 16); o += 16; s += 16; }
+            } else {
+                memcpy(op, lp, ll);
+            }
+            op += ll; lp += ll;
+            if (ml == 15) { ml += zap__ext(&lnp, lne, &err); if (err) goto out; }
+            ml += 4;
+            if (off > (size_t)(op - ostart) + dlen || ml > (size_t)(oend - op)) goto out;
+            zap__dict_copy(op, ostart, oend, d, off, ml);
+            op += ml;
+        }
+        if ((size_t)(le - lp) != (size_t)(oend - op)) goto out; /* trailing literals finish the block exactly */
+        memcpy(op, lp, (size_t)(le - lp));
+        r = (ptrdiff_t)raw_size;
+    }
+out:
+    free(own);
+    return r;
+}
+
 /* ---------------- frames: [magic][block_size u32][raw_size u64][end offset u64 per block][blocks]
- * A block whose stored size equals its raw size is stored uncompressed. */
+ * "ZAP1": a block whose stored size equals its raw size is stored uncompressed, else it's a plain block.
+ * "ZAP2" (written when depth has ZAP_ENTROPY): each block starts with a method byte: 0 raw, 1 plain, 2 entropy. */
+#define ZAP_FRAME_MAGIC2 0x3250415Au /* "ZAP2" */
 
-typedef struct { const uint8_t *table, *blocks; size_t raw, bs, nb, blocks_size; } zap_frame;
+typedef struct { const uint8_t *table, *blocks; size_t raw, bs, nb, blocks_size; int v; } zap_frame;
 
-static inline size_t zap_frame_bound(size_t n, size_t bs) { return 16 + 8 * ((n + bs - 1) / bs) + n; }
+static inline size_t zap_frame_bound(size_t n, size_t bs) { return 16 + 9 * ((n + bs - 1) / bs) + n; }
 
 static inline void zap__w64(uint8_t *p, uint64_t v) { zap__w32(p, (uint32_t)v); zap__w32(p + 4, (uint32_t)(v >> 32)); }
 
@@ -336,25 +696,47 @@ static inline size_t zap__block(const uint8_t *src, size_t len, uint8_t *dst, si
                  : zap_compress(src, len, dst, lim, (zap_state *)st, d);
 }
 
-static inline size_t zap__frame_hdr(uint8_t *dst, size_t cap, size_t n, size_t bs, size_t *nb) {
+/* version-2 frame block: method byte + payload, smallest of raw / plain / entropy. 0 = no room or out of memory. */
+static inline size_t zap__block2(const uint8_t *src, size_t len, uint8_t *dst, size_t lim, void *st, int depth, const zap_dict *d) {
+    size_t lcap = zap_bound(len), ln = 0, en = 0, best = len;
+    int m = 0;
+    uint8_t *lz = (uint8_t *)malloc(lcap), *e = (uint8_t *)malloc(len + 1);
+    if (!lz || !e) { free(lz); free(e); return 0; }
+    if (len >= 2) {
+        ln = depth ? zap_compress_hc(src, len, lz, lcap, (zap_hc_state *)st, d, depth) : zap_compress(src, len, lz, lcap, (zap_state *)st, d);
+        if (ln && ln < best) { best = ln; m = 1; }
+        if (ln && best > 1) en = zap__e_encode(lz, ln, len, e, best - 1);
+        if (en && en < best) { best = en; m = 2; }
+    }
+    size_t r = 0;
+    if (lim >= best + 1) { dst[0] = (uint8_t)m; memcpy(dst + 1, m == 0 ? src : m == 1 ? lz : e, best); r = best + 1; }
+    free(lz); free(e);
+    return r;
+}
+
+static inline size_t zap__frame_hdr(uint8_t *dst, size_t cap, size_t n, size_t bs, size_t *nb, int v2) {
     if (!bs || bs > 0x80000000u) return 0;
     size_t hdr = 16 + 8 * (*nb = (n + bs - 1) / bs);
     if (cap < hdr) return 0;
-    zap__w32(dst, ZAP_FRAME_MAGIC); zap__w32(dst + 4, (uint32_t)bs); zap__w64(dst + 8, n);
+    zap__w32(dst, v2 ? ZAP_FRAME_MAGIC2 : ZAP_FRAME_MAGIC); zap__w32(dst + 4, (uint32_t)bs); zap__w64(dst + 8, n);
     return hdr;
 }
 
-/* depth 0 = fast compressor, >0 = hc chain depth. block_size <= 2GB. Returns frame size, 0 on failure. */
+/* depth 0 = fast compressor, >0 = hc chain depth; | ZAP_ENTROPY for entropy blocks (version-2 frame).
+ * block_size <= 2GB. Returns frame size, 0 on failure. */
 static inline size_t zap_frame_compress(const void *src_, size_t n, void *dst_, size_t cap, size_t bs, int depth, const zap_dict *d) {
     const uint8_t *src = (const uint8_t *)src_;
     uint8_t *dst = (uint8_t *)dst_;
-    size_t nb, pos = zap__frame_hdr(dst, cap, n, bs, &nb), hdr = pos;
+    int v2 = (depth & ZAP_ENTROPY) != 0;
+    depth &= 0xFFFF;
+    size_t nb, pos = zap__frame_hdr(dst, cap, n, bs, &nb, v2), hdr = pos;
     if (!pos) return 0;
     void *st = malloc(depth ? sizeof(zap_hc_state) : sizeof(zap_state));
     if (!st) return 0;
     for (size_t b = 0; b < nb; b++) {
         size_t len = b == nb - 1 ? n - b * bs : bs, room = cap - pos;
-        size_t c = zap__block(src + b * bs, len, dst + pos, room, st, depth, d);
+        size_t c = v2 ? zap__block2(src + b * bs, len, dst + pos, room, st, depth, d) : zap__block(src + b * bs, len, dst + pos, room, st, depth, d);
+        if (!c && v2) { free(st); return 0; }
         if (!c) { /* incompressible: store raw */
             if (room < len) { free(st); return 0; }
             memcpy(dst + pos, src + b * bs, len); c = len;
@@ -371,7 +753,8 @@ static inline uint64_t zap__r64le(const uint8_t *p) { return zap__r32(p) | ((uin
 /* validates the header and block table. 0 ok, -1 corrupt. */
 static inline int zap_frame_open(zap_frame *f, const void *src_, size_t n) {
     const uint8_t *src = (const uint8_t *)src_;
-    if (n < 16 || zap__r32(src) != ZAP_FRAME_MAGIC) return -1;
+    if (n < 16 || (zap__r32(src) != ZAP_FRAME_MAGIC && zap__r32(src) != ZAP_FRAME_MAGIC2)) return -1;
+    f->v = zap__r32(src) == ZAP_FRAME_MAGIC2 ? 2 : 1;
     uint64_t raw = zap__r64le(src + 8);
     f->bs = zap__r32(src + 4);
     if (!f->bs || f->bs > 0x80000000u || raw > SIZE_MAX) return -1;
@@ -382,27 +765,41 @@ static inline int zap_frame_open(zap_frame *f, const void *src_, size_t n) {
     uint64_t prev = 0;
     for (size_t b = 0; b < f->nb; b++) {
         uint64_t end = zap__r64le(f->table + 8 * b), len = b == f->nb - 1 ? f->raw - b * f->bs : f->bs;
-        if (end < prev || end - prev > len || end > f->blocks_size) return -1;
+        if (end < prev || end - prev > len + (f->v == 2) || (f->v == 2 && end == prev) || end > f->blocks_size) return -1;
         prev = end;
     }
     return 0;
 }
 
-/* decode block i into dst (the whole raw_size output buffer). Thread-safe: call from any job. 0 ok, -1 corrupt. */
-static inline int zap_frame_decode_block(const zap_frame *f, size_t i, void *dst, const zap_dict *d) {
+/* decode block i into dst (the whole raw_size output buffer). Thread-safe: call from any job. 0 ok, -1 corrupt.
+ * scratch: zap_entropy_scratch(block_size) bytes reused across calls for entropy blocks, or NULL to malloc. */
+static inline int zap_frame_decode_block_ex(const zap_frame *f, size_t i, void *dst, const zap_dict *d, void *scratch, size_t scratch_cap) {
     size_t start = i ? (size_t)zap__r64le(f->table + 8 * (i - 1)) : 0, end = (size_t)zap__r64le(f->table + 8 * i);
-    size_t len = i == f->nb - 1 ? f->raw - i * f->bs : f->bs;
+    size_t len = i == f->nb - 1 ? f->raw - i * f->bs : f->bs, sz = end - start;
+    const uint8_t *p = f->blocks + start;
     uint8_t *o = (uint8_t *)dst + i * f->bs;
-    if (end - start == len) { memcpy(o, f->blocks + start, len); return 0; }
-    return zap_decompress(f->blocks + start, end - start, o, len, d) == (ptrdiff_t)len ? 0 : -1;
+    int m = sz == len ? 0 : 1;
+    if (f->v == 2) { m = *p++; sz--; }
+    if (m == 0) { if (sz != len) return -1; memcpy(o, p, len); return 0; }
+    if (m == 1) return zap_decompress(p, sz, o, len, d) == (ptrdiff_t)len ? 0 : -1;
+    if (m == 2) return zap_decompress_entropy(p, sz, o, len, d, scratch, scratch_cap) == (ptrdiff_t)len ? 0 : -1;
+    return -1;
+}
+
+static inline int zap_frame_decode_block(const zap_frame *f, size_t i, void *dst, const zap_dict *d) {
+    return zap_frame_decode_block_ex(f, i, dst, d, NULL, 0);
 }
 
 /* returns raw size, or -1 if corrupt / cap too small */
 static inline ptrdiff_t zap_frame_decode(const void *src, size_t n, void *dst, size_t cap, const zap_dict *d) {
     zap_frame f;
     if (zap_frame_open(&f, src, n) || f.raw > cap) return -1;
-    for (size_t b = 0; b < f.nb; b++) if (zap_frame_decode_block(&f, b, dst, d)) return -1;
-    return (ptrdiff_t)f.raw;
+    size_t sc = f.v == 2 ? zap_entropy_scratch(f.bs) : 0;
+    void *scratch = sc ? malloc(sc) : NULL;
+    ptrdiff_t r = (ptrdiff_t)f.raw;
+    for (size_t b = 0; b < f.nb && r >= 0; b++) if (zap_frame_decode_block_ex(&f, b, dst, d, scratch, scratch ? sc : 0)) r = -1;
+    free(scratch);
+    return r;
 }
 
 #ifdef ZAP_THREADS
@@ -445,7 +842,11 @@ static inline void zap__par(int n, void (*fn)(void *, int, int), void *ctx) {
 typedef struct { const zap_frame *f; uint8_t *dst; const zap_dict *d; int err[ZAP__MAXT]; } zap__djob;
 static inline void zap__dwork(void *p, int t, int n) {
     zap__djob *j = (zap__djob *)p;
-    for (size_t b = (size_t)t; b < j->f->nb; b += (size_t)n) if (zap_frame_decode_block(j->f, b, j->dst, j->d)) j->err[t] = 1;
+    size_t sc = j->f->v == 2 ? zap_entropy_scratch(j->f->bs) : 0;
+    void *scratch = sc ? malloc(sc) : NULL; /* one per thread, reused across blocks */
+    for (size_t b = (size_t)t; b < j->f->nb; b += (size_t)n)
+        if (zap_frame_decode_block_ex(j->f, b, j->dst, j->d, scratch, scratch ? sc : 0)) j->err[t] = 1;
+    free(scratch);
 }
 
 static inline ptrdiff_t zap_frame_decode_mt(const void *src, size_t n, void *dst, size_t cap, const zap_dict *d, int threads) {
@@ -459,14 +860,15 @@ static inline ptrdiff_t zap_frame_decode_mt(const void *src, size_t n, void *dst
 }
 
 /* blocks compress into their own slot of tmp (each result < block size, so slots never overflow) */
-typedef struct { const uint8_t *src; uint8_t *tmp; size_t n, bs, nb, *cs; int depth; const zap_dict *d; } zap__cjob;
+typedef struct { const uint8_t *src; uint8_t *tmp; size_t n, bs, nb, *cs, slot; int depth, v2; const zap_dict *d; } zap__cjob;
 static inline void zap__cwork(void *p, int t, int n) {
     zap__cjob *j = (zap__cjob *)p;
     void *st = malloc(j->depth ? sizeof(zap_hc_state) : sizeof(zap_state));
     if (!st) return; /* its blocks keep cs == SIZE_MAX -> caller fails */
     for (size_t b = (size_t)t; b < j->nb; b += (size_t)n) {
         size_t len = b == j->nb - 1 ? j->n - b * j->bs : j->bs;
-        j->cs[b] = zap__block(j->src + b * j->bs, len, j->tmp + b * j->bs, len, st, j->depth, j->d);
+        if (j->v2) { size_t c = zap__block2(j->src + b * j->bs, len, j->tmp + b * j->slot, len + 1, st, j->depth, j->d); if (c) j->cs[b] = c; }
+        else j->cs[b] = zap__block(j->src + b * j->bs, len, j->tmp + b * j->slot, len, st, j->depth, j->d);
     }
     free(st);
 }
@@ -476,16 +878,18 @@ static inline size_t zap_frame_compress_mt(const void *src_, size_t n, void *dst
                                            const zap_dict *d, int threads) {
     const uint8_t *src = (const uint8_t *)src_;
     uint8_t *dst = (uint8_t *)dst_;
-    size_t nb, pos = zap__frame_hdr(dst, cap, n, bs, &nb), hdr = pos;
+    int v2 = (depth & ZAP_ENTROPY) != 0;
+    size_t nb, pos = zap__frame_hdr(dst, cap, n, bs, &nb, v2), hdr = pos;
     if (!pos) return 0;
-    zap__cjob j = { src, (uint8_t *)malloc(n ? n : 1), n, bs, nb, (size_t *)malloc((nb ? nb : 1) * sizeof(size_t)), depth, d };
+    size_t slot = v2 ? (nb == 1 ? n : bs) + 1 : bs;
+    zap__cjob j = { src, (uint8_t *)malloc(v2 ? nb * slot + 1 : n + 1), n, bs, nb, (size_t *)malloc((nb ? nb : 1) * sizeof(size_t)), slot, depth & 0xFFFF, v2, d };
     if (!j.tmp || !j.cs) { free(j.tmp); free(j.cs); return 0; }
     for (size_t b = 0; b < nb; b++) j.cs[b] = SIZE_MAX;
     zap__par(zap__threads(threads, nb), zap__cwork, &j);
     for (size_t b = 0; b < nb; b++) {
         size_t len = b == nb - 1 ? n - b * bs : bs, c = j.cs[b];
-        const uint8_t *from = c ? j.tmp + b * bs : src + b * bs;
-        if (!c) c = len; /* store raw */
+        const uint8_t *from = c && c != SIZE_MAX ? j.tmp + b * slot : src + b * bs;
+        if (!c) c = len; /* store raw (version 1 only: version 2 blocks always carry a method byte) */
         if (c == SIZE_MAX || cap - pos < c) { pos = 0; break; }
         memcpy(dst + pos, from, c);
         pos += c;
