@@ -413,17 +413,23 @@ These are single runs on an AMD Ryzen 7 5800X (8 cores) with clang 18 `-O3 -marc
 
   | Codec | Ratio | Decode |
   |---|---|---|
-  | zap hc64 | 2.528 | 2.5 GB/s |
+  | zap hc64 (1.2) | 2.528 | 2.5 GB/s |
   | lz4hc 12 | 2.565 | 5.0 GB/s |
   | Oodle Selkie | 2.600 | 5.8 GB/s |
+  | **zap hc64 (1.3)** | **2.616** | not yet re-measured |
   | zap hc64 + entropy (1.2) | 2.876 | 1.6 GB/s |
-  | **zap hc64 + entropy (1.3)** | **3.045** | 1.3 GB/s |
+  | zap hc64 + entropy (1.3, entropy v2 only) | 3.045 | 1.3 GB/s |
   | Oodle Mermaid | 3.054 | 3.2 GB/s |
   | zstd 19 | 3.074 | 0.9 GB/s |
+  | **zap hc64 + entropy (1.3)** | **3.134** | not yet re-measured |
   | Oodle Kraken | 3.300 | 1.8 GB/s |
   | Oodle Leviathan | 3.358 | 1.2 GB/s |
 
-  Entropy version 2 (three repeat offsets tracked by the optimal parser, low offset bits entropy coded) is +5.9% on this data and draws level with Mermaid's ratio, but Mermaid decodes 2.4× faster and Kraken is 8% smaller and 1.4× faster. Oodle still dominates every tier here. The measured gaps, in order: the decoder's per-sequence cost (the Huffman streams are only a third of decode time), weaker match finding (lz4hc 12 beats zap hc64's ratio at the same 64 KB window; a deeper search reaches 3.10), and a parser that prices bytes but not decode time (limiting zap's window to 1 MB makes plain decode 35% faster for 0.7% ratio).
+  - Entropy version 2 (three repeat offsets tracked by the optimal parser, low offset bits entropy coded): +5.9% on this data.
+  - A binary-tree match finder for the optimal parser (hc depth ≥ 32) instead of hash chains: +2.5% plain, +1.8% entropy, and faster compression. Hash chains stop after `depth` candidates, newest first; the tree walks straight to the positions sharing the longest prefix.
+  - Longer matches priced exactly (up to 256 bytes instead of 64) and a second re-pricing pass in entropy mode: another +0.9% plain, +1.1% entropy.
+  - Plain zap now compresses slightly smaller than Selkie (2.616 vs 2.600) and entropy mode passes Mermaid's ratio (3.134 vs 3.054). Kraken is still 5% smaller, Oodle decodes much faster, and zap's optimal parser compresses several times slower than Oodle's (about 0.5–1.5 MB/s against 2–4 MB/s here, one thread). Decode speeds with the new parse are pending a measurement on an idle machine: the machine these ran on was fully loaded, which made timing noise larger than the effects being measured.
+  - The remaining decode gap, from AMD uProf counters: store-to-load forwarding stalls and misaligned loads in the sequence loop, and Huffman-decoding literals that barely compress on this data (7.7 bits per 8).
 - **Oodle, zap 1.2:** measured with `zap_viewer`'s Package tab on a 225 MB Source-engine VPK from Portal Revolution (uncompressed game data: textures, models, sounds), 4 MB blocks, with Oodle 2.8 (`oo2ext_8_win64.dll`) as shipped by a game. Ratios are exact. Decode speeds are single-thread and were measured while other work was running, so treat them as rough.
 
   | Codec | Ratio | Decode (1 thread) |

@@ -223,7 +223,16 @@ static inline size_t zap__hc_find(zap_hc_state *s, const uint8_t *src, const uin
 #define ZAP_OPT_DEPTH 32
 #define ZAP_FAST_DECODE (1 << 17) /* OR into depth (>= ZAP_OPT_DEPTH): ~2 bytes per sequence penalty -> ~15% faster decode, ~3.5% bigger */
 #define ZAP__SEQ_PENALTY(depth) ((depth) & ZAP_FAST_DECODE ? 256u : 8u)
-enum { ZAP__OPTN = 2048, ZAP__SUFF = 64, ZAP__MAXC = 24 };
+#ifndef ZAP__OPTN
+#define ZAP__OPTN 2048
+#endif
+#ifndef ZAP__SUFF
+#define ZAP__SUFF 256 /* a match this long is taken outright instead of being priced at every length */
+#endif
+#ifndef ZAP__E_PASSES
+#define ZAP__E_PASSES 2 /* entropy mode: optimal parses re-priced from the previous parse's Huffman code lengths */
+#endif
+enum { ZAP__MAXC = 24 };
 
 typedef struct { uint32_t len, off; } zap__match;
 typedef struct { uint32_t price, len, off, lit, rep, rep1, rep2; } zap__opt;
@@ -276,6 +285,66 @@ static inline int zap__hc_all(zap_hc_state *s, const uint8_t *src, const uint8_t
     return n;
 }
 
+/* Binary-tree match finder for the optimal parser (LZMA's bt4 idea). Every position is a node in a tree ordered
+   by the bytes that follow it; a lookup walks from the hash bucket's newest position toward the ones sharing the
+   longest prefix, and inserting re-links the tree around the new position on the way. Hash chains visit
+   candidates newest-first and give up after `depth` steps, which on structured data misses the long matches.
+   The two child links per position live in the hc state's prev array (so the tree window is half the chain
+   window: 4 MB by default). Walks stop at ZAP__BT_NICE bytes, which also keeps long runs from degrading the tree. */
+#ifndef ZAP__BT_NICE
+#define ZAP__BT_NICE 256
+#endif
+static inline int zap__bt(zap_hc_state *s, const uint8_t *src, size_t pos, const uint8_t *iend, int depth, int insert, size_t best,
+                          zap__match *m, int n) {
+    const size_t wmask = sizeof s->prev / sizeof s->prev[0] / 2 - 1;
+    uint32_t *son = s->prev;
+    const uint8_t *ip = src + pos;
+    size_t avail = (size_t)(iend - ip), limit = avail < ZAP__BT_NICE ? avail : ZAP__BT_NICE, len0 = 0, len1 = 0;
+    uint32_t *head = &s->head[zap__hash(zap__r32(ip), ZAP_HC_HLOG)], dummy[2];
+    size_t cur = *head;
+    uint32_t *p1 = insert ? son + 2 * (pos & wmask) : dummy, *p0 = p1 + 1;
+    if (insert) *head = (uint32_t)pos;
+    while (cur < pos && pos - cur <= wmask && depth-- > 0) {
+        uint32_t *pair = son + 2 * (cur & wmask);
+        const uint8_t *q = src + cur;
+        size_t len = len0 < len1 ? len0 : len1;
+        if (q[len] == ip[len]) {
+            len += 1 + zap__count(ip + len + 1, q + len + 1, ip + limit);
+            if (len > best && m) {
+                best = len;
+                if (n == ZAP__MAXC) n--;
+                m[n].len = (uint32_t)len; m[n].off = (uint32_t)(pos - cur); n++;
+            }
+            if (len >= limit) { *p1 = pair[0]; *p0 = pair[1]; return n; } /* equal: the new node takes cur's place */
+        }
+        if (q[len] < ip[len]) { *p1 = (uint32_t)cur; p1 = pair + 1; cur = *p1; len1 = len; }
+        else { *p0 = (uint32_t)cur; p0 = pair; cur = *p0; len0 = len; }
+        if (!insert) { p1 = dummy; p0 = dummy + 1; }
+    }
+    *p0 = *p1 = 0xFFFFFFFFu;
+    return n;
+}
+
+/* the optimal parser's match list at pos (strictly increasing lengths, repeat offset first): inserts any
+   positions the parser skipped, then searches pos (inserting it the first time it's visited) */
+static inline int zap__bt_all(zap_hc_state *s, const uint8_t *src, const uint8_t *ip, const uint8_t *iend, const zap_dict *d,
+                              int depth, size_t *next, size_t rep, zap__match *m) {
+    size_t pos = (size_t)(ip - src), best = 3;
+    for (size_t p = *next; p < pos; p++) zap__bt(s, src, p, iend, depth < 8 ? depth : 8, 1, 0, NULL, 0); /* skipped: shallow insert */
+    int n = 0;
+    if (rep && rep <= pos && zap__r32(ip - rep) == zap__r32(ip)) {
+        best = 4 + zap__count(ip + 4, ip - rep + 4, iend);
+        m[n].len = (uint32_t)best; m[n].off = (uint32_t)rep; n++;
+    }
+    n = zap__bt(s, src, pos, iend, depth, pos >= *next, best, m, n);
+    if (pos >= *next) *next = pos + 1;
+    if (d) {
+        size_t o, l = zap__dmatch(d, ip, src, iend, &o), b = n ? m[n - 1].len : 3;
+        if (l > b) { if (n == ZAP__MAXC) n--; m[n].len = (uint32_t)l; m[n].off = (uint32_t)o; n++; }
+    }
+    return n;
+}
+
 static inline uint32_t zap__ext_bytes(size_t v) { return v < 15 ? 0 : (uint32_t)((v - 15) / 255 + 1); }
 
 /* entropy v2 offset coding: which repeat slot (0-2) an offset hits, or -1 */
@@ -319,7 +388,7 @@ static inline size_t zap__compress_opt(const uint8_t *src, size_t n, uint8_t *ds
             uint32_t lp = o.price + cm->lit[src[pos]] + (zap__ext_bytes(o.lit + 1) - zap__ext_bytes(o.lit)) * cm->lenb;
             if (p + 1 > last) { opt[p + 1].price = 0xFFFFFFFFu; last = p + 1; }
             if (lp < opt[p + 1].price) { opt[p + 1] = o; opt[p + 1].price = lp; opt[p + 1].len = 0; opt[p + 1].lit = o.lit + 1; }
-            int nm = zap__hc_all(s, src, src + pos, iend, d, depth, &next, o.rep, m);
+            int nm = zap__bt_all(s, src, src + pos, iend, d, depth, &next, o.rep, m);
             if (nm && m[nm - 1].len >= ZAP__SUFF) { fl = m[nm - 1].len; fo = m[nm - 1].off; break; } /* long match: just take it */
             const uint32_t orep[3] = { o.rep, o.rep1, o.rep2 };
             if (cm->entropy) /* repeat offsets 1 and 2: cheap to code, so worth trying even when shorter than chain matches */
@@ -846,7 +915,7 @@ static inline size_t zap_compress_entropy(const void *src, size_t n, void *dst, 
     int skip = depth && zap__hc_skip((const uint8_t *)src, n, (zap_hc_state *)state); /* incompressible: fast parse, Huffman still applies */
     size_t ln = skip ? zap_compress(src, n, lz, lcap, (zap_state *)(void *)((zap_hc_state *)state)->prev, d)
               : depth ? zap_compress_hc(src, n, lz, lcap, (zap_hc_state *)state, d, depth | fd) : zap_compress(src, n, lz, lcap, (zap_state *)state, d);
-    if (ln && depth >= ZAP_OPT_DEPTH && !skip) {
+    for (int pass = 0; ln && depth >= ZAP_OPT_DEPTH && !skip && pass < ZAP__E_PASSES; pass++) {
         zap__cost cm;
         zap__cost_from_lz(lz, ln, &cm, seq);
         ln = zap__compress_opt((const uint8_t *)src, n, lz, lcap, (zap_hc_state *)state, d, depth, &cm);
