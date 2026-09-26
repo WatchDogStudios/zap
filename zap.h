@@ -821,7 +821,7 @@ static inline uint8_t *zap__e_stream(uint8_t *op, uint8_t *oend, const uint8_t *
      5 streams (method + size + data): literals, tokens, length bytes, offset codes, offset low nibbles
      offset extra bits (LSB-first)
    Offset code 0-2: repeat offset 0-2 (move-to-front). Code 3 + k: an offset in [2^k, 2^(k+1)); for k >= 4 its low
-   4 bits come from the low-nibble stream and the k - 4 bits above them are extra bits, else k extra bits. Aligned
+   4 bits come from the low-nibble stream (two nibbles per byte, first in the low half, n_low counts nibbles) and the k - 4 bits above them are extra bits, else k extra bits. Aligned
    data (DXT blocks, vertex strides, PCM frames) makes the low nibbles very predictable. */
 static inline size_t zap__e_encode(const uint8_t *lz, size_t lzn, size_t raw, uint8_t *dst, size_t cap) {
     size_t maxseq = raw / 4 + 2, nl = 0, ns = 0, nlen = 0, nlow = 0;
@@ -848,7 +848,7 @@ static inline size_t zap__e_encode(const uint8_t *lz, size_t lzn, size_t raw, ui
             int k = zap__log2((uint32_t)off), xk = k >= 4 ? k - 4 : k;
             size_t x = off - ((size_t)1 << k);
             offc[ns] = (uint8_t)(k + 3);
-            if (k >= 4) { low[nlow++] = (uint8_t)(x & 15); x >>= 4; }
+            if (k >= 4) { if (nlow & 1) low[nlow >> 1] |= (uint8_t)((x & 15) << 4); else low[nlow >> 1] = (uint8_t)(x & 15); nlow++; x >>= 4; }
             acc |= (uint64_t)x << nb; nb += xk;
             while (nb >= 8) { *xp++ = (uint8_t)acc; acc >>= 8; nb -= 8; }
         }
@@ -864,7 +864,7 @@ static inline size_t zap__e_encode(const uint8_t *lz, size_t lzn, size_t raw, ui
     op = zap__e_stream(op, oend, toks, ns);
     op = zap__e_stream(op, oend, lens, nlen);
     op = zap__e_stream(op, oend, offc, ns);
-    op = zap__e_stream(op, oend, low, nlow);
+    op = zap__e_stream(op, oend, low, (nlow + 1) / 2);
     size_t r = 0;
     if (op && (size_t)(oend - op) >= nx) { memcpy(op, xb, nx); r = (size_t)(op + nx - dst); }
     free(buf);
@@ -935,7 +935,7 @@ static inline ptrdiff_t zap_decompress_entropy(const void *src_, size_t n, void 
     if (v2) { if (n < 20) return -1; nlow = zap__r32(ip); ip += 4; }
     if (nl > raw_size || ns > raw_size / 4 + 1 || nlen > 2 * ns + raw_size / 255 + 1 || nx > 3 * ns + 8 || nlow > ns) return -1;
     int nstreams = v2 ? 5 : 4;
-    size_t need = nl + 2 * ns + nlen + nlow, cnt[5] = { nl, ns, nlen, ns, nlow };
+    size_t need = nl + 2 * ns + nlen + (nlow + 1) / 2, cnt[5] = { nl, ns, nlen, ns, (nlow + 1) / 2 };
     uint8_t *mem = (uint8_t *)scratch, *own = NULL;
     if (!mem || scratch_cap < need) { if (!(mem = own = (uint8_t *)malloc(need ? need : 1))) return -1; }
     const uint8_t *st[5] = { NULL, NULL, NULL, NULL, NULL };
@@ -954,7 +954,8 @@ static inline ptrdiff_t zap_decompress_entropy(const void *src_, size_t n, void 
     }
     if ((size_t)(iend - ip) != nx) goto out;
     {
-        const uint8_t *lp = st[0], *le = lp + nl, *tp = st[1], *lnp = st[2], *lne = lnp + nlen, *oc = st[3], *lwp = st[4], *lwe = lwp + nlow, *xp = ip;
+        const uint8_t *lp = st[0], *le = lp + nl, *tp = st[1], *lnp = st[2], *lne = lnp + nlen, *oc = st[3], *lwb = st[4], *xp = ip;
+        size_t lwi = 0; /* low nibbles used */
         uint8_t *op = (uint8_t *)dst_, *ostart = op, *oend = op + raw_size;
         size_t rep = 0, rep1 = 0, rep2 = 0, dlen = d ? d->len : 0;
         uint64_t xacc = 0;
@@ -977,7 +978,7 @@ static inline ptrdiff_t zap_decompress_entropy(const void *src_, size_t n, void 
                 }
                 size_t x = (size_t)(xacc & (((uint64_t)1 << xk) - 1));
                 xacc >>= xk; xnb -= xk;
-                if (v2 && k >= 4) { if (lwp >= lwe || *lwp > 15) goto out; x = x << 4 | *lwp++; }
+                if (v2 && k >= 4) { if (lwi >= nlow) goto out; x = x << 4 | (size_t)(lwb[lwi >> 1] >> (lwi & 1) * 4 & 15); lwi++; }
                 off = ((size_t)1 << k) + x;
                 if (v2) { if (off != rep1) rep2 = rep1; rep1 = rep; }
                 rep = off;
@@ -1008,7 +1009,7 @@ static inline ptrdiff_t zap_decompress_entropy(const void *src_, size_t n, void 
             zap__dict_copy(op, ostart, oend, d, off, ml);
             op += ml;
         }
-        if (lwp != lwe) goto out;
+        if (lwi != nlow || (nlow & 1 && lwb[nlow >> 1] >> 4)) goto out; /* every nibble used; the pad nibble is 0 */
         if ((size_t)(le - lp) != (size_t)(oend - op)) goto out; /* trailing literals finish the block exactly */
         memcpy(op, lp, (size_t)(le - lp));
         r = (ptrdiff_t)raw_size;
