@@ -1085,6 +1085,7 @@ static inline ptrdiff_t zap_decompress_entropy(const void *src_, size_t n, void 
         uint64_t xacc = 0;
         int xnb = 0, err = 0;
         if (v2 && !d) { /* version 2 without a dictionary (the packaging case): a specialised loop */
+            size_t xbit = 0; /* extra-bit position */
             const uint8_t *nw = lwb, *nwe = lwb + (nlow + 1) / 2;
             uint64_t nbuf = 0;
             int nn = 0; /* nibbles left in nbuf */
@@ -1094,13 +1095,16 @@ static inline ptrdiff_t zap_decompress_entropy(const void *src_, size_t n, void 
                 if (c >= 3) {
                     if (c > 25) goto out;
                     unsigned k = c - 3, xk = k >= 4 ? k - 4 : k;
-                    if (xnb < 24) { /* at most 21 extra bits per offset */
-                        if (iend - xp >= 8) { xacc |= zap__r64(xp) << xnb; xp += (63 - xnb) >> 3; xnb |= 56; }
-                        else while (xnb < 24 && xp < iend) { xacc |= (uint64_t)*xp++ << xnb; xnb += 8; }
-                        if (xnb < (int)xk) goto out;
+                    /* position-based bit reader: only the bit position carries over, so the loads don't chain */
+                    size_t x, by = xbit >> 3;
+                    if (by + 8 <= nx) x = (size_t)((zap__r64(xp + by) >> (xbit & 7)) & (((uint64_t)1 << xk) - 1));
+                    else { /* the last 8 bytes: bytewise, bounds-checked */
+                        uint64_t v = 0;
+                        for (size_t q = 0; q < 8 && by + q < nx; q++) v |= (uint64_t)xp[by + q] << 8 * q;
+                        if (xbit + xk > 8 * nx) goto out;
+                        x = (size_t)((v >> (xbit & 7)) & (((uint64_t)1 << xk) - 1));
                     }
-                    size_t x = (size_t)(xacc & (((uint64_t)1 << xk) - 1));
-                    xacc >>= xk; xnb -= (int)xk;
+                    xbit += xk;
                     if (k >= 4) {
                         if (!nn) { /* 16 nibbles at a time; bytewise at the end */
                             if (nwe - nw >= 8) { nbuf = zap__r64(nw); nw += 8; nn = 16; }
