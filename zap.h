@@ -791,6 +791,106 @@ static inline int zap__hdec4(const uint8_t *in, size_t n, uint8_t *out, size_t r
 #undef ZAP__HREFILL
 #undef ZAP__HSYM
 
+/* Contextual 4-way Huffman (stream method 2): symbol i is coded with the table of group grp[previous symbol in the
+   same quarter] (group 0 at each quarter's start), so the four quarters still decode independently. On game data
+   this is -1.1% for literals grouped by the previous literal's top 4 bits and -1.2% for tokens grouped by the
+   previous token's literal and match lengths, net of the extra tables.
+   Layout: u8 groups (1..ZAP__HCTX), groups x 128 bytes of 4-bit code lengths, u32 sizes of quarters 0-2, 4 bitstreams. */
+enum { ZAP__HCTX = 16 };
+static inline size_t zap__henc4c(const uint8_t *src, size_t n, const uint8_t grp[256], int ng, uint8_t *out, size_t cap) {
+    size_t hdr = 1 + 128 * (size_t)ng + 12, q = (n + 3) / 4;
+    if (cap < hdr || ng < 1 || ng > ZAP__HCTX) return 0;
+    uint32_t (*freq)[256] = (uint32_t(*)[256])calloc((size_t)ng, sizeof *freq);
+    uint8_t (*len)[256] = (uint8_t(*)[256])malloc((size_t)ng * sizeof *len);
+    uint16_t (*code)[256] = (uint16_t(*)[256])malloc((size_t)ng * sizeof *code);
+    size_t r = 0;
+    if (!freq || !len || !code) goto done;
+    for (size_t i = 0; i < n; i++) freq[i % q ? grp[src[i - 1]] : 0][src[i]]++;
+    out[0] = (uint8_t)ng;
+    for (int g = 0; g < ng; g++) {
+        zap__hlens(freq[g], len[g]);
+        zap__hcodes(len[g], code[g]);
+        for (int i = 0; i < 128; i++) out[1 + 128 * g + i] = (uint8_t)(len[g][2 * i] | len[g][2 * i + 1] << 4);
+    }
+    {
+        uint8_t *o = out + hdr, *oe = out + cap;
+        for (int k = 0; k < 4; k++) {
+            size_t lo = (size_t)k * q < n ? (size_t)k * q : n, hi = lo + q < n ? lo + q : n;
+            uint8_t *start = o;
+            uint64_t acc = 0;
+            int nb = 0, g = 0;
+            for (size_t i = lo; i < hi; i++) {
+                acc |= (uint64_t)code[g][src[i]] << nb; nb += len[g][src[i]];
+                g = grp[src[i]];
+                while (nb >= 8) { if (o >= oe) goto done; *o++ = (uint8_t)acc; acc >>= 8; nb -= 8; }
+            }
+            if (nb) { if (o >= oe) goto done; *o++ = (uint8_t)acc; }
+            if (k < 3) zap__w32(out + 1 + 128 * (size_t)ng + 4 * (size_t)k, (uint32_t)(o - start));
+        }
+        r = (size_t)(o - out);
+    }
+done:
+    free(freq); free(len); free(code);
+    return r;
+}
+
+/* tables: ZAP__HCTX << ZAP__HMAX entries of scratch */
+static inline int zap__hdec4c(const uint8_t *in, size_t n, uint8_t *out, size_t raw, const uint8_t grp[256], uint16_t *tables) {
+    const unsigned mask = (1u << ZAP__HMAX) - 1;
+    if (n < 1) return -1;
+    int ng = in[0];
+    size_t hdr = 1 + 128 * (size_t)ng + 12;
+    if (ng < 1 || ng > ZAP__HCTX || n < hdr) return -1;
+    for (int g = 0; g < ng; g++) if (zap__htable(in + 1 + 128 * g, tables + ((size_t)g << ZAP__HMAX))) return -1;
+    for (int v = 0; v < 256; v++) if (grp[v] >= ng) return -1; /* a group without a table */
+    const uint8_t *sz = in + 1 + 128 * (size_t)ng;
+    size_t s0 = zap__r32(sz), s1 = zap__r32(sz + 4), s2 = zap__r32(sz + 8), avail = n - hdr;
+    if (s0 > avail || s1 > avail - s0 || s2 > avail - s0 - s1) return -1;
+    const uint8_t *p[4] = { in + hdr, in + hdr + s0, in + hdr + s0 + s1, in + hdr + s0 + s1 + s2 }, *e[4] = { p[1], p[2], p[3], in + n };
+    size_t q = (raw + 3) / 4, lo[4], hi[4], i = 0;
+    for (int k = 0; k < 4; k++) { lo[k] = (size_t)k * q < raw ? (size_t)k * q : raw; hi[k] = lo[k] + q < raw ? lo[k] + q : raw; }
+    zap__hbits b0 = { p[0], e[0], 0, 0 }, b1 = { p[1], e[1], 0, 0 }, b2 = { p[2], e[2], 0, 0 }, b3 = { p[3], e[3], 0, 0 };
+    unsigned g0 = 0, g1 = 0, g2 = 0, g3 = 0;
+    /* fast part: the four quarters interleaved (independent dependency chains), while the shortest (the last)
+       has 5 symbols left and every reader 8 bytes */
+#define ZAP__HCSYM(b, g, dst) do { int t_ = tables[((g) << ZAP__HMAX) | (unsigned)((b).acc & mask)], l_ = t_ >> 8; \
+    (dst) = (uint8_t)t_; (b).acc >>= l_; (b).nb -= l_; (g) = grp[(uint8_t)t_]; } while (0)
+#define ZAP__HCREFILL(b) do { (b).acc |= zap__r64((b).p) << (b).nb; (b).p += (63 - (b).nb) >> 3; (b).nb |= 56; } while (0)
+    while (hi[3] - lo[3] - i >= 5 && b0.e - b0.p >= 8 && b1.e - b1.p >= 8 && b2.e - b2.p >= 8 && b3.e - b3.p >= 8) {
+        ZAP__HCREFILL(b0); ZAP__HCREFILL(b1); ZAP__HCREFILL(b2); ZAP__HCREFILL(b3);
+        for (int j = 0; j < 5; j++) {
+            ZAP__HCSYM(b0, g0, out[lo[0] + i + j]); ZAP__HCSYM(b1, g1, out[lo[1] + i + j]);
+            ZAP__HCSYM(b2, g2, out[lo[2] + i + j]); ZAP__HCSYM(b3, g3, out[lo[3] + i + j]);
+        }
+        i += 5;
+    }
+#undef ZAP__HCSYM
+#undef ZAP__HCREFILL
+    zap__hbits *bs[4] = { &b0, &b1, &b2, &b3 };
+    unsigned gs[4] = { g0, g1, g2, g3 };
+    for (int k = 0; k < 4; k++) { /* careful tails, bounds-checked */
+        zap__hbits *b = bs[k];
+        unsigned g = gs[k];
+        for (size_t x = lo[k] + i; x < hi[k]; x++) {
+            while (b->nb <= 56 && b->p < b->e) { b->acc |= (uint64_t)*b->p++ << b->nb; b->nb += 8; }
+            int t = tables[(g << ZAP__HMAX) | (unsigned)(b->acc & mask)], l = t >> 8;
+            if (!l || l > b->nb) return -1;
+            out[x] = (uint8_t)t; b->acc >>= l; b->nb -= l; g = grp[(uint8_t)t];
+        }
+    }
+    return 0;
+}
+
+/* the fixed groupings: literals by the previous literal's top 4 bits, tokens by the previous token's literal length
+   (0, 1, 2-3, 4+) x match nibble (0-1, 2-4, 5-14, 15) */
+static inline void zap__grp_lit(uint8_t g[256]) { for (int v = 0; v < 256; v++) g[v] = (uint8_t)(v >> 4); }
+static inline void zap__grp_tok(uint8_t g[256]) {
+    for (int v = 0; v < 256; v++) {
+        int l = v >> 4, m = v & 15;
+        g[v] = (uint8_t)((l == 0 ? 0 : l <= 1 ? 1 : l <= 3 ? 2 : 3) * 4 + (m <= 1 ? 0 : m <= 4 ? 1 : m < 15 ? 2 : 3));
+    }
+}
+
 /* ---------------- entropy mode: the LZ parse re-coded as Huffman streams. For packaging blocks (>= ~16KB);
  * small packets should stay on the plain format (5 x 128-byte code tables would outweigh the gain).
  * Block layout (little-endian):
@@ -803,12 +903,19 @@ static inline int zap__hdec4(const uint8_t *in, size_t n, uint8_t *out, size_t r
 #define ZAP_ENTROPY (1 << 16) /* OR into a frame's depth: entropy blocks, version-2 frame */
 
 /* decoder scratch that always suffices for a block of raw bytes */
-static inline size_t zap_entropy_scratch(size_t raw) { return 2 * raw + raw / 255 + 128; }
+static inline size_t zap_entropy_scratch(size_t raw) { return 2 * raw + raw / 255 + 128 + (2u << 15) + 64; } /* streams + contextual tables */
 
-static inline uint8_t *zap__e_stream(uint8_t *op, uint8_t *oend, const uint8_t *s, size_t n) {
+static inline uint8_t *zap__e_stream(uint8_t *op, uint8_t *oend, const uint8_t *s, size_t n, const uint8_t *grp) {
     if (!op || oend - op < 5) return NULL;
-    size_t room = (size_t)(oend - op) - 5, h = 0;
+    size_t room = (size_t)(oend - op) - 5, h = 0, hc = 0;
     if (n > 64) h = zap__henc4(s, n, op + 5, room < n - 1 ? room : n - 1);
+    if (grp && n > 4096) { /* contextual Huffman: kept only if smaller (it overwrites the plain encoding) */
+        size_t lim = (h ? h : n) - 1, cap2 = room < lim ? room : lim;
+        uint8_t *tmp = (uint8_t *)malloc(cap2 ? cap2 : 1);
+        if (tmp && (hc = zap__henc4c(s, n, grp, ZAP__HCTX, tmp, cap2)) != 0) { *op = 2; zap__w32(op + 1, (uint32_t)hc); memcpy(op + 5, tmp, hc); }
+        free(tmp);
+        if (hc) return op + 5 + hc;
+    }
     if (h) { *op = 1; zap__w32(op + 1, (uint32_t)h); return op + 5 + h; }
     if (room < n) return NULL;
     *op = 0; zap__w32(op + 1, (uint32_t)n); memcpy(op + 5, s, n);
@@ -860,11 +967,13 @@ static inline size_t zap__e_encode(const uint8_t *lz, size_t lzn, size_t raw, ui
     uint8_t *op = dst, *oend = dst + cap;
     zap__w32(op, (uint32_t)nl | 0x80000000u); zap__w32(op + 4, (uint32_t)ns); zap__w32(op + 8, (uint32_t)nlen); zap__w32(op + 12, (uint32_t)nx);
     zap__w32(op + 16, (uint32_t)nlow);
-    op = zap__e_stream(op + 20, oend, lits, nl);
-    op = zap__e_stream(op, oend, toks, ns);
-    op = zap__e_stream(op, oend, lens, nlen);
-    op = zap__e_stream(op, oend, offc, ns);
-    op = zap__e_stream(op, oend, low, (nlow + 1) / 2);
+    uint8_t glit[256], gtok[256];
+    zap__grp_lit(glit); zap__grp_tok(gtok);
+    op = zap__e_stream(op + 20, oend, lits, nl, glit);
+    op = zap__e_stream(op, oend, toks, ns, gtok);
+    op = zap__e_stream(op, oend, lens, nlen, NULL);
+    op = zap__e_stream(op, oend, offc, ns, NULL);
+    op = zap__e_stream(op, oend, low, (nlow + 1) / 2, NULL);
     size_t r = 0;
     if (op && (size_t)(oend - op) >= nx) { memcpy(op, xb, nx); r = (size_t)(op + nx - dst); }
     free(buf);
@@ -935,7 +1044,10 @@ static inline ptrdiff_t zap_decompress_entropy(const void *src_, size_t n, void 
     if (v2) { if (n < 20) return -1; nlow = zap__r32(ip); ip += 4; }
     if (nl > raw_size || ns > raw_size / 4 + 1 || nlen > 2 * ns + raw_size / 255 + 1 || nx > 3 * ns + 8 || nlow > ns) return -1;
     int nstreams = v2 ? 5 : 4;
-    size_t need = nl + 2 * ns + nlen + (nlow + 1) / 2, cnt[5] = { nl, ns, nlen, ns, (nlow + 1) / 2 };
+    size_t tabbytes = sizeof(uint16_t) * ((size_t)ZAP__HCTX << ZAP__HMAX);
+    size_t need = nl + 2 * ns + nlen + (nlow + 1) / 2 + tabbytes + 16, cnt[5] = { nl, ns, nlen, ns, (nlow + 1) / 2 };
+    uint8_t grps[2][256];
+    zap__grp_lit(grps[0]); zap__grp_tok(grps[1]);
     uint8_t *mem = (uint8_t *)scratch, *own = NULL;
     if (!mem || scratch_cap < need) { if (!(mem = own = (uint8_t *)malloc(need ? need : 1))) return -1; }
     const uint8_t *st[5] = { NULL, NULL, NULL, NULL, NULL };
@@ -949,6 +1061,12 @@ static inline ptrdiff_t zap_decompress_entropy(const void *src_, size_t n, void 
         if (sz > (size_t)(iend - ip)) goto out;
         if (m == 0) { if (sz != cnt[k]) goto out; st[k] = ip; }
         else if (m == 1) { if (zap__hdec4(ip, sz, w, cnt[k])) goto out; st[k] = w; w += cnt[k]; }
+        else if (m == 2 && v2 && k < 2) { /* contextual Huffman: literals and tokens only; tables at the end of scratch */
+            uint8_t *tb = mem + nl + 2 * ns + nlen + (nlow + 1) / 2; /* past everything the streams decode into */
+            uint16_t *tab = (uint16_t *)(void *)(tb + ((16 - ((uintptr_t)tb & 15)) & 15));
+            if (zap__hdec4c(ip, sz, w, cnt[k], grps[k], tab)) goto out;
+            st[k] = w; w += cnt[k];
+        }
         else goto out;
         ip += sz;
     }

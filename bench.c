@@ -147,6 +147,32 @@ static void v1_compat_test(void) {
     assert(zap_decompress_entropy(kV1, sizeof kV1, o, sizeof o, NULL, NULL, 0) == (ptrdiff_t)sizeof o && !memcmp(s, o, sizeof o));
 }
 
+/* contextual Huffman (stream method 2): data whose next byte depends on the previous one's top bits makes the
+   encoder pick it for the literals; round trip, then corrupt blocks must fail cleanly */
+static void ctx_huffman_test(void) {
+    enum { N = 1 << 18 };
+    uint8_t *s = malloc(N), *c = malloc(2 * N + 1024), *o = malloc(N), *f = malloc(2 * N + 1024);
+    uint32_t x = 777;
+    for (size_t i = 0; i < N; i++) {
+        x = x * 1103515245u + 12345u;
+        uint8_t prev = i ? s[i - 1] : 0;
+        s[i] = (uint8_t)(((prev >> 4) * 16 + ((x >> 24) & 7) * 3 + (prev & 1)) & 0xFF); /* depends on prev's top nibble */
+        if (i % 1024 > 1000 && i > 4096) s[i] = s[i - 3000];                          /* a few matches */
+    }
+    int depths[2] = { 0, 64 };
+    for (int k = 0; k < 2; k++) {
+        size_t cn = zap_compress_entropy(s, N, c, 2 * N + 1024, depths[k] ? (void *)hc : (void *)&st, depths[k], NULL);
+        assert(cn && (zap__r32(c) >> 31) && c[20] == 2); /* version 2 block, literal stream contextual */
+        assert(zap_decompress_entropy(c, cn, o, N, NULL, NULL, 0) == N && !memcmp(s, o, N));
+        for (int t = 0; t < 500; t++) {
+            memcpy(f, c, cn);
+            f[t < 250 ? (size_t)(20 + rand() % 3000) : (size_t)rand() % cn] ^= (uint8_t)(1 + rand() % 255); /* half of them in the tables */
+            zap_decompress_entropy(f, cn, o, N, NULL, NULL, 0);
+        }
+    }
+    free(s); free(c); free(o); free(f);
+}
+
 static void incompressible_test(void) {
     enum { N = 1 << 20 };
     uint8_t *src = malloc(N), *c = malloc(zap_bound(N) + 1024), *d = malloc(N);
@@ -242,6 +268,7 @@ static void selftest(void) {
     }
     free(buf);
     v1_compat_test();
+    ctx_huffman_test();
     incompressible_test();
     pak_test();
     printf("selftest ok\n");

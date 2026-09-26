@@ -421,14 +421,14 @@ These are single runs on an AMD Ryzen 7 5800X (8 cores) with clang 18 `-O3 -marc
   | zap hc64 + entropy (1.3, entropy v2 only) | 3.045 | 1.3 GB/s |
   | Oodle Mermaid | 3.054 | 3.2 GB/s |
   | zstd 19 | 3.074 | 0.9 GB/s |
-  | **zap hc64 + entropy (1.3)** | **3.159** | not yet re-measured |
+  | **zap hc64 + entropy (1.3)** | **3.232** | not yet re-measured |
   | Oodle Kraken | 3.300 | 1.8 GB/s |
   | Oodle Leviathan | 3.358 | 1.2 GB/s |
 
   - Entropy version 2 (three repeat offsets tracked by the optimal parser, low offset bits entropy coded): +5.9% on this data.
   - A binary-tree match finder for the optimal parser (hc depth ≥ 32) instead of hash chains: +2.5% plain, +1.8% entropy, and faster compression. Hash chains stop after `depth` candidates, newest first; the tree walks straight to the positions sharing the longest prefix.
   - Longer matches priced exactly (up to 256 bytes instead of 64) and a second re-pricing pass in entropy mode: another +0.9% plain, +1.1% entropy.
-  - Plain zap now compresses slightly smaller than Selkie (2.616 vs 2.600) and entropy mode passes Mermaid's ratio (3.159 vs 3.054; low offset nibbles are now Huffman coded in pairs, +0.8%). Kraken is still 4.5% smaller, Oodle decodes much faster, and zap's optimal parser compresses several times slower than Oodle's (about 0.5–1.5 MB/s against 2–4 MB/s here, one thread). Decode speeds with the new parse are pending a measurement on an idle machine: the machine these ran on was fully loaded, which made timing noise larger than the effects being measured.
+  - Plain zap now compresses slightly smaller than Selkie (2.616 vs 2.600) and entropy mode passes Mermaid's ratio (3.232 vs 3.054; low offset nibbles are Huffman coded in pairs, +0.8%, and literals and tokens use contextual Huffman, +2.3%). Kraken is still 2.1% smaller, Oodle decodes much faster, and zap's optimal parser compresses several times slower than Oodle's (about 0.5–1.5 MB/s against 2–4 MB/s here, one thread). Decode speeds with the new parse are pending a measurement on an idle machine: the machine these ran on was fully loaded, which made timing noise larger than the effects being measured.
   - The remaining decode gap, from AMD uProf counters: store-to-load forwarding stalls and misaligned loads in the sequence loop, and Huffman-decoding literals that barely compress on this data (7.7 bits per 8).
 - **Oodle, zap 1.2:** measured with `zap_viewer`'s Package tab on a 225 MB Source-engine VPK from Portal Revolution (uncompressed game data: textures, models, sounds), 4 MB blocks, with Oodle 2.8 (`oo2ext_8_win64.dll`) as shipped by a game. Ratios are exact. Decode speeds are single-thread and were measured while other work was running, so treat them as rough.
 
@@ -474,9 +474,13 @@ With `ZAP_ENTROPY`, the magic is `"ZAP2"` and each block starts with a method by
 ```
 u32 n_literals | 1 << 31  u32 n_sequences  u32 n_length_bytes  u32 n_extra_bytes  u32 n_low_nibbles
 5 streams: literals, tokens, length bytes, offset codes, offset low nibbles (two per byte, first in the low half)
-   each: u8 method (0 raw, 1 Huffman) + u32 size + data
+   each: u8 method (0 raw, 1 Huffman, 2 contextual Huffman) + u32 size + data
    Huffman = 128 bytes of 4-bit code lengths (max 11), u32 sizes of sub-streams 0-2, then 4 bitstreams
    (the symbols split into 4 contiguous quarters, decoded in parallel)
+   contextual Huffman (literals and tokens only) = u8 groups, groups x 128 bytes of code lengths, u32 sizes of
+   sub-streams 0-2, 4 bitstreams; each symbol uses the table of the previous symbol's group in its quarter (group 0
+   at a quarter's start). Literal groups: the previous literal's top 4 bits. Token groups: the previous token's
+   literal length (0, 1, 2-3, 4+) x match nibble (0-1, 2-4, 5-14, 15).
 offset extra bits (LSB-first)
 ```
 
