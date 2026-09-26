@@ -777,6 +777,28 @@ static inline int zap__hdec4(const uint8_t *in, size_t n, uint8_t *out, size_t r
         }
         return 0;
     }
+    if (raw >= 256 && (n - 140) * 16 <= raw * 88) { /* short codes (<= 5.5 bits on average): two symbols per lookup */
+        uint32_t t2[1 << ZAP__HMAX]; /* sym1 | sym2 << 8 | count << 16 | total length << 20 */
+        for (unsigned bi = 0; bi <= mask; bi++) {
+            unsigned e1 = table[bi], l1 = e1 >> 8, e2 = l1 ? table[(bi >> l1) & mask] : 0, l2 = e2 >> 8;
+            /* codes are LSB-first, so the second code only needs its own l2 low bits of what follows the first */
+            t2[bi] = l1 && l2 && l1 + l2 <= ZAP__HMAX ? (e1 & 255) | (e2 & 255) << 8 | 2u << 16 | (l1 + l2) << 20 : (e1 & 255) | 1u << 16 | l1 << 20;
+        }
+        size_t i0 = 0, i1 = 0, i2 = 0, i3 = 0;
+        zap__hbits r0 = b0, r1 = b1, r2 = b2, r3 = b3;
+        /* 5 lookups (<= 55 bits) per refill, up to 10 symbols per quarter: runs while every quarter has 10 left */
+        while (c3 - i3 >= 10 && q - i0 >= 10 && q - i1 >= 10 && q - i2 >= 10 && r0.e - r0.p >= 8 && r1.e - r1.p >= 8 && r2.e - r2.p >= 8 && r3.e - r3.p >= 8) {
+            ZAP__HREFILL(r0); ZAP__HREFILL(r1); ZAP__HREFILL(r2); ZAP__HREFILL(r3);
+#define ZAP__HSYM2(b, o, i) do { uint32_t e_ = t2[(b).acc & mask], l_ = e_ >> 20; (o)[i] = (uint8_t)e_; (o)[(i) + 1] = (uint8_t)(e_ >> 8); \
+                                 (i) += e_ >> 16 & 3; (b).acc >>= l_; (b).nb -= (int)l_; } while (0)
+            for (int k = 0; k < 5; k++) { ZAP__HSYM2(r0, o0, i0); ZAP__HSYM2(r1, o1, i1); ZAP__HSYM2(r2, o2, i2); ZAP__HSYM2(r3, o3, i3); }
+#undef ZAP__HSYM2
+        }
+        b0 = r0; b1 = r1; b2 = r2; b3 = r3;
+        if (zap__hrun(table, &b0, o0 + i0, q - i0) || zap__hrun(table, &b1, o1 + i1, q - i1) ||
+            zap__hrun(table, &b2, o2 + i2, q - i2) || zap__hrun(table, &b3, o3 + i3, c3 - i3)) return -1;
+        return 0;
+    }
     while (c3 - i >= 5 && b0.e - b0.p >= 8 && b1.e - b1.p >= 8 && b2.e - b2.p >= 8 && b3.e - b3.p >= 8) {
         ZAP__HREFILL(b0); ZAP__HREFILL(b1); ZAP__HREFILL(b2); ZAP__HREFILL(b3);
         for (int k = 0; k < 5; k++) { /* 5 x 11 bits <= 56 */
