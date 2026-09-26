@@ -777,6 +777,28 @@ static inline int zap__hdec4(const uint8_t *in, size_t n, uint8_t *out, size_t r
         }
         return 0;
     }
+    if (raw >= 256 && (n - 140) * 16 <= raw * 88) { /* short codes (<= 5.5 bits on average): two symbols per lookup */
+        uint32_t t2[1 << ZAP__HMAX]; /* sym1 | sym2 << 8 | count << 16 | total length << 20 */
+        for (unsigned bi = 0; bi <= mask; bi++) {
+            unsigned e1 = table[bi], l1 = e1 >> 8, e2 = l1 ? table[(bi >> l1) & mask] : 0, l2 = e2 >> 8;
+            /* codes are LSB-first, so the second code only needs its own l2 low bits of what follows the first */
+            t2[bi] = l1 && l2 && l1 + l2 <= ZAP__HMAX ? (e1 & 255) | (e2 & 255) << 8 | 2u << 16 | (l1 + l2) << 20 : (e1 & 255) | 1u << 16 | l1 << 20;
+        }
+        size_t i0 = 0, i1 = 0, i2 = 0, i3 = 0;
+        zap__hbits r0 = b0, r1 = b1, r2 = b2, r3 = b3;
+        /* 5 lookups (<= 55 bits) per refill, up to 10 symbols per quarter: runs while every quarter has 10 left */
+        while (c3 - i3 >= 10 && q - i0 >= 10 && q - i1 >= 10 && q - i2 >= 10 && r0.e - r0.p >= 8 && r1.e - r1.p >= 8 && r2.e - r2.p >= 8 && r3.e - r3.p >= 8) {
+            ZAP__HREFILL(r0); ZAP__HREFILL(r1); ZAP__HREFILL(r2); ZAP__HREFILL(r3);
+#define ZAP__HSYM2(b, o, i) do { uint32_t e_ = t2[(b).acc & mask], l_ = e_ >> 20; (o)[i] = (uint8_t)e_; (o)[(i) + 1] = (uint8_t)(e_ >> 8); \
+                                 (i) += e_ >> 16 & 3; (b).acc >>= l_; (b).nb -= (int)l_; } while (0)
+            for (int k = 0; k < 5; k++) { ZAP__HSYM2(r0, o0, i0); ZAP__HSYM2(r1, o1, i1); ZAP__HSYM2(r2, o2, i2); ZAP__HSYM2(r3, o3, i3); }
+#undef ZAP__HSYM2
+        }
+        b0 = r0; b1 = r1; b2 = r2; b3 = r3;
+        if (zap__hrun(table, &b0, o0 + i0, q - i0) || zap__hrun(table, &b1, o1 + i1, q - i1) ||
+            zap__hrun(table, &b2, o2 + i2, q - i2) || zap__hrun(table, &b3, o3 + i3, c3 - i3)) return -1;
+        return 0;
+    }
     while (c3 - i >= 5 && b0.e - b0.p >= 8 && b1.e - b1.p >= 8 && b2.e - b2.p >= 8 && b3.e - b3.p >= 8) {
         ZAP__HREFILL(b0); ZAP__HREFILL(b1); ZAP__HREFILL(b2); ZAP__HREFILL(b3);
         for (int k = 0; k < 5; k++) { /* 5 x 11 bits <= 56 */
@@ -1085,6 +1107,7 @@ static inline ptrdiff_t zap_decompress_entropy(const void *src_, size_t n, void 
         uint64_t xacc = 0;
         int xnb = 0, err = 0;
         if (v2 && !d) { /* version 2 without a dictionary (the packaging case): a specialised loop */
+            size_t xbit = 0; /* extra-bit position */
             const uint8_t *nw = lwb, *nwe = lwb + (nlow + 1) / 2;
             uint64_t nbuf = 0;
             int nn = 0; /* nibbles left in nbuf */
@@ -1094,13 +1117,16 @@ static inline ptrdiff_t zap_decompress_entropy(const void *src_, size_t n, void 
                 if (c >= 3) {
                     if (c > 25) goto out;
                     unsigned k = c - 3, xk = k >= 4 ? k - 4 : k;
-                    if (xnb < 24) { /* at most 21 extra bits per offset */
-                        if (iend - xp >= 8) { xacc |= zap__r64(xp) << xnb; xp += (63 - xnb) >> 3; xnb |= 56; }
-                        else while (xnb < 24 && xp < iend) { xacc |= (uint64_t)*xp++ << xnb; xnb += 8; }
-                        if (xnb < (int)xk) goto out;
+                    /* position-based bit reader: only the bit position carries over, so the loads don't chain */
+                    size_t x, by = xbit >> 3;
+                    if (by + 8 <= nx) x = (size_t)((zap__r64(xp + by) >> (xbit & 7)) & (((uint64_t)1 << xk) - 1));
+                    else { /* the last 8 bytes: bytewise, bounds-checked */
+                        uint64_t v = 0;
+                        for (size_t q = 0; q < 8 && by + q < nx; q++) v |= (uint64_t)xp[by + q] << 8 * q;
+                        if (xbit + xk > 8 * nx) goto out;
+                        x = (size_t)((v >> (xbit & 7)) & (((uint64_t)1 << xk) - 1));
                     }
-                    size_t x = (size_t)(xacc & (((uint64_t)1 << xk) - 1));
-                    xacc >>= xk; xnb -= (int)xk;
+                    xbit += xk;
                     if (k >= 4) {
                         if (!nn) { /* 16 nibbles at a time; bytewise at the end */
                             if (nwe - nw >= 8) { nbuf = zap__r64(nw); nw += 8; nn = 16; }
