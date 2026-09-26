@@ -841,8 +841,14 @@ static inline int zap__hdec4c(const uint8_t *in, size_t n, uint8_t *out, size_t 
     int ng = in[0];
     size_t hdr = 1 + 128 * (size_t)ng + 12;
     if (ng < 1 || ng > ZAP__HCTX || n < hdr) return -1;
-    for (int g = 0; g < ng; g++) if (zap__htable(in + 1 + 128 * g, tables + ((size_t)g << ZAP__HMAX))) return -1;
     for (int v = 0; v < 256; v++) if (grp[v] >= ng) return -1; /* a group without a table */
+    for (int g = 0; g < ng; g++) {
+        uint16_t *t = tables + ((size_t)g << ZAP__HMAX);
+        if (zap__htable(in + 1 + 128 * g, t)) return -1;
+        /* entries are symbol | length << 8 (length <= 11); the spare top 4 bits get the symbol's group, so the next
+           table is known from this entry alone: one load per symbol in the dependency chain instead of two */
+        for (int j = 0; j < 1 << ZAP__HMAX; j++) t[j] = (uint16_t)(t[j] | grp[t[j] & 255] << 12);
+    }
     const uint8_t *sz = in + 1 + 128 * (size_t)ng;
     size_t s0 = zap__r32(sz), s1 = zap__r32(sz + 4), s2 = zap__r32(sz + 8), avail = n - hdr;
     if (s0 > avail || s1 > avail - s0 || s2 > avail - s0 - s1) return -1;
@@ -853,8 +859,8 @@ static inline int zap__hdec4c(const uint8_t *in, size_t n, uint8_t *out, size_t 
     unsigned g0 = 0, g1 = 0, g2 = 0, g3 = 0;
     /* fast part: the four quarters interleaved (independent dependency chains), while the shortest (the last)
        has 5 symbols left and every reader 8 bytes */
-#define ZAP__HCSYM(b, g, dst) do { int t_ = tables[((g) << ZAP__HMAX) | (unsigned)((b).acc & mask)], l_ = t_ >> 8; \
-    (dst) = (uint8_t)t_; (b).acc >>= l_; (b).nb -= l_; (g) = grp[(uint8_t)t_]; } while (0)
+#define ZAP__HCSYM(b, g, dst) do { unsigned t_ = tables[((g) << ZAP__HMAX) | (unsigned)((b).acc & mask)], l_ = t_ >> 8 & 15; \
+    (dst) = (uint8_t)t_; (b).acc >>= l_; (b).nb -= (int)l_; (g) = t_ >> 12; } while (0)
 #define ZAP__HCREFILL(b) do { (b).acc |= zap__r64((b).p) << (b).nb; (b).p += (63 - (b).nb) >> 3; (b).nb |= 56; } while (0)
     while (hi[3] - lo[3] - i >= 5 && b0.e - b0.p >= 8 && b1.e - b1.p >= 8 && b2.e - b2.p >= 8 && b3.e - b3.p >= 8) {
         ZAP__HCREFILL(b0); ZAP__HCREFILL(b1); ZAP__HCREFILL(b2); ZAP__HCREFILL(b3);
@@ -873,9 +879,9 @@ static inline int zap__hdec4c(const uint8_t *in, size_t n, uint8_t *out, size_t 
         unsigned g = gs[k];
         for (size_t x = lo[k] + i; x < hi[k]; x++) {
             while (b->nb <= 56 && b->p < b->e) { b->acc |= (uint64_t)*b->p++ << b->nb; b->nb += 8; }
-            int t = tables[(g << ZAP__HMAX) | (unsigned)(b->acc & mask)], l = t >> 8;
+            int t = tables[(g << ZAP__HMAX) | (unsigned)(b->acc & mask)], l = t >> 8 & 15;
             if (!l || l > b->nb) return -1;
-            out[x] = (uint8_t)t; b->acc >>= l; b->nb -= l; g = grp[(uint8_t)t];
+            out[x] = (uint8_t)t; b->acc >>= l; b->nb -= l; g = (unsigned)t >> 12;
         }
     }
     return 0;
@@ -1078,6 +1084,61 @@ static inline ptrdiff_t zap_decompress_entropy(const void *src_, size_t n, void 
         size_t rep = 0, rep1 = 0, rep2 = 0, dlen = d ? d->len : 0;
         uint64_t xacc = 0;
         int xnb = 0, err = 0;
+        if (v2 && !d) { /* version 2 without a dictionary (the packaging case): a specialised loop */
+            const uint8_t *nw = lwb, *nwe = lwb + (nlow + 1) / 2;
+            uint64_t nbuf = 0;
+            int nn = 0; /* nibbles left in nbuf */
+            for (size_t i = 0; i < ns; i++) {
+                unsigned tok = tp[i], c = oc[i];
+                size_t ll = tok >> 4, ml = tok & 15, off;
+                if (c >= 3) {
+                    if (c > 25) goto out;
+                    unsigned k = c - 3, xk = k >= 4 ? k - 4 : k;
+                    if (xnb < 24) { /* at most 21 extra bits per offset */
+                        if (iend - xp >= 8) { xacc |= zap__r64(xp) << xnb; xp += (63 - xnb) >> 3; xnb |= 56; }
+                        else while (xnb < 24 && xp < iend) { xacc |= (uint64_t)*xp++ << xnb; xnb += 8; }
+                        if (xnb < (int)xk) goto out;
+                    }
+                    size_t x = (size_t)(xacc & (((uint64_t)1 << xk) - 1));
+                    xacc >>= xk; xnb -= (int)xk;
+                    if (k >= 4) {
+                        if (!nn) { /* 16 nibbles at a time; bytewise at the end */
+                            if (nwe - nw >= 8) { nbuf = zap__r64(nw); nw += 8; nn = 16; }
+                            else { nbuf = 0; for (int b = 0; nw < nwe; b++) { nbuf |= (uint64_t)*nw++ << 8 * b; nn += 2; } if (!nn) goto out; }
+                        }
+                        x = x << 4 | (size_t)(nbuf & 15); nbuf >>= 4; nn--;
+                    }
+                    off = ((size_t)1 << k) + x;
+                    if (off != rep1) rep2 = rep1;
+                    rep1 = rep; rep = off;
+                } else if (c == 0) { off = rep; if (!off) goto out; }
+                else if (c == 1) { off = rep1; rep1 = rep; rep = off; if (!off) goto out; }
+                else { off = rep2; rep2 = rep1; rep1 = rep; rep = off; if (!off) goto out; }
+                if (ll < 15 && ml < 15 && le - lp >= 16 && oend - op >= 32 && off >= 16 && off <= (size_t)(op - ostart) + ll) {
+                    memcpy(op, lp, 16);
+                    op += ll; lp += ll;
+                    memcpy(op, op - off, 16); memcpy(op + 16, op - off + 16, 2);
+                    op += ml + 4;
+                    continue;
+                }
+                if (ll == 15) { ll += zap__ext(&lnp, lne, &err); if (err) goto out; }
+                if (ll > (size_t)(le - lp) || ll > (size_t)(oend - op)) goto out;
+                memcpy(op, lp, ll);
+                op += ll; lp += ll;
+                if (ml == 15) { ml += zap__ext(&lnp, lne, &err); if (err) goto out; }
+                ml += 4;
+                if (off > (size_t)(op - ostart) || ml > (size_t)(oend - op)) goto out;
+                zap__match_copy(op, off, ml, oend);
+                op += ml;
+            }
+            /* every nibble used (the pad nibble of an odd count is 0) */
+            if ((size_t)(nw - lwb) * 2 - (size_t)nn != nlow) goto out; /* fetched minus still buffered = used */
+            if (nlow & 1 && lwb[nlow >> 1] >> 4) goto out;
+            if ((size_t)(le - lp) != (size_t)(oend - op)) goto out;
+            memcpy(op, lp, (size_t)(le - lp));
+            r = (ptrdiff_t)raw_size;
+            goto out;
+        }
         const unsigned base = v2 ? 3 : 1, cmax = v2 ? 25 : 23;
         for (size_t i = 0; i < ns; i++) {
             unsigned tok = tp[i], c = oc[i];
