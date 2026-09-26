@@ -26,6 +26,8 @@ median of 8 interleaved runs on an otherwise idle machine; with a game running, 
 | 8 interleaved Huffman sub-streams instead of 4 | −25% | register spills |
 | Bit readers copied to locals (address-taken structs) | 0 | the compiler already kept them in registers |
 | Raw (uncompressed) literals | +38% speed, −3.1% ratio | still slower and larger than Kraken |
+| One combined "command" symbol per sequence (token + offset code) | +7.1% output for a concrete 1-byte design; even ideal joint coding is +0.6% | the contextual token tables already capture more than the token/offset correlation; bucketing to 256 symbols pushes sub-class and length bits out raw |
+| Parse penalty per sequence (fewer, longer sequences) | penalty 64 (1/16 bit): +2.3% speed, −0.2% ratio; 256: +7%, −5.4% | sequence count isn't the dominant cost at these settings |
 
 ## What did help
 
@@ -38,7 +40,8 @@ median of 8 interleaved runs on an otherwise idle machine; with a game running, 
 ## What's left
 
 The remaining gap to Kraken is structural: about 5.7 entropy symbols per sequence (token, offset code, half a nibble
-pair, ~2.8 literals) at 0.6–1 ns each, plus ~7 ns per sequence of offset resolution and copying. Candidates, none tried yet:
-fewer symbols per sequence (a combined command symbol for token and offset class, as Oodle's formats use), a faster
-entropy decoder for the contextual streams, and parse-level trade-offs that produce fewer, longer sequences at a
-controlled ratio cost.
+pair, ~2.8 literals) at 0.6–1 ns each, plus ~7 ns per sequence of offset resolution and copying. A combined command symbol
+and a sequence penalty (above) don't close it. What's left untried is the entropy decoder itself: literals and
+tokens are ~8 M contextual-Huffman symbols at ~1 ns each, nearly half of decode time. Candidates: a table-driven
+decoder that emits two symbols per lookup for the short-code streams, tANS with interleaved states, or SIMD Huffman.
+Each is a substantial rewrite with an uncertain payoff.
