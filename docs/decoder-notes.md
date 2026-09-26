@@ -27,6 +27,9 @@ median of 8 interleaved runs on an otherwise idle machine; with a game running, 
 | Bit readers copied to locals (address-taken structs) | 0 | the compiler already kept them in registers |
 | Raw (uncompressed) literals | +38% speed, −3.1% ratio | still slower and larger than Kraken |
 | One combined "command" symbol per sequence (token + offset code) | +7.1% output for a concrete 1-byte design; even ideal joint coding is +0.6% | the contextual token tables already capture more than the token/offset correlation; bucketing to 256 symbols pushes sub-class and length bits out raw |
+| Two symbols per lookup for the contextual streams (tokens) | −14% | the two-symbol tables (16 groups x 2048 x 4 bytes = 128 KB) don't fit in L1/L2 |
+| Fewer literal/token groups (smaller contextual tables) | 8 groups: +4.9% speed, −0.5% ratio; 4 groups: +8.2%, −0.8% | a real knob, not applied: ratio is already 2% behind Kraken |
+| 10-bit contextual tables (codes limited to 10 bits; 32 KB, L1-resident) | +3.2% speed, −0.28% ratio | cache misses are only part of the contextual decoder's cost |
 | Parse penalty per sequence (fewer, longer sequences) | penalty 64 (1/16 bit): +2.3% speed, −0.2% ratio; 256: +7%, −5.4% | sequence count isn't the dominant cost at these settings |
 
 ## What did help
@@ -36,6 +39,10 @@ median of 8 interleaved runs on an otherwise idle machine; with a game running, 
 | Specialised version-2 loop (no per-sequence version tests, 16 nibbles per refill) | +3% | = |
 | Next Huffman group folded into the table entry (one dependent load per symbol) | +4% | = |
 | Position-based extra-bit reader (the bit position is the only loop-carried value, so loads don't chain) | +1.6% | = |
+| Two symbols per lookup for plain Huffman streams averaging <= 5.5 bits (offset codes, nibble pairs, lengths) | +7.2% | = |
+
+After these: 1480 MB/s (Kraken 2037). Profile: sequence loop 53%, contextual Huffman (literals, tokens) 31%, slow
+match-copy path 7%, plain Huffman 6%.
 
 ## What's left
 
