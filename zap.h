@@ -10,7 +10,8 @@
  *   size_t    zap_compress_entropy  (src, n, dst, cap, state, depth, dict);   // state: zap_state (depth 0) or zap_hc_state
  *   ptrdiff_t zap_decompress_entropy(src, n, dst, raw_size, dict, scratch, scratch_cap); // scratch may be NULL (mallocs)
  *   depth >= 32 without a dict writes entropy v3, the Kraken tier (multi-arrival parse; slow to compress, ~0.5 MB/s
- *   per thread at depth 64). Blocks written by older versions (v1, v2) still decode.
+ *   per thread at depth 64); | ZAP_FAST_DECODE keeps literal chunks raw unless Huffman saves > 4% (~10% faster decode,
+ *   ~0.6% larger). Blocks written by older versions (v1, v2) still decode.
  *
  * Frames (packaging: self-describing, independent blocks, parallel decode):
  *   zap_frame_compress(src, n, dst, cap, block_size, depth /0 = fast/ [| ZAP_ENTROPY or ZAP_TURBO], dict)
@@ -1069,15 +1070,15 @@ static inline void zap__cost_from_lz(const uint8_t *lz, size_t lzn, zap__cost *c
     (void)fx; (void)nx;
 }
 
-static inline size_t zap__k_compress(const uint8_t *src, size_t n, uint8_t *dst, size_t cap, zap_hc_state *hc, int depth);
+static inline size_t zap__k_compress(const uint8_t *src, size_t n, uint8_t *dst, size_t cap, zap_hc_state *hc, int depth, int rawpct);
 static inline ptrdiff_t zap__k_decompress(const uint8_t *ip, size_t n, uint8_t *dst, size_t raw_size, void *scratch, size_t scratch_cap);
 
 /* depth 0: fast parse (state = zap_state*), else hc chain depth (state = zap_hc_state*). 0 = doesn't fit in cap.
    depth >= ZAP_OPT_DEPTH without a dictionary: entropy v3 (the Kraken tier: multi-arrival parses, see below);
    otherwise v2: two optimal parses, the second priced with the first one's Huffman code lengths. */
 static inline size_t zap_compress_entropy(const void *src, size_t n, void *dst, size_t cap, void *state, int depth, const zap_dict *d) {
-    if (!d && (depth & 0xFFFF) >= ZAP_OPT_DEPTH && !(depth & ZAP_FAST_DECODE) && !zap__hc_skip((const uint8_t *)src, n, (zap_hc_state *)state))
-        return zap__k_compress((const uint8_t *)src, n, (uint8_t *)dst, cap, (zap_hc_state *)state, depth & 0xFFFF);
+    if (!d && (depth & 0xFFFF) >= ZAP_OPT_DEPTH && !zap__hc_skip((const uint8_t *)src, n, (zap_hc_state *)state))
+        return zap__k_compress((const uint8_t *)src, n, (uint8_t *)dst, cap, (zap_hc_state *)state, depth & 0xFFFF, depth & ZAP_FAST_DECODE ? 4 : 0);
     size_t lcap = zap_bound(n), r = 0;
     uint8_t *lz = (uint8_t *)malloc(lcap);
     if (!lz) return 0;
@@ -1876,7 +1877,8 @@ static inline size_t zap__k_bits(const uint8_t *s, size_t n, const uint8_t (*len
     for (size_t i = 0; i < n; i++) { unsigned g = grp && i % q ? grp[s[i - 1]] : 0; b += len[g][s[i]] ? len[g][s[i]] : 64; }
     return (size_t)((b + 7) / 8) + (size_t)W;
 }
-static inline uint8_t *zap__k_lits(uint8_t *op, uint8_t *oend, const uint8_t *lits, const size_t *cb, size_t nch) {
+/* rawpct: a chunk stays raw unless Huffman saves more than this many percent (ZAP_FAST_DECODE: 4, for decode speed) */
+static inline uint8_t *zap__k_lits(uint8_t *op, uint8_t *oend, const uint8_t *lits, const size_t *cb, size_t nch, int rawpct) {
     uint8_t glit[256], *mode = (uint8_t *)malloc(nch + 1);
     uint32_t (*fq)[256] = (uint32_t(*)[256])malloc(sizeof(uint32_t) * 16 * 256);
     uint8_t (*lc)[256] = (uint8_t(*)[256])malloc(16 * 256);
@@ -1900,7 +1902,7 @@ static inline uint8_t *zap__k_lits(uint8_t *op, uint8_t *oend, const uint8_t *li
             uint8_t lp[1][256];
             for (size_t i = 0; i < n; i++) fp[s[i]]++;
             zap__hlens_l(fp, lp[0], 11);
-            size_t sr = n, sp = n >= 64 ? zap__k_bits(s, n, (const uint8_t(*)[256])lp, NULL, 8) + 128 + 28 : (size_t)-1,
+            size_t sr = n - n * (size_t)rawpct / 100, sp = n >= 64 ? zap__k_bits(s, n, (const uint8_t(*)[256])lp, NULL, 8) + 128 + 28 : (size_t)-1,
                    sc = n >= 256 ? zap__k_bits(s, n, (const uint8_t(*)[256])lc, glit, 6) + 20 : (size_t)-1;
             mode[c] = sc <= sp && sc < sr ? 2 : sp < sr ? 1 : 0;
             if (it == 2) gain += mode[c] == 2 ? (int64_t)(sp < sr ? sp : sr) - (int64_t)sc : 0;
@@ -1966,7 +1968,7 @@ static inline int zap__k_dlits(const uint8_t *in, size_t sz, const uint8_t *chun
 }
 
 /* ---- encoder: an LZ parse (plain block format) re-coded as a v3 block */
-static inline size_t zap__k_encode(const uint8_t *lz, size_t lzn, size_t raw, uint8_t *dst, size_t cap) {
+static inline size_t zap__k_encode(const uint8_t *lz, size_t lzn, size_t raw, uint8_t *dst, size_t cap, int rawpct) {
     size_t maxseq = raw / 4 + 2, nl = 0, ns = 0, nlen = 0, nn = 0, nf = 0, nch = 0, maxch = raw / ZAP__K_CHUNK + 2, pos = 0, cend = 0;
     uint32_t rep[3] = { 0, 0, 0 };
     uint8_t *buf = (uint8_t *)malloc(raw + 8 * maxseq + lzn + 16), gtok[256];
@@ -2001,7 +2003,7 @@ static inline size_t zap__k_encode(const uint8_t *lz, size_t lzn, size_t raw, ui
     op += 24;
     for (size_t c = 0; c < nch; c++) { zap__w32(op, (uint32_t)(cb[c + 1] - cb[c])); op += 4; }
     uint8_t *ls = op;
-    op = zap__k_lits(op + 5, oend, lits, cb, nch);
+    op = zap__k_lits(op + 5, oend, lits, cb, nch, rawpct);
     if (op) { ls[0] = 0x0F; zap__w32(ls + 1, (uint32_t)(op - ls - 5)); }
     zap__grp_tok(gtok);
     op = zap__k_stream(op, oend, toks, ns, gtok, 11);
@@ -2333,7 +2335,7 @@ out:
 }
 
 /* hc parse, then optimal parses with K arrivals, each priced from the previous one */
-static inline size_t zap__k_compress(const uint8_t *src, size_t n, uint8_t *dst, size_t cap, zap_hc_state *hc, int depth) {
+static inline size_t zap__k_compress(const uint8_t *src, size_t n, uint8_t *dst, size_t cap, zap_hc_state *hc, int depth, int rawpct) {
     size_t lcap = zap_bound(n), r = 0;
     int K = depth >= 128 ? 8 : depth >= 64 ? 4 : 2, passes = depth >= 128 ? 4 : 3;
     uint8_t *lz = (uint8_t *)malloc(lcap);
@@ -2343,7 +2345,7 @@ static inline size_t zap__k_compress(const uint8_t *src, size_t n, uint8_t *dst,
         zap__k_costs(lz, ln, cm, 24); /* sequence penalty 1.5 bits: fewer, longer sequences; ratio-neutral */
         ln = zap__compress_ma(src, n, lz, lcap, hc, depth, cm, K);
     }
-    if (ln) r = zap__k_encode(lz, ln, n, dst, cap);
+    if (ln) r = zap__k_encode(lz, ln, n, dst, cap, rawpct);
     free(lz); free(cm);
     return r;
 }

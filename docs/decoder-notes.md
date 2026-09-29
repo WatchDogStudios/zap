@@ -130,8 +130,21 @@ real data is contextual coding and data effects.
 | Parse penalty (2 bits) on offsets past 256 KB | +0.0% | +1.4% |
 | Offsets < 16 as a pshufb pattern (two stores), not a byte loop | | +1-2% |
 
-Now: ratio 3.306 against 3.300; decode 0.87x Kraken with clang, 0.67x with MSVC (0.71x with /arch:AVX2).
-Time on the sample (clang, TSC Mticks): literals 18.4, tokens 6.6, other streams 8.5, LZ 35.6 (offsets 11, copies 25).
+Later: stack rows instead of per-part output pointers (MSVC spilled them), a table layout per ISA (length-low where
+shrx shifts by the entry, symbol-low without BMI2), BMI2 / LZCNT / SSSE3 code picked by CPUID in builds that don't
+target them, and no library memcpy for short literal runs on the slow path.
+
+Now (in-process, interleaved rounds against Kraken's 3.300 at ~2060 MB/s):
+
+| Build | Default: ratio 3.306 | ZAP_FAST_DECODE: ratio 3.285 |
+|---|---|---|
+| clang -march=native | ~1820 MB/s, 0.88x | ~2020 MB/s, 0.98x |
+| MSVC default | ~0.78x | |
+
+ZAP_FAST_DECODE keeps a 128 KB literal chunk raw unless Huffman saves more than 4% (Kraken stores 28% of its literals
+raw). The threshold is the ratio/speed dial: 0% 3.306 / 67.4 Mticks, 3% 3.294 / 63.1, 4% 3.285 / 61.2, 7% 3.259 / 58.6,
+10% 3.221 / 54.9. Smaller chunks (64 KB, 32 KB) lose ratio at every threshold. Kraken sits at about 3.300 / 61.7:
+just outside the curve (0.93x at its ratio, -0.6% at its speed).
 
 ## What didn't help
 
