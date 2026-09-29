@@ -43,7 +43,26 @@ static void e_roundtrip(const uint8_t *src, size_t n, const zap_dict *d, int dep
     free(c); free(o); free(scratch); free(f);
 }
 
+/* turbo blocks: round trip, exact-size checks, too-small cap, corrupt input (run the ASan build) */
+static void t_roundtrip(const uint8_t *src, size_t n, int depth) {
+    size_t cap = zap_bound(n) + 1024;
+    uint8_t *c = malloc(cap), *o = malloc(n + 1), *f = malloc(cap);
+    size_t cn = zap_compress_turbo(src, n, c, cap, hc, depth);
+    assert(cn > 0);
+    assert(zap_decompress_turbo(c, cn, o, n) == (ptrdiff_t)n && memcmp(src, o, n) == 0);
+    assert(zap_decompress_turbo(c, cn, o, n + 1) == -1);
+    if (n) assert(zap_decompress_turbo(c, cn, o, n - 1) == -1);
+    assert(zap_compress_turbo(src, n, c, cn - 1, hc, depth) == 0);
+    for (int i = 0; i < 300; i++) {
+        memcpy(f, c, cn);
+        for (int k = 1 + rand() % 3; k > 0; k--) f[rand() % cn] ^= (uint8_t)(1 + rand() % 255);
+        zap_decompress_turbo(f, cn - (i & 1) * (rand() % cn), o, i & 4 ? (size_t)rand() % (n + 1) : n);
+    }
+    free(c); free(o); free(f);
+}
+
 static size_t roundtrip(const uint8_t *src, size_t n, const zap_dict *d, int depth) {
+    if (!d) t_roundtrip(src, n, depth);
     e_roundtrip(src, n, d, depth);
     size_t cap = zap_bound(n);
     uint8_t *c = malloc(cap), *o = malloc(n + 1);
@@ -246,8 +265,9 @@ static void selftest(void) {
     }
     /* frames: mixed compressible / raw blocks, odd tail; version 1 and version 2 (entropy) */
     for (size_t i = 0; i < N; i++) buf[i] = i < N / 2 ? (uint8_t)(i / 100 + (i % 7 == 0) * (i >> 9)) : (uint8_t)rand();
-    static const int depths[8] = { 0, 16, 32, 32 | ZAP_FAST_DECODE, ZAP_ENTROPY, 16 | ZAP_ENTROPY, 32 | ZAP_ENTROPY, 32 | ZAP_ENTROPY | ZAP_FAST_DECODE };
-    for (int di = 0; di < 8; di++) {
+    static const int depths[11] = { 0, 16, 32, 32 | ZAP_FAST_DECODE, ZAP_ENTROPY, 16 | ZAP_ENTROPY, 32 | ZAP_ENTROPY, 32 | ZAP_ENTROPY | ZAP_FAST_DECODE,
+                                    ZAP_TURBO, 16 | ZAP_TURBO, 32 | ZAP_TURBO };
+    for (int di = 0; di < 11; di++) {
         int depth = depths[di];
         size_t n = N - 123, cap = zap_frame_bound(n, 65536);
         uint8_t *c = malloc(cap), *o = malloc(n);
@@ -262,7 +282,7 @@ static void selftest(void) {
         assert(zap_frame_compress(buf, n, c2, cap, 0, depth, 0) == 0 && zap_frame_compress_mt(buf, n, c2, cap, 0, depth, 0, 4) == 0);
         assert(zap_frame_compress_mt(buf, n, c2, cn - 1, 65536, depth, 0, 4) == 0); /* too-small cap fails cleanly */
         free(c2);
-        if (depth & ZAP_ENTROPY) assert(zap__r32(c) == ZAP_FRAME_MAGIC2); else assert(zap__r32(c) == ZAP_FRAME_MAGIC);
+        if (depth & (ZAP_ENTROPY | ZAP_TURBO)) assert(zap__r32(c) == ZAP_FRAME_MAGIC2); else assert(zap__r32(c) == ZAP_FRAME_MAGIC);
         fuzz(c, cn, n, 0);
         free(c); free(o);
     }
