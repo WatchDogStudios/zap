@@ -1567,10 +1567,21 @@ static inline ptrdiff_t zap_decompress_turbo(const void *src, size_t n, void *ds
  * 1 plain [128-byte table][u32 x 7][8 parts], 2 contextual [u32 x 5][6 parts] (groups: previous literal >> 4). */
 #if defined(_MSC_VER) && !defined(__clang__)
 #define ZAP__NOINLINE __declspec(noinline)
+#if defined(__AVX2__) /* /arch:AVX2: Haswell-class, LZCNT and BMI2 */
+#define ZAP__BMI2 1
+static inline unsigned zap__clz64(uint64_t x) { return (unsigned)__lzcnt64(x); }
+#else
 static inline unsigned zap__clz64(uint64_t x) { unsigned long i; _BitScanReverse64(&i, x); return 63u - (unsigned)i; } /* x != 0 */
+#endif
 #else
 #define ZAP__NOINLINE __attribute__((noinline))
 static inline unsigned zap__clz64(uint64_t x) { return (unsigned)__builtin_clzll(x); } /* x != 0 */
+#endif
+#if defined(__BMI2__) && !defined(ZAP__BMI2)
+#define ZAP__BMI2 1
+#endif
+#ifndef ZAP__BMI2
+#define ZAP__BMI2 0
 #endif
 #if defined(__SSSE3__) || defined(__AVX__)
 #include <immintrin.h>
@@ -1642,7 +1653,20 @@ static inline uint8_t *zap__k_stream(uint8_t *op, uint8_t *oend, const uint8_t *
     op[0] = 0; zap__w32(op + 1, (uint32_t)n); memcpy(op + 5, s, n);
     return op + 5 + n;
 }
-/* decode tables from nt x 128 nibbles: entry = len | group << 4 | sym << 8 (group = grp[sym], 0 without grp) */
+/* table entries: with BMI2 len | group << 4 | sym << 8 (shrx shifts by the entry itself); without, sym | len << 8 | group << 12
+   (the symbol stores straight from the entry; shifts go through CL anyway) */
+#if ZAP__BMI2
+#define ZAP__KENTRY(s, l, g) ((l) | (g) << 4 | (s) << 8)
+#define ZAP__KSYM(e) ((uint8_t)((e) >> 8))
+#define ZAP__KLEN(e) ((e) & 15)
+#define ZAP__KGRP(e) ((e) >> 4 & 15)
+#else
+#define ZAP__KENTRY(s, l, g) ((s) | (l) << 8 | (g) << 12)
+#define ZAP__KSYM(e) ((uint8_t)(e))
+#define ZAP__KLEN(e) ((e) >> 8 & 15)
+#define ZAP__KGRP(e) ((e) >> 12)
+#endif
+/* decode tables from nt x 128 nibbles (group = grp[sym], 0 without grp) */
 static inline int zap__k_tables(const uint8_t *in, int nt, const uint8_t *grp, int L, uint16_t *T) {
     for (int g = 0; g < nt; g++) {
         uint8_t len[256];
@@ -1657,7 +1681,7 @@ static inline int zap__k_tables(const uint8_t *in, int nt, const uint8_t *grp, i
         for (int s = 0; s < 256; s++) {
             unsigned c = grp ? grp[s] : 0;
             if (c >= (unsigned)nt) return -1;
-            if (len[s]) for (int j = code[s]; j < 1 << L; j += 1 << len[s]) t[j] = (uint16_t)(len[s] | c << 4 | s << 8);
+            if (len[s]) for (int j = code[s]; j < 1 << L; j += 1 << len[s]) t[j] = (uint16_t)ZAP__KENTRY(s, len[s], c);
         }
     }
     return 0;
@@ -1672,22 +1696,31 @@ static inline int zap__k_tail(const uint8_t *s, size_t e, size_t b, uint8_t *o, 
         else for (size_t t = 0; t < 8 && by + t < e; t++) v |= (uint64_t)s[by + t] << 8 * t;
         v >>= b & 7;
         unsigned en = T[(g << L) | (unsigned)(v & M)];
-        if (!(en & 15) || b + (en & 15) > 8 * e) return -1;
-        o[x] = (uint8_t)(en >> 8); b += en & 15;
-        if (ctx) g = en >> 4 & 15;
+        if (!ZAP__KLEN(en) || b + ZAP__KLEN(en) > 8 * e) return -1;
+        o[x] = ZAP__KSYM(en); b += ZAP__KLEN(en);
+        if (ctx) g = ZAP__KGRP(en);
     }
     return 0;
 }
 /* decoders: in = [u32 sizes][W parts], tables built. A step decodes 5 symbols of every part (one 8-byte load each:
    >= 57 bits); all parts' dependency chains sit side by side so the core overlaps them; a marker bit gives each
-   part's consumed bits (clz). Tails go through zap__k_tail. */
-#define ZAP__KR(k) uint64_t v##k = (zap__r64(s + (b##k >> 3)) >> (b##k & 7)) | (1ull << 63)
-#define ZAP__KD(k) b##k += zap__clz64(v##k)
-#define ZAP__KP(k, j) do { unsigned e_ = T[v##k & M]; o##k[i + (j)] = (uint8_t)(e_ >> 8); v##k >>= (e_ & 63); } while (0)
-#define ZAP__KC(k, j) do { unsigned e_ = T[g##k | (unsigned)(v##k & M)]; o##k[i + (j)] = (uint8_t)(e_ >> 8); v##k >>= (e_ & 15); g##k = (e_ & 0xF0) << (L - 4); } while (0)
+   part's consumed bits (clz). Symbols go to one row per part of a stack buffer (a fixed stride, so no output pointer
+   per part has to live in a register) and are copied out per slice. Tails go through zap__k_tail. */
+#define ZAP__KSL 1020  /* symbols per part per slice (a multiple of 5) */
+#define ZAP__KROW 1088 /* row stride */
+#define ZAP__KR(k) uint64_t v##k = (zap__r64(s + (b[k] >> 3)) >> (b[k] & 7)) | (1ull << 63)
+#define ZAP__KD(k) b[k] += zap__clz64(v##k)
+#if ZAP__BMI2
+#define ZAP__KP(k, j) do { unsigned e_ = T[v##k & M]; row[(k) * ZAP__KROW + x + (j)] = (uint8_t)(e_ >> 8); v##k >>= (e_ & 63); } while (0)
+#define ZAP__KC(k, j) do { unsigned e_ = T[g##k | (unsigned)(v##k & M)]; row[(k) * ZAP__KROW + x + (j)] = (uint8_t)(e_ >> 8); v##k >>= (e_ & 15); g##k = (e_ & 0xF0) << (L - 4); } while (0)
+#else
+#define ZAP__KP(k, j) do { unsigned e_ = T[v##k & M]; row[(k) * ZAP__KROW + x + (j)] = (uint8_t)e_; v##k >>= e_ >> 8; } while (0)
+#define ZAP__KC(k, j) do { unsigned e_ = T[g##k | (unsigned)(v##k & M)]; row[(k) * ZAP__KROW + x + (j)] = (uint8_t)e_; v##k >>= (e_ >> 8 & 15); g##k = (e_ >> 12) << L; } while (0)
+#endif
 #define ZAP__KSETUP(W)                                                                                                     \
     const unsigned M = (1u << L) - 1;                                                                                      \
     size_t hdr = 4 * (W - 1), q = (raw + W - 1) / W, b[W], e[W], cnt[W], lo[W], at = 0, i = 0;                             \
+    uint8_t row[W * ZAP__KROW];                                                                                            \
     if (n < hdr) return -1;                                                                                                \
     const uint8_t *s = in + hdr;                                                                                           \
     for (int k = 0; k < W; k++) {                                                                                          \
@@ -1699,7 +1732,11 @@ static inline int zap__k_tail(const uint8_t *s, size_t e, size_t b, uint8_t *o, 
     unsigned gg[W] = { 0 };
 #define ZAP__KITERS(W)                                                                                                     \
     size_t it = (cnt[W - 1] - i) / 5;                                                                                      \
-    for (int k = 0; k < W; k++) { size_t by = b[k] >> 3, m_ = e[k] >= by + 8 ? (e[k] - by - 8) / 7 + 1 : 0; if (m_ < it) it = m_; }
+    for (int k = 0; k < W; k++) { size_t by = b[k] >> 3, m_ = e[k] >= by + 8 ? (e[k] - by - 8) / 7 + 1 : 0; if (m_ < it) it = m_; } \
+    if (it > ZAP__KSL / 5) it = ZAP__KSL / 5;
+#define ZAP__KOUT(W)                                                                                                       \
+    for (int k = 0; k < W; k++) memcpy(out + lo[k] + i, row + (size_t)k * ZAP__KROW, x);                                  \
+    i += x;
 #define ZAP__KTAILS(W, CTX)                                                                                                \
     for (int k = 0; k < W; k++) {                                                                                          \
         size_t done = i < cnt[k] ? i : cnt[k];                                                                             \
@@ -1710,20 +1747,19 @@ static inline int zap__k_tail(const uint8_t *s, size_t e, size_t b, uint8_t *o, 
     ZAP__NOINLINE static int NAME(const uint8_t *in, size_t n, uint8_t *out, size_t raw, const uint16_t *T) {              \
         enum { L = L_ };                                                                                                   \
         ZAP__KSETUP(8)                                                                                                     \
-        uint8_t *o0 = out + lo[0], *o1 = out + lo[1], *o2 = out + lo[2], *o3 = out + lo[3], *o4 = out + lo[4], *o5 = out + lo[5], *o6 = out + lo[6], *o7 = out + lo[7]; \
         for (;;) {                                                                                                         \
             ZAP__KITERS(8)                                                                                                 \
             if (!it) break;                                                                                                \
-            size_t b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3], b4 = b[4], b5 = b[5], b6 = b[6], b7 = b[7];                 \
             unsigned g0 = gg[0] << L, g1 = gg[1] << L, g2 = gg[2] << L, g3 = gg[3] << L, g4 = gg[4] << L, g5 = gg[5] << L, g6 = gg[6] << L, g7 = gg[7] << L; \
-            for (size_t t = 0; t < it; t++, i += 5) {                                                                      \
+            size_t x = 0;                                                                                                  \
+            for (size_t t = 0; t < it; t++, x += 5) {                                                                      \
                 ZAP__KR(0); ZAP__KR(1); ZAP__KR(2); ZAP__KR(3); ZAP__KR(4); ZAP__KR(5); ZAP__KR(6); ZAP__KR(7);            \
                 if (CTX) { for (int j = 0; j < 5; j++) { ZAP__KC(0, j); ZAP__KC(1, j); ZAP__KC(2, j); ZAP__KC(3, j); ZAP__KC(4, j); ZAP__KC(5, j); ZAP__KC(6, j); ZAP__KC(7, j); } } \
                 else { for (int j = 0; j < 5; j++) { ZAP__KP(0, j); ZAP__KP(1, j); ZAP__KP(2, j); ZAP__KP(3, j); ZAP__KP(4, j); ZAP__KP(5, j); ZAP__KP(6, j); ZAP__KP(7, j); } } \
                 ZAP__KD(0); ZAP__KD(1); ZAP__KD(2); ZAP__KD(3); ZAP__KD(4); ZAP__KD(5); ZAP__KD(6); ZAP__KD(7);            \
             }                                                                                                              \
-            b[0] = b0; b[1] = b1; b[2] = b2; b[3] = b3; b[4] = b4; b[5] = b5; b[6] = b6; b[7] = b7;                        \
             gg[0] = g0 >> L; gg[1] = g1 >> L; gg[2] = g2 >> L; gg[3] = g3 >> L; gg[4] = g4 >> L; gg[5] = g5 >> L; gg[6] = g6 >> L; gg[7] = g7 >> L; \
+            ZAP__KOUT(8)                                                                                                   \
         }                                                                                                                  \
         ZAP__KTAILS(8, CTX)                                                                                                \
     }
@@ -1731,20 +1767,19 @@ static inline int zap__k_tail(const uint8_t *s, size_t e, size_t b, uint8_t *o, 
     ZAP__NOINLINE static int NAME(const uint8_t *in, size_t n, uint8_t *out, size_t raw, const uint16_t *T) {              \
         enum { L = L_ };                                                                                                   \
         ZAP__KSETUP(6)                                                                                                     \
-        uint8_t *o0 = out + lo[0], *o1 = out + lo[1], *o2 = out + lo[2], *o3 = out + lo[3], *o4 = out + lo[4], *o5 = out + lo[5]; \
         for (;;) {                                                                                                         \
             ZAP__KITERS(6)                                                                                                 \
             if (!it) break;                                                                                                \
-            size_t b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3], b4 = b[4], b5 = b[5];                                       \
             unsigned g0 = gg[0] << L, g1 = gg[1] << L, g2 = gg[2] << L, g3 = gg[3] << L, g4 = gg[4] << L, g5 = gg[5] << L; \
-            for (size_t t = 0; t < it; t++, i += 5) {                                                                      \
+            size_t x = 0;                                                                                                  \
+            for (size_t t = 0; t < it; t++, x += 5) {                                                                      \
                 ZAP__KR(0); ZAP__KR(1); ZAP__KR(2); ZAP__KR(3); ZAP__KR(4); ZAP__KR(5);                                    \
                 if (CTX) { for (int j = 0; j < 5; j++) { ZAP__KC(0, j); ZAP__KC(1, j); ZAP__KC(2, j); ZAP__KC(3, j); ZAP__KC(4, j); ZAP__KC(5, j); } } \
                 else { for (int j = 0; j < 5; j++) { ZAP__KP(0, j); ZAP__KP(1, j); ZAP__KP(2, j); ZAP__KP(3, j); ZAP__KP(4, j); ZAP__KP(5, j); } } \
                 ZAP__KD(0); ZAP__KD(1); ZAP__KD(2); ZAP__KD(3); ZAP__KD(4); ZAP__KD(5);                                    \
             }                                                                                                              \
-            b[0] = b0; b[1] = b1; b[2] = b2; b[3] = b3; b[4] = b4; b[5] = b5;                                              \
             gg[0] = g0 >> L; gg[1] = g1 >> L; gg[2] = g2 >> L; gg[3] = g3 >> L; gg[4] = g4 >> L; gg[5] = g5 >> L;         \
+            ZAP__KOUT(6)                                                                                                   \
         }                                                                                                                  \
         ZAP__KTAILS(6, CTX)                                                                                                \
     }
