@@ -241,10 +241,10 @@ typedef struct { uint32_t price, len, off, lit, rep, rep1, rep2; } zap__opt;
 typedef struct {
     int entropy;
     uint32_t lit[256], tok[256], oc[26], low[16], lenb, seq; /* oc: entropy v2 offset codes (0-2 repeats, 3 + log2) */
-    /* turbo blocks: tri[kind][lit][ml] = the block's command table has it (kind 0 repeat, 1 near, 2 far);
+    /* turbo blocks: tri[kind][lit][ml] = the block's command table has it (kind 0 repeat, else offset bytes);
        pesc / pfar: decode-time penalties for escapes and for offsets >= farlim (cache misses) */
     int turbo;
-    uint8_t tri[3][17][33];
+    uint8_t tri[4][17][33];
     uint32_t pesc, pfar, farlim;
 } zap__cost;
 
@@ -362,12 +362,26 @@ static inline void zap__rep_push(uint32_t r[3], size_t off) {
     r[1] = r[0]; r[0] = o;
 }
 
+#define ZAP__T_SPLIT_LEN 96 /* turbo: matches of 33..96 bytes (offset >= 16) go out as up to 3 table commands */
+#ifndef ZAP__T_MAXOFF
+/* turbo: farthest offset the parse may use (ZAP_MAX_DIST = the whole window). Decode speed is bound by match-source loads;
+   sources within ~384KB mostly stay in L2 (512KB on Zen 2/3, the consoles included), farther ones come from L3.
+   On a game pak sample the cap costs 0.9% ratio and gains ~25% decode speed. */
+#define ZAP__T_MAXOFF (384u << 10)
+#endif
 static inline uint32_t zap__match_price(const zap__cost *c, size_t len, size_t off, size_t lit, const uint32_t rep[3]) {
-    if (c->turbo) { /* token byte + 0/2/3 offset bytes; an escape adds its two length bytes (4 each when >= 255) */
-        int kind = off == rep[0] ? 0 : off < 65536 ? 1 : 2;
-        uint32_t p = c->seq + 128u * (kind == 0 ? 1u : kind == 1 ? 3u : 4u) + (kind && off >= c->farlim ? c->pfar : 0u);
-        if (lit > 16 || len > 32 || off < 16 || !c->tri[kind][lit][len])
-            p += (len <= 32 ? c->pesc : 0u) + 256u + (lit >= 255 ? 384u : 0u) + (len >= 259 ? 384u : 0u);
+    if (c->turbo) { /* token byte + offset bytes; an escape adds its two length bytes (4 each when >= 255) */
+        if (off > ZAP__T_MAXOFF && off != rep[0]) return 0x3FFFFFFFu; /* out of reach: never chosen */
+        int kind = off == rep[0] ? 0 : off < 256 ? 1 : off < 65536 ? 2 : 3;
+        uint32_t p = c->seq + 128u * (1u + (unsigned)kind) + (kind && off >= c->farlim ? c->pfar : 0u);
+        size_t first = len;
+        if (len > 32 && len <= ZAP__T_SPLIT_LEN && off >= 16) { /* split into repeat commands: a token (and command) each */
+            size_t more = (len - 1) / 32;
+            p += (c->seq + 128u) * (uint32_t)more;
+            first = len - 32 * more >= 4 ? 32 : len - 4;
+        }
+        if (lit > 16 || first > 32 || off < 16 || !c->tri[kind][lit][first])
+            p += (first <= 32 ? c->pesc : 0u) + 256u + (lit >= 255 ? 384u : 0u) + (first >= 259 ? 384u : 0u);
         return p;
     }
     uint32_t p = c->seq + zap__ext_bytes(len - 4) * c->lenb;
@@ -1240,9 +1254,9 @@ out:
  * [u32 ntok][u32 noff][u32 nlen][u8 ntab][ntab x u16: lit | (ml - 4) << 5 | kind << 10]
  * [tokens: one byte per command][offsets][lengths][literals: the rest of the block]
  * A token below ntab is that table entry: lit (0-16) literals, then ml (4-32) bytes from an offset given by kind:
- * 0 = the previous command's offset, 1 = 2 bytes (LE) from the offset stream, 2 = 3 bytes. Tokens 253 + kind are
+ * 0 = the previous command's offset, else kind bytes (LE) from the offset stream (1: < 256, 2: < 64K, 3). Tokens 252 + kind are
  * escapes: lit and ml - 4 come from the lengths stream, one byte each (255 + 3 bytes LE for values >= 255).
- * Each block picks its own table: its 253 most frequent (kind, lit, ml) commands. Offsets < 16 are always escapes,
+ * Each block picks its own table: its 252 most frequent (kind, lit, ml) commands. Offsets < 16 are always escapes,
  * so a table command is always one 16-byte literal copy and two 16-byte match copies. The parse is priced in bytes
  * plus decode-time penalties for commands, escapes and far offsets. */
 #define ZAP_TURBO (1 << 18) /* OR into a frame's depth: turbo blocks (version-2 frame); depth >= ZAP_OPT_DEPTH to price the parse */
@@ -1258,8 +1272,11 @@ out:
 #ifndef ZAP__T_FARLIM
 #define ZAP__T_FARLIM (256u << 10)
 #endif
-#define ZAP__T_ESC0 253u
-#define ZAP__T_NTRI (3 * 17 * 33)
+#define ZAP__T_ESC0 252u
+#define ZAP__T_NTRI (4 * 17 * 33)
+
+/* a command's offset kind: 0 = repeat the previous offset, else how many offset bytes it takes */
+static inline size_t zap__t_kind(size_t off, size_t last) { return off == last ? 0 : off < 256 ? 1 : off < 65536 ? 2 : 3; }
 
 typedef struct { const uint8_t *p, *e; } zap__lzcur;
 /* next sequence of a plain block made by this compressor: its literals in lp, ll; 0 = the trailing literals */
@@ -1278,12 +1295,23 @@ static inline int zap__lznext(zap__lzcur *c, const uint8_t **lp, size_t *ll, siz
     return 1;
 }
 
+/* the commands one sequence becomes: a match of 33..ZAP__T_SPLIT_LEN bytes (offset >= 16) splits into up to 3 table
+   commands, the later ones with no literals and the same offset (so a repeat): a token byte each instead of an
+   escape's two length bytes, and no escape to decode */
+static inline int zap__t_split(size_t ll, size_t ml, size_t off, size_t cl[3], size_t cm[3]) {
+    int n = 0;
+    if (ml > 32 && ml <= ZAP__T_SPLIT_LEN && off >= 16)
+        while (ml > 32) { size_t c = ml - 32 >= 4 ? 32 : ml - 4; cl[n] = n ? 0 : ll; cm[n++] = c; ml -= c; }
+    cl[n] = n ? 0 : ll; cm[n++] = ml;
+    return n;
+}
+
 /* the triple index of a command, or -1 when it can only be an escape */
 static inline int zap__t_tri(size_t kind, size_t ll, size_t off, size_t ml) {
     return ll <= 16 && ml <= 32 && off >= 16 ? (int)((kind * 17 + ll) * 33 + ml) : -1;
 }
 
-/* the block's command table: its 253 most frequent triples, as tri[] flags and (if code) the code of each triple */
+/* the block's command table: its 252 most frequent triples, as tri[] flags and (if code) the code of each triple */
 static inline int zap__t_table(const uint8_t *lz, size_t lzn, uint8_t tri[ZAP__T_NTRI], int16_t *code) {
     uint64_t *h = (uint64_t *)calloc(ZAP__T_NTRI, sizeof *h);
     if (!h) return -1;
@@ -1291,12 +1319,15 @@ static inline int zap__t_table(const uint8_t *lz, size_t lzn, uint8_t tri[ZAP__T
     const uint8_t *lp;
     size_t ll, off, ml, last = 0;
     while (zap__lznext(&c, &lp, &ll, &off, &ml)) {
-        int i = zap__t_tri(off == last ? 0 : off < 65536 ? 1 : 2, ll, off, ml);
-        last = off;
-        if (i >= 0) h[i] += (uint64_t)1 << 16;
+        size_t cl[3], cm[3];
+        for (int j = 0, nc = zap__t_split(ll, ml, off, cl, cm); j < nc; j++) {
+            int i = zap__t_tri(zap__t_kind(off, last), cl[j], off, cm[j]);
+            last = off;
+            if (i >= 0) h[i] += (uint64_t)1 << 16;
+        }
     }
     for (int i = 0; i < ZAP__T_NTRI; i++) h[i] |= (uint64_t)i;
-    for (int i = 0; i < (int)ZAP__T_ESC0; i++) { /* partial selection sort: the 253 largest counts, ties by index */
+    for (int i = 0; i < (int)ZAP__T_ESC0; i++) { /* partial selection sort: the 252 largest counts, ties by index */
         int b = i;
         for (int j = i + 1; j < ZAP__T_NTRI; j++) if (h[j] > h[b]) b = j;
         uint64_t x = h[i]; h[i] = h[b]; h[b] = x;
@@ -1334,11 +1365,14 @@ static inline size_t zap__t_encode(const uint8_t *lz, size_t lzn, uint8_t *dst, 
             more = zap__lznext(&c, &lp, &ll, &off, &ml);
             nlit += ll;
             if (!more) break;
-            size_t kind = off == last ? 0 : off < 65536 ? 1 : 2;
-            last = off;
-            int i = zap__t_tri(kind, ll, off, ml);
-            ntok++; noff += kind ? kind + 1 : 0;
-            if (i < 0 || code[i] < 0) nlen += (ll < 255 ? 1 : 4) + (ml - 4 < 255 ? 1 : 4);
+            size_t cl[3], cm[3];
+            for (int j = 0, nc = zap__t_split(ll, ml, off, cl, cm); j < nc; j++) {
+                size_t kind = zap__t_kind(off, last);
+                last = off;
+                int i = zap__t_tri(kind, cl[j], off, cm[j]);
+                ntok++; noff += kind;
+                if (i < 0 || code[i] < 0) nlen += (cl[j] < 255 ? 1 : 4) + (cm[j] - 4 < 255 ? 1 : 4);
+            }
         } while (more);
         size_t hdr = 13 + 2 * (size_t)ntab, total = hdr + ntok + noff + nlen + nlit;
         if (total > cap || ntok > 0xFFFFFFFFu || noff > 0xFFFFFFFFu || nlen > 0xFFFFFFFFu) goto done;
@@ -1353,12 +1387,15 @@ static inline size_t zap__t_encode(const uint8_t *lz, size_t lzn, uint8_t *dst, 
             more = zap__lznext(&c, &lp, &ll, &off, &ml);
             memcpy(litp, lp, ll); litp += ll;
             if (!more) break;
-            size_t kind = off == last ? 0 : off < 65536 ? 1 : 2;
-            last = off;
-            int i = zap__t_tri(kind, ll, off, ml), k = i >= 0 ? code[i] : -1;
-            if (k < 0) { k = (int)(ZAP__T_ESC0 + kind); lnp = zap__t_ext(zap__t_ext(lnp, ll), ml - 4); }
-            *tp++ = (uint8_t)k;
-            if (kind) { op[0] = (uint8_t)off; op[1] = (uint8_t)(off >> 8); if (kind == 2) op[2] = (uint8_t)(off >> 16); op += kind + 1; }
+            size_t cl[3], cm[3];
+            for (int j = 0, nc = zap__t_split(ll, ml, off, cl, cm); j < nc; j++) {
+                size_t kind = zap__t_kind(off, last);
+                last = off;
+                int i = zap__t_tri(kind, cl[j], off, cm[j]), k = i >= 0 ? code[i] : -1;
+                if (k < 0) { k = (int)(ZAP__T_ESC0 + kind); lnp = zap__t_ext(zap__t_ext(lnp, cl[j]), cm[j] - 4); }
+                *tp++ = (uint8_t)k;
+                for (size_t b = 0; b < kind; b++) *op++ = (uint8_t)(off >> 8 * b);
+            }
         } while (more);
         r = total;
     }
@@ -1399,27 +1436,32 @@ static inline void zap__t_copy(uint8_t *op, size_t off, size_t ml, uint8_t *oend
     else for (size_t j = 0; j < ml; j++) op[j] = m[j];
 }
 
+/* 16 bytes from s to d, which may overlap: through a temporary, so neither memcpy overlaps (memmove would be the
+   obvious call, but MSVC doesn't inline it); compilers make this one 16-byte load and store */
+static inline void zap__cp16(uint8_t *d, const uint8_t *s) { uint8_t t[16]; memcpy(t, s, 16); memcpy(d, t, 16); }
+
 /* table entry: bits 0-7 lit, 8-15 ml, 16-23 offset bytes, bit 31 escape; bits 32-63 offset mask (0 = repeat the
    previous offset). An unused code is ZAP__T_BAD (escape bit set, caught on the escape path). */
 #define ZAP__T_BAD 0xFFFFFFFFu
 #define ZAP__T_CMD(ESCAPE)                                                                                           \
     do {                                                                                                             \
         uint64_t e = tab[*t++];                                                                                      \
-        size_t nb = (e >> 16) & 0xFF, noff = zap__r32(o) & (uint32_t)(e >> 32);                                      \
+        size_t nb = (e >> 16) & 0xFF, nv = zap__r32(o) & (uint32_t)(e >> 32);                                        \
         o += nb;                                                                                                     \
-        off = nb ? noff : off;                                                                                       \
+        off = nb ? nv : off;                                                                                         \
         if ((int32_t)(uint32_t)e < 0) goto ESCAPE;                                                                   \
         size_t ll = e & 0xFF;                                                                                        \
         memcpy(op, lp, 16);                                                                                          \
         op += ll; lp += ll;                                                                                          \
-        if (off > (size_t)(op - dst)) return -1;                                                                     \
-        memmove(op, op - off, 16); /* off < 16 only in a corrupt block: overlapping, so memmove (same code) */       \
-        memmove(op + 16, op - off + 16, 16);                                                                         \
+        uintptr_t m = (uintptr_t)op - off; /* integer math: the check reuses the address the copy needs */           \
+        if (m < (uintptr_t)dst) return -1;                                                                           \
+        zap__cp16(op, (const uint8_t *)m); /* off < 16 only in a corrupt block: may overlap */                       \
+        zap__cp16(op + 16, (const uint8_t *)m + 16);                                                                 \
         op += (e >> 8) & 0xFF;                                                                                       \
     } while (0)
 
 static inline ptrdiff_t zap__t_decode(const uint8_t *src, size_t n, uint8_t *dst, size_t raw) {
-    static const uint32_t kmask[3] = { 0, 0xFFFFu, 0xFFFFFFu };
+    static const uint32_t kmask[4] = { 0, 0xFFu, 0xFFFFu, 0xFFFFFFu };
     if (n < 13) return -1;
     size_t ntab = src[12];
     if (ntab > ZAP__T_ESC0 || n - 13 < 2 * ntab) return -1;
@@ -1427,10 +1469,10 @@ static inline ptrdiff_t zap__t_decode(const uint8_t *src, size_t n, uint8_t *dst
     for (int i = 0; i < 256; i++) tab[i] = ZAP__T_BAD;
     for (size_t i = 0; i < ntab; i++) {
         unsigned w = src[13 + 2 * i] | (unsigned)src[14 + 2 * i] << 8, ll = w & 31, ml = (w >> 5 & 31) + 4, kind = w >> 10;
-        if (ll > 16 || ml > 32 || kind > 2) return -1;
-        tab[i] = ll | ml << 8 | (uint64_t)(kind ? kind + 1 : 0) << 16 | (uint64_t)kmask[kind] << 32;
+        if (ll > 16 || ml > 32 || kind > 3) return -1;
+        tab[i] = ll | ml << 8 | (uint64_t)kind << 16 | (uint64_t)kmask[kind] << 32;
     }
-    for (unsigned k = 0; k < 3; k++) tab[ZAP__T_ESC0 + k] = 0x80000000u | (uint64_t)(k ? k + 1 : 0) << 16 | (uint64_t)kmask[k] << 32;
+    for (unsigned k = 0; k < 4; k++) tab[ZAP__T_ESC0 + k] = 0x80000000u | (uint64_t)k << 16 | (uint64_t)kmask[k] << 32;
     const uint8_t *t = src + 13 + 2 * ntab, *end = src + n;
     uint64_t ntok = zap__r32(src), noff = zap__r32(src + 4), nlen = zap__r32(src + 8);
     if (ntok + noff + nlen > (uint64_t)(end - t)) return -1;
@@ -1467,7 +1509,7 @@ static inline ptrdiff_t zap__t_decode(const uint8_t *src, size_t n, uint8_t *dst
         uint64_t e = tab[*t++];
         size_t nb = (e >> 16) & 0xFF, ll = e & 0xFF, ml = (e >> 8) & 0xFF;
         if (e == ZAP__T_BAD || nb > (size_t)(oe - o)) return -1;
-        if (nb) { off = (size_t)o[0] | (size_t)o[1] << 8 | (nb == 3 ? (size_t)o[2] << 16 : 0); o += nb; }
+        if (nb) { off = 0; for (size_t j = 0; j < nb; j++) off |= (size_t)o[j] << 8 * j; o += nb; }
         if ((uint32_t)e & 0x80000000u) { if (zap__t_len(&ln, le, &ll) || zap__t_len(&ln, le, &ml)) return -1; ml += 4; }
         if (ll > (size_t)(end - lp) || ll > (size_t)(oend - op)) return -1;
         memcpy(op, lp, ll); op += ll; lp += ll;

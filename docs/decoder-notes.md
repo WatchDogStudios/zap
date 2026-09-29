@@ -52,3 +52,49 @@ and a sequence penalty (above) don't close it. What's left untried is the entrop
 tokens are ~8 M contextual-Huffman symbols at ~1 ns each, nearly half of decode time. Candidates: a table-driven
 decoder that emits two symbols per lookup for the short-code streams, tANS with interleaved states, or SIMD Huffman.
 Each is a substantial rewrite with an uncertain payoff.
+
+# Fast level: turbo blocks against Selkie
+
+Same sample and machine. Oodle Selkie 6 on it: ratio 2.600, 5.9–6.4 GB/s. zap's plain format: 2.616 at about 4 GB/s.
+Background load on this machine moved single runs by up to 30%, so the numbers below come from decoders timed in the
+same process, interleaved; a comparison between separate runs isn't worth much here.
+
+## Why the plain format can't get there
+
+On identical sequences (LZ4-HC's parse re-emitted in zap's format) zap's decoder ran at 66% of LZ4's speed. It wasn't
+the parse or the window. The next token's address depends on a byte loaded inside the current sequence (the far-offset
+flag), which puts a load in the loop-carried chain; with a predicted branch instead, 22% far offsets mispredict about as
+often. Precomputed limits and 8-byte copies were worth 4–7%, which doesn't close a 35% gap.
+
+## What the turbo format does
+
+One token byte per command, indexing the block's own table of its 253 most frequent (offset kind, literals, match
+length) triples; offsets (2 bytes, 3 bytes, or none for "repeat the previous offset") in one stream, escape lengths and
+literals in their own. Every pointer advances by an amount the token alone determines, so nothing chains through a load.
+
+| Step | Ratio | Decode |
+|---|---|---|
+| Split streams, fixed 3/4-bit token split | 2.587 | slower than plain: 23% of tokens escape (literal runs peak at 10–12 on this data, 16-byte records) |
+| Per-block (lit, ml) table, 127 pairs + far bit | 2.621 | 1.2x plain; escapes 7% |
+| 1-byte token over (kind, lit, ml) triples, repeat offsets | 2.626 | repeat offsets are only 6% of commands but save 2 bytes each |
+| Parser priced for the format (bytes + per-command, escape and far-offset penalties) | 2.611–2.631 | 1.3x plain |
+
+## What the decode loop taught
+
+- Counters: at the start the new loop ran at the same IPC as LZ4 (about 2.2) but retired 1.3x the instructions per
+  command. It was instruction count, not stalls; the loop has no load-carried chain at all.
+- Five stream pointers plus five limits made clang spill a limit per command. One bound per batch (fast commands read at
+  most 16 literal and 4 offset bytes and write at most 48) removed every limit but the token pointer's.
+- An instruction-pointer sampler (a thread that suspends the decoder and reads RIP) found a third of the time outside
+  the fast loop: escapes and offsets < 16 left it through a call, then re-computed the batch. Handling them inline, and
+  keeping offsets < 16 out of table commands (the encoder makes them escapes), took it from 0.77x to 0.95x of LZ4 on
+  LZ4's own parse.
+- On zap's parse 57% of samples wait on the match-source load. 18% of new offsets reach past 512 KB (L3). An oracle
+  (prefetch the source recorded from an earlier decode, 16 commands ahead) was worth 9–15%. A real version, far
+  matches as absolute positions in their own stream so they can be prefetched without decoding ahead, cost 10 more
+  instructions per command and ended at 0.91x of the plain turbo loop. A parse penalty on offsets past 512 KB does
+  some of the same job for free.
+- Compilers differ: packed 64-bit table entries with a pointer output were fastest under both clang (0.93x Selkie by
+  best round) and MSVC (0.96x); a struct of byte fields suited MSVC's register allocation but lost 16% under clang.
+- A table command's match copy must be `memmove`: in a corrupt block the offset can be < 16, and overlapping `memcpy` is
+  undefined even though it stays in bounds (ASan flags it). A fixed 16-byte `memmove` compiles to the same load and store.
