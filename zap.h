@@ -1611,16 +1611,16 @@ static inline unsigned zap__clz64(uint64_t x) { return (unsigned)__builtin_clzll
 #define ZAP__KXSHR(v, c) ((v) >> (c))
 #define ZAP__KXCLZ(v) ((unsigned)__builtin_clzll(v))
 #endif
-#if ZAP__X86 && !ZAP__BMI2
+#if ZAP__X86 && !(ZAP__BMI2 && ZAP__PSHUFB)
 #if defined(_MSC_VER) /* MSVC, and clang targeting it (<cpuid.h>'s __cpuid macro would break a later <intrin.h>) */
 #include <intrin.h>
 #else
 #include <cpuid.h>
 #endif
 #endif
-static inline int zap__k_x(void) { /* 1: use the X decoders */
-#if ZAP__BMI2
-    return 1;
+static inline int zap__k_cpu(void) { /* bit 0: BMI2 and LZCNT (the X decoders), bit 1: SSSE3 */
+#if ZAP__BMI2 && ZAP__PSHUFB
+    return 3;
 #elif ZAP__X86
     static int f = -1; /* benign race: every thread computes the same */
     if (f < 0) {
@@ -1629,12 +1629,21 @@ static inline int zap__k_x(void) { /* 1: use the X decoders */
         __cpuidex(r, 7, 0);
         int bmi2 = (r[1] >> 8) & 1;
         __cpuid(r, (int)0x80000001);
-        f = bmi2 && ((r[2] >> 5) & 1);
+        int lz = (r[2] >> 5) & 1;
+        __cpuid(r, 1);
+        f = (bmi2 && lz) | ((r[2] >> 9) & 1) << 1;
 #else
-        unsigned a, b, c, d, bmi2 = 0, lz = 0;
+        unsigned a, b, c, d, bmi2 = 0, lz = 0, s3 = 0;
         if (__get_cpuid_count(7, 0, &a, &b, &c, &d)) bmi2 = (b >> 8) & 1;
         if (__get_cpuid(0x80000001u, &a, &b, &c, &d)) lz = (c >> 5) & 1;
-        f = (int)(bmi2 && lz);
+        if (__get_cpuid(1, &a, &b, &c, &d)) s3 = (c >> 9) & 1;
+        f = (int)((bmi2 && lz) | s3 << 1);
+#endif
+#if ZAP__BMI2
+        f |= 1;
+#endif
+#if ZAP__PSHUFB
+        f |= 2;
 #endif
     }
     return f;
@@ -1642,6 +1651,7 @@ static inline int zap__k_x(void) { /* 1: use the X decoders */
     return 0;
 #endif
 }
+static inline int zap__k_x(void) { return zap__k_cpu() & 1; } /* use the X decoders */
 #define ZAP__K_CHUNK (128u << 10) /* literal chunks: output bytes */
 #define ZAP__K_NEAR 64512u        /* offsets below: near (high byte in the offset symbol) */
 #define ZAP__K_N 512              /* sequences per offset-stage batch */
@@ -2175,22 +2185,36 @@ ZAP__NOINLINE static void zap__k_offs(zap__ko *s, const uint8_t *cb, uint32_t *O
     }
     s->pa = pa; s->pb = pb; s->r0 = r0; s->r1 = r1; s->r2 = r2;
 }
-/* match with offset 1..15: a pattern of the period (two 16-byte stores), then copies at a multiple >= 16; the
-   caller guarantees ml + 32 bytes of room */
-static inline void zap__k_short(uint8_t *op, size_t off, size_t ml, uint8_t *oend) {
-#if ZAP__PSHUFB
-    static const uint8_t pat[16][33] = {
+/* match with offset 1..15: a pattern of the period (two 16-byte stores via pshufb), then copies at a multiple >= 16;
+   the caller guarantees ml + 32 bytes of room. Without SSSE3: the byte-priming copy. */
+#if ZAP__PSHUFB || ZAP__X86
+#if !ZAP__PSHUFB && !(defined(_MSC_VER) && !defined(__clang__))
+#include <tmmintrin.h> /* clang for Windows leaves it out of <immintrin.h> without -mssse3 */
+#define ZAP__S3ATTR __attribute__((target("ssse3")))
+#else
+#define ZAP__S3ATTR
+#endif
+static const uint8_t zap__k_pat[16][33] = {
 #define ZAP__PR(o) { 0%o,1%o,2%o,3%o,4%o,5%o,6%o,7%o,8%o,9%o,10%o,11%o,12%o,13%o,14%o,15%o, 16%o,17%o,18%o,19%o,20%o,21%o,22%o,23%o,24%o,25%o,26%o,27%o,28%o,29%o,30%o,31%o, (o)*((16+(o)-1)/(o)) }
-        { 0 }, ZAP__PR(1), ZAP__PR(2), ZAP__PR(3), ZAP__PR(4), ZAP__PR(5), ZAP__PR(6), ZAP__PR(7), ZAP__PR(8), ZAP__PR(9), ZAP__PR(10), ZAP__PR(11), ZAP__PR(12), ZAP__PR(13), ZAP__PR(14), ZAP__PR(15)
+    { 0 }, ZAP__PR(1), ZAP__PR(2), ZAP__PR(3), ZAP__PR(4), ZAP__PR(5), ZAP__PR(6), ZAP__PR(7), ZAP__PR(8), ZAP__PR(9), ZAP__PR(10), ZAP__PR(11), ZAP__PR(12), ZAP__PR(13), ZAP__PR(14), ZAP__PR(15)
 #undef ZAP__PR
-    };
-    const uint8_t *t = pat[off];
+};
+ZAP__S3ATTR static inline void zap__k_short3(uint8_t *op, size_t off, size_t ml) {
+    const uint8_t *t = zap__k_pat[off];
     __m128i v = _mm_loadu_si128((const __m128i *)(const void *)(op - off));
     _mm_storeu_si128((__m128i *)(void *)op, _mm_shuffle_epi8(v, _mm_loadu_si128((const __m128i *)(const void *)t)));
     _mm_storeu_si128((__m128i *)(void *)(op + 16), _mm_shuffle_epi8(v, _mm_loadu_si128((const __m128i *)(const void *)(t + 16))));
     if (ml > 32) { size_t p = t[32]; for (uint8_t *d = op + 32, *e = op + ml; d < e; d += 16) zap__cp16(d, d - p); }
-    (void)oend;
+}
+#endif
+static inline void zap__k_short(uint8_t *op, size_t off, size_t ml, uint8_t *oend, int s3) {
+#if ZAP__PSHUFB
+    (void)oend; (void)s3;
+    zap__k_short3(op, off, ml);
+#elif ZAP__X86
+    if (s3) zap__k_short3(op, off, ml); else zap__match_copy(op, off, ml, oend);
 #else
+    (void)s3;
     zap__match_copy(op, off, ml, oend);
 #endif
 }
@@ -2200,7 +2224,7 @@ static inline ptrdiff_t zap__k_lz(const uint8_t *lits, size_t nl, const uint8_t 
     zap__ko s = { NL, FAR, 0, 0, 0 };
     const uint8_t *lp = lits, *le = lits + nl;
     uint8_t *op = dst, *oend = dst + raw;
-    int err = 0;
+    int err = 0, s3 = zap__k_cpu() >> 1 & 1;
     for (size_t i = 0; i < ns;) {
         size_t cnt = ns - i < ZAP__K_N ? ns - i : ZAP__K_N, j;
         if (s.pa > NL + nn || s.pb > FAR + nf) return -1; /* a batch reads at most ZAP__K_N entries past these (padding) */
@@ -2221,7 +2245,7 @@ static inline ptrdiff_t zap__k_lz(const uint8_t *lits, size_t nl, const uint8_t 
                 continue;
             slow_match:
                 if (off - 1 >= (size_t)(op - dst)) return -1;
-                zap__k_short(op, off, ml + 4, oend);
+                zap__k_short(op, off, ml + 4, oend, s3);
                 op += ml + 4;
                 continue;
             slow:
@@ -2234,7 +2258,7 @@ static inline ptrdiff_t zap__k_lz(const uint8_t *lits, size_t nl, const uint8_t 
                 if (ml == 15) { ml += zap__ext(&lnp, lne, &err); if (err) return -1; }
                 ml += 4;
                 if (off - 1 >= (size_t)(op - dst) || ml > (size_t)(oend - op)) return -1;
-                if (off < 16 && (size_t)(oend - op) >= ml + 32) zap__k_short(op, off, ml, oend);
+                if (off < 16 && (size_t)(oend - op) >= ml + 32) zap__k_short(op, off, ml, oend, s3);
                 else zap__match_copy(op, off, ml, oend);
                 op += ml;
                 j++;
