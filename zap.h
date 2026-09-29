@@ -1562,7 +1562,7 @@ static inline ptrdiff_t zap_decompress_turbo(const void *src, size_t n, void *ds
  * 255 = far offset (next far low | mid << 8 | high << 16). Leftover literals end the block.
  * Huffman data: [u8 ntables][ntables x 128 bytes of 4-bit code lengths][u32 sizes of parts 0..W-2][W parts]; part
  * k holds symbols [k q, (k + 1) q), q = ceil(n / W), LSB-first; contextual: a part's table is the group of its
- * previous symbol (group 0 at its start). Tokens: 8 parts, 16 groups (zap__grp_tok). Plain streams: 8 parts, L11.
+ * previous symbol (group 0 at its start). Tokens: 6 parts, 16 groups (zap__grp_tok), L11. Plain streams: 8 parts, L11.
  * Literal stream: [u8 16][16 x 128: contextual tables, L10] then per chunk [u8 mode][u32 bytes][payload]: mode 0 raw,
  * 1 plain [128-byte table][u32 x 7][8 parts], 2 contextual [u32 x 5][6 parts] (groups: previous literal >> 4). */
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -1633,7 +1633,7 @@ static inline void zap__k_lens(const uint8_t *s, size_t n, int W, const uint8_t 
     for (int g = 0; g < (grp ? 16 : 1); g++) zap__hlens_l(f[g], len[g], L);
     free(f);
 }
-/* a stream: raw, or Huffman when that saves >= 1% (plain: 8 parts L11; grp: contextual 16 groups, 8 parts, L) */
+/* a stream: raw, or Huffman when that saves >= 1% (plain: 8 parts L11; grp: contextual 16 groups, 6 parts, L) */
 static inline uint8_t *zap__k_stream(uint8_t *op, uint8_t *oend, const uint8_t *s, size_t n, const uint8_t *grp, int L) {
     if (!op || oend - op < 5) return NULL;
     uint8_t *o = NULL;
@@ -1641,9 +1641,9 @@ static inline uint8_t *zap__k_stream(uint8_t *op, uint8_t *oend, const uint8_t *
     if (n >= 64 && (size_t)(oend - op) > 5 + 1 + 128 * (size_t)nt + 32) {
         uint8_t (*len)[256] = (uint8_t(*)[256])malloc(256 * (size_t)nt);
         if (len) {
-            zap__k_lens(s, n, 8, grp, grp ? L : 11, len);
+            zap__k_lens(s, n, grp ? 6 : 8, grp, grp ? L : 11, len);
             zap__k_head(op + 5, (const uint8_t(*)[256])len, nt);
-            o = zap__k_parts(op + 6 + 128 * nt, oend, s, n, 8, grp, (const uint8_t(*)[256])len);
+            o = zap__k_parts(op + 6 + 128 * nt, oend, s, n, grp ? 6 : 8, grp, (const uint8_t(*)[256])len);
             free(len);
         }
         if (o && (size_t)(o - op - 5) >= n - n / 100) o = NULL;
@@ -1784,15 +1784,15 @@ static inline int zap__k_tail(const uint8_t *s, size_t e, size_t b, uint8_t *o, 
         ZAP__KTAILS(6, CTX)                                                                                                \
     }
 ZAP__KDEC8(zap__k_p8, 0, 11)
-ZAP__KDEC8(zap__k_c8, 1, 11)
 ZAP__KDEC6(zap__k_c6, 1, 10)
+ZAP__KDEC6(zap__k_c6l, 1, 11)
 
 /* a whole stream (tokens, lengths, offset bytes): method from the header byte, tables into T */
 static inline int zap__k_dstream(int m, int L, const uint8_t *in, size_t sz, uint8_t *out, size_t cnt, const uint8_t *grp, uint16_t *T) {
     int nt = m == 2 ? 16 : 1;
     if ((m != 1 && m != 2) || L != 11 || !cnt || (m == 2 && !grp) || sz < 1 + 128 * (size_t)nt || in[0] != nt) return -1;
     if (zap__k_tables(in + 1, nt, m == 2 ? grp : NULL, L, T)) return -1;
-    return m == 2 ? zap__k_c8(in + 1 + 128 * nt, sz - 1 - 128 * nt, out, cnt, T) : zap__k_p8(in + 1 + 128 * nt, sz - 1 - 128 * nt, out, cnt, T);
+    return m == 2 ? zap__k_c6l(in + 1 + 128 * nt, sz - 1 - 128 * nt, out, cnt, T) : zap__k_p8(in + 1 + 128 * nt, sz - 1 - 128 * nt, out, cnt, T);
 }
 
 /* ---- literals per chunk: raw, plain (own table), or contextual (the block's 16 tables), whichever is smallest */
@@ -2160,9 +2160,12 @@ static inline ptrdiff_t zap__k_lz(const uint8_t *lits, size_t nl, const uint8_t 
                 op += ml + 4;
                 continue;
             slow:
-                if (ll == 15) { ll += zap__ext(&lnp, lne, &err); if (err) return -1; }
-                if (ll > (size_t)(le - lp) || ll > (size_t)(oend - op)) return -1;
-                memcpy(op, lp, ll); op += ll; lp += ll;
+                if (ll == 15) {
+                    ll += zap__ext(&lnp, lne, &err);
+                    if (err || ll > (size_t)(le - lp) || ll > (size_t)(oend - op)) return -1;
+                    memcpy(op, lp, ll);
+                } else zap__cp16(op, lp); /* < 15 literals: inside the batch budget */
+                op += ll; lp += ll;
                 if (ml == 15) { ml += zap__ext(&lnp, lne, &err); if (err) return -1; }
                 ml += 4;
                 if (off - 1 >= (size_t)(op - dst) || ml > (size_t)(oend - op)) return -1;
