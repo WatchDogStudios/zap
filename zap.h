@@ -302,13 +302,13 @@ static inline int zap__hc_all(zap_hc_state *s, const uint8_t *src, const uint8_t
 #ifndef ZAP__BT_NICE
 #define ZAP__BT_NICE 256
 #endif
-static inline int zap__bt(zap_hc_state *s, const uint8_t *src, size_t pos, const uint8_t *iend, int depth, int insert, size_t best,
-                          zap__match *m, int n) {
+static inline int zap__bt(zap_hc_state *s, uint32_t *heads, int hlog, const uint8_t *src, size_t pos, const uint8_t *iend, int depth,
+                          int insert, size_t best, zap__match *m, int n) {
     const size_t wmask = sizeof s->prev / sizeof s->prev[0] / 2 - 1;
     uint32_t *son = s->prev;
     const uint8_t *ip = src + pos;
     size_t avail = (size_t)(iend - ip), limit = avail < ZAP__BT_NICE ? avail : ZAP__BT_NICE, len0 = 0, len1 = 0;
-    uint32_t *head = &s->head[zap__hash(zap__r32(ip), ZAP_HC_HLOG)], dummy[2];
+    uint32_t *head = &heads[zap__hash(zap__r32(ip), hlog)], dummy[2];
     size_t cur = *head;
     uint32_t *p1 = insert ? son + 2 * (pos & wmask) : dummy, *p0 = p1 + 1;
     if (insert) *head = (uint32_t)pos;
@@ -338,13 +338,13 @@ static inline int zap__bt(zap_hc_state *s, const uint8_t *src, size_t pos, const
 static inline int zap__bt_all(zap_hc_state *s, const uint8_t *src, const uint8_t *ip, const uint8_t *iend, const zap_dict *d,
                               int depth, size_t *next, size_t rep, zap__match *m) {
     size_t pos = (size_t)(ip - src), best = 3;
-    for (size_t p = *next; p < pos; p++) zap__bt(s, src, p, iend, depth < 8 ? depth : 8, 1, 0, NULL, 0); /* skipped: shallow insert */
+    for (size_t p = *next; p < pos; p++) zap__bt(s, s->head, ZAP_HC_HLOG, src, p, iend, depth < 8 ? depth : 8, 1, 0, NULL, 0); /* skipped: shallow insert */
     int n = 0;
     if (rep && rep <= pos && zap__r32(ip - rep) == zap__r32(ip)) {
         best = 4 + zap__count(ip + 4, ip - rep + 4, iend);
         m[n].len = (uint32_t)best; m[n].off = (uint32_t)rep; n++;
     }
-    n = zap__bt(s, src, pos, iend, depth, pos >= *next, best, m, n);
+    n = zap__bt(s, s->head, ZAP_HC_HLOG, src, pos, iend, depth, pos >= *next, best, m, n);
     if (pos >= *next) *next = pos + 1;
     if (d) {
         size_t o, l = zap__dmatch(d, ip, src, iend, &o), b = n ? m[n - 1].len : 3;
@@ -2170,24 +2170,25 @@ static inline void zap__ma_insert(zap__arr *a, uint8_t *na, int K, const zap__ar
    a per-pass search couldn't: positions a window revisits, and those a long match skipped. */
 typedef struct { uint32_t *idx, *m; } zap__kmt;
 static inline void zap__kmt_free(zap__kmt *t) { free(t->idx); free(t->m); t->idx = t->m = NULL; }
+#define ZAP__K_HLOG 20 /* the table's tree roots: 4 MB of heads, fewer 4-byte values per tree than the hc state's (-25% time) */
 static inline int zap__kmt_build(zap__kmt *t, const uint8_t *src, size_t n, zap_hc_state *s, int depth) {
     const uint8_t *iend = src + n;
-    size_t limit = n >= 13 ? n - 12 : 0, cap = limit + limit / 2 + 64, cnt = 0, next = 0;
-    uint32_t *h3 = (uint32_t *)malloc(sizeof(uint32_t) << 16);
+    size_t limit = n >= 13 ? n - 12 : 0, cap = limit + limit / 2 + 64, cnt = 0;
+    uint32_t *h3 = (uint32_t *)malloc(sizeof(uint32_t) << 16), *heads = (uint32_t *)malloc(sizeof(uint32_t) << ZAP__K_HLOG);
     zap__match mm[ZAP__MAXC];
     t->idx = (uint32_t *)malloc(sizeof(uint32_t) * (limit + 1));
     t->m = (uint32_t *)malloc(sizeof(uint32_t) * cap);
-    if (!h3 || !t->idx || !t->m) { free(h3); zap__kmt_free(t); return -1; }
+    if (!h3 || !heads || !t->idx || !t->m) { free(h3); free(heads); zap__kmt_free(t); return -1; }
     memset(h3, 0xFF, sizeof(uint32_t) << 16);
-    memset(s->head, 0xFF, sizeof s->head);
+    memset(heads, 0xFF, sizeof(uint32_t) << ZAP__K_HLOG);
     for (size_t pos = 0; pos < limit; pos++) {
         uint32_t v = zap__r32(src + pos) & 0xFFFFFF, h = (v * 2654435761u) >> 16, c = h3[h];
-        if (pos + 16 < limit) { /* the tree walks are chains of cache misses: fetch the root 8 positions ahead (-10%) */
-            uint32_t r = s->head[zap__hash(zap__r32(src + pos + 8), ZAP_HC_HLOG)];
-            ZAP__PREFETCH(&s->head[zap__hash(zap__r32(src + pos + 16), ZAP_HC_HLOG)]);
+        if (pos + 16 < limit) { /* the tree walks are chains of cache misses: fetch the root 8 positions ahead */
+            uint32_t r = heads[zap__hash(zap__r32(src + pos + 8), ZAP__K_HLOG)];
+            ZAP__PREFETCH(&heads[zap__hash(zap__r32(src + pos + 16), ZAP__K_HLOG)]);
             if (r < pos) { ZAP__PREFETCH(s->prev + 2 * (r & (sizeof s->prev / sizeof s->prev[0] / 2 - 1))); ZAP__PREFETCH(src + r); }
         }
-        int nm = zap__bt_all(s, src, src + pos, iend, NULL, depth, &next, 0, mm);
+        int nm = zap__bt(s, heads, ZAP__K_HLOG, src, pos, iend, depth, 1, 3, mm, 0);
         h3[h] = (uint32_t)pos;
         t->idx[pos] = (uint32_t)cnt;
         if (cnt + (size_t)nm + 1 > cap) {
@@ -2199,7 +2200,7 @@ static inline int zap__kmt_build(zap__kmt *t, const uint8_t *src, size_t n, zap_
         for (int i = 0; i < nm; i++) t->m[cnt++] = mm[i].off << 8 | (mm[i].len - 3);
     }
     t->idx[limit] = (uint32_t)cnt;
-    free(h3);
+    free(h3); free(heads);
     return 0;
 }
 /* the first parse, only for the first pass's statistics: lazy over the table (the longest match of 4+ bytes, unless
