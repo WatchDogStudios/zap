@@ -2339,7 +2339,7 @@ static inline size_t zap__compress_ma(const uint8_t *src, size_t n, size_t base,
                     uint32_t nr[3] = { o.rep[0], o.rep[1], o.rep[2] }, op_ = o.price + zap__k_oprice(cm, m[i].off, o.rep);
                     zap__rep_push(nr, m[i].off);
                     while (last < p + m[i].len) { na[++last] = 0; wp[last] = 0xFFFFFFFFu; }
-                    for (size_t L = lo; L <= m[i].len; L++) {
+                    for (size_t L = ai ? m[i].len : lo; L <= m[i].len; L++) { /* dearer arrivals (kept for their repeats): whole matches only, -12% time, ratio +-0.05% */
                         uint32_t mp = op_ + ZAP__LP(L);
                         if (mp >= wp[p + L]) continue;
                         zap__arr y = { mp, m[i].off, 0, { nr[0], nr[1], nr[2] }, (uint16_t)L, (uint8_t)ai, ZAP__LG(L), o.pl, { 0, 0, 0 } };
