@@ -141,6 +141,10 @@ are multiples of 3 (the pixel) - invisible to byte-wise offset coding.
 | Offset scale per block: offsets divisible by S (the encoder's pick of 1..64) coded as off / S, the rest in their own symbol range | +0.34% (RGB block -4.9%) | 0 |
 | (both) | 3.329 | |
 | Matches found once per block into a table (every position in order, tree depth 128) instead of per pass; the first parse is lazy over the table. The per-pass search found nothing at positions a window revisits | 3.345 | 0 |
+| A 2^20-bucket 3-byte hash (2^16 lost 3-byte matches to collisions) | 3.347 | |
+| Forced long matches (256+) taken whole, and the cheapest path's long repeats too, not in 256-byte pieces | 3.348 | |
+| Literal chunk modes priced by decode time (Huffman must save ~1% over raw, contextual 0.5% more) | 3.349 | +2% |
+| Delta literals: a chunk may code literal - the byte at the last match's offset (Kraken's "sub" literals), with a second contextual table set; the parse prices literals by region as they'll be coded | 3.362 | -1.5% |
 
 Later: stack rows instead of per-part output pointers (MSVC spilled them), a table layout per ISA (length-low where
 shrx shifts by the entry, symbol-low without BMI2), BMI2 / LZCNT / SSSE3 code picked by CPUID in builds that don't
@@ -188,8 +192,21 @@ just outside the curve (0.93x at its ratio, -0.6% at its speed).
 - MSVC: the 6- and 8-part contextual decoders need ~20 live registers; MSVC keeps the table pointer, the index and the
   output pointers on the stack (literals 27 vs 18 Mticks, tokens 10 vs 6.6). A lower-pressure layout is the next step.
 - The copy loop: far sources and store-forwarding stalls (offsets 16-63: 10 ticks each in isolation).
-- Compression speed at the top: depth 64 (arrivals 4, 4, 4) is 3.344 at ~0.8 MB/s per thread, a quarter of Kraken
-  level 7's speed at its ratio; level 8 (3.357) is still ahead on ratio.
+- Compression speed at the top: depth 64 (arrivals 4, 4, 4) is 3.362 at ~0.8 MB/s per thread (Kraken level 8: 3.357
+  at 1.8 MB/s).
+- Decode: 0.88x Kraken level 6 on the pak sample, 0.78x on the mixed one. Kraken codes its commands as one symbol
+  (zap: token + offset symbol, and contextual tokens: 1.6% of the ratio), decodes literals plain or raw (zap mostly
+  contextual: 2.5 against 1.6 ticks a literal), and stores incompressible quanta; its parse trades ~0.7% of ratio
+  for decode speed (spaceSpeedTradeoffBytes 256; at 1 it reaches 3.385 on the pak sample, 22% slower).
+
+## A second sample: mixed game data
+
+The pak sample is DXT textures. A 32 MB mix of 4 MB pieces (a UE4 pak's BC7 textures, the game's executable, a
+terrain heightmap, a nav mesh, Lua text) told a different story before this round: zap 2.097 against Kraken level
+6's 2.135, and 0.58x its decode speed. Kraken stores near-incompressible 256 KB quanta raw (memcpy speed) where zap
+Huffman-coded literals for a 0.04% gain, codes every chunk of the heightmap, nav mesh and executable as delta
+literals, and zap cut long matches into 256-byte pieces. After the fixes above: 2.192 (Kraken 6: 2.135, 7: 2.172,
+8: 2.197), decode 0.78x (textures still ~3x slower than Kraken's stored quanta: the literals are copied twice).
 
 ## Compression speed
 
