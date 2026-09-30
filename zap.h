@@ -1882,7 +1882,10 @@ static inline size_t zap__k_bits(const uint8_t *s, size_t n, const uint8_t (*len
     for (size_t i = 0; i < n; i++) { unsigned g = grp && i % q ? grp[s[i - 1]] : 0; b += len[g][s[i]] ? len[g][s[i]] : 64; }
     return (size_t)((b + 7) / 8) + (size_t)W;
 }
-/* rawpct: a chunk stays raw unless Huffman saves more than this many percent (ZAP_FAST_DECODE: 4, for decode speed) */
+/* A chunk's mode pays for its decode time: plain Huffman (~1.6 ticks a literal) must save ~1% of the chunk over raw
+   (a memcpy), contextual (~2.5) another 0.5% over plain; about the exchange rate Kraken's parse settles on. On
+   near-incompressible literals (BC7 textures: Huffman saved 0.04%) that makes the chunks raw: ~10x faster decode.
+   rawpct: raw unless Huffman saves more than this many percent too (ZAP_FAST_DECODE: 4, for decode speed). */
 static inline uint8_t *zap__k_lits(uint8_t *op, uint8_t *oend, const uint8_t *lits, const size_t *cb, size_t nch, int rawpct) {
     uint8_t glit[256], *mode = (uint8_t *)malloc(nch + 1);
     uint32_t (*fq)[256] = (uint32_t(*)[256])malloc(sizeof(uint32_t) * 16 * 256);
@@ -1907,8 +1910,8 @@ static inline uint8_t *zap__k_lits(uint8_t *op, uint8_t *oend, const uint8_t *li
             uint8_t lp[1][256];
             for (size_t i = 0; i < n; i++) fp[s[i]]++;
             zap__hlens_l(fp, lp[0], 11);
-            size_t sr = n - n * (size_t)rawpct / 100, sp = n >= 64 ? zap__k_bits(s, n, (const uint8_t(*)[256])lp, NULL, 8) + 128 + 28 : (size_t)-1,
-                   sc = n >= 256 ? zap__k_bits(s, n, (const uint8_t(*)[256])lc, glit, 6) + 20 : (size_t)-1;
+            size_t sr = n - n * (size_t)rawpct / 100, sp = n >= 64 ? zap__k_bits(s, n, (const uint8_t(*)[256])lp, NULL, 8) + 128 + 28 + n / 100 : (size_t)-1,
+                   sc = n >= 256 ? zap__k_bits(s, n, (const uint8_t(*)[256])lc, glit, 6) + 20 + n * 3 / 200 : (size_t)-1;
             mode[c] = sc <= sp && sc < sr ? 2 : sp < sr ? 1 : 0;
             if (it == 2) gain += mode[c] == 2 ? (int64_t)(sp < sr ? sp : sr) - (int64_t)sc : 0;
         }
@@ -1919,7 +1922,7 @@ static inline uint8_t *zap__k_lits(uint8_t *op, uint8_t *oend, const uint8_t *li
         uint8_t lp[1][256];
         for (size_t i = 0; i < n; i++) fp[lits[cb[c] + i]]++;
         zap__hlens_l(fp, lp[0], 11);
-        mode[c] = zap__k_bits(lits + cb[c], n, (const uint8_t(*)[256])lp, NULL, 8) + 128 + 28 < n ? 1 : 0;
+        mode[c] = zap__k_bits(lits + cb[c], n, (const uint8_t(*)[256])lp, NULL, 8) + 128 + 28 + n / 100 < n ? 1 : 0;
     }
     o = op;
     if (gain > 16 * 128) { zap__k_head(o, (const uint8_t(*)[256])lc, 16); o += 1 + 16 * 128; }
@@ -2248,7 +2251,10 @@ static inline size_t zap__compress_ma(const uint8_t *src, size_t n, zap__kseq *o
             const uint32_t *me = mt->m + mt->idx[pos];
             int nm = (int)(mt->idx[pos + 1] - mt->idx[pos]); /* every match: arrivals differ in repeats */
             for (int i = 0; i < nm; i++) { m[i].len = (me[i] & 255) + 3; m[i].off = me[i] >> 8; if (m[i].len > n - pos) m[i].len = (uint32_t)(n - pos); } /* a table built for a longer span */
-            if (nm && m[nm - 1].len >= ZAP__SUFF) { fl = m[nm - 1].len; fo = m[nm - 1].off; break; } /* long match: just take it */
+            if (nm && m[nm - 1].len >= ZAP__SUFF) { /* long match: just take it, all of it (the table stops at 256) */
+                fo = m[nm - 1].off; fl = m[nm - 1].len + zap__count(src + pos + m[nm - 1].len, src + pos - fo + m[nm - 1].len, iend);
+                break;
+            }
             int cnt = na[p];
             for (int ai = 0; ai < cnt; ai++) {
                 zap__arr o = ZAP__A(p)[ai];
@@ -2266,7 +2272,7 @@ static inline size_t zap__compress_ma(const uint8_t *src, size_t n, zap__kseq *o
                     size_t ro = o.rep[r];
                     if (!ro || ro > pos || (r >= 1 && ro == o.rep[0]) || (r == 2 && ro == o.rep[1]) || ((zap__r32(src + pos - ro) ^ zap__r32(src + pos)) & 0xFFFFFF)) continue;
                     size_t rl = 3 + zap__count(src + pos + 3, src + pos - ro + 3, iend);
-                    if (rl >= ZAP__SUFF) rl = ZAP__SUFF - 1;
+                    if (rl >= ZAP__SUFF) { if (!ai) { fl = rl; fo = ro; goto window_end; } rl = ZAP__SUFF - 1; } /* the cheapest path's long repeat: take it */
                     uint32_t nr[3] = { o.rep[0], o.rep[1], o.rep[2] }, op_ = o.price + zap__k_oprice(cm, ro, o.rep);
                     zap__rep_push(nr, ro);
                     while (last < p + rl) { na[++last] = 0; wp[last] = 0xFFFFFFFFu; }
@@ -2293,6 +2299,7 @@ static inline size_t zap__compress_ma(const uint8_t *src, size_t n, zap__kseq *o
 #undef ZAP__LG
             }
         }
+    window_end:;
         size_t end = fl ? p : 0;
         if (!fl) for (size_t e = p < last ? p : last; e > 0; e--) if (na[e] && ZAP__A(e)[0].len) { end = e; break; }
         if (!end && !fl) { start += p ? p : 1; continue; } /* nothing matched: the literals carry into the next window */
