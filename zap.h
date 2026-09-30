@@ -9,9 +9,9 @@
  * Entropy mode (packaging: smaller files, Huffman-coded streams, blocks >= ~16KB):
  *   size_t    zap_compress_entropy  (src, n, dst, cap, state, depth, dict);   // state: zap_state (depth 0) or zap_hc_state
  *   ptrdiff_t zap_decompress_entropy(src, n, dst, raw_size, dict, scratch, scratch_cap); // scratch may be NULL (mallocs)
- *   depth >= 32 without a dict writes entropy v3, the Kraken tier (multi-arrival parse; ~1.5 MB/s per thread at
- *   depth 32, ~0.5 at 64; ~85 MB per 4 MB block); | ZAP_FAST_DECODE keeps literal chunks raw unless Huffman saves
- *   > 4% (~10% faster decode, ~0.6% larger). Blocks written by 1.x versions (v1, v2) still decode.
+ *   depth >= 32 without a dict writes entropy v3, the Kraken tier (multi-arrival parse; per thread ~4.5 MB/s at
+ *   depth 32, ~3 at 48, ~0.8 at 64; ~85 MB per 4 MB block); | ZAP_FAST_DECODE keeps literal chunks raw unless
+ *   Huffman saves > 4% (~10% faster decode, ~0.6% larger). Blocks written by 1.x versions (v1, v2) still decode.
  *
  * Frames (packaging: self-describing, independent blocks, parallel decode):
  *   zap_frame_compress(src, n, dst, cap, block_size, depth /0 = fast/ [| ZAP_ENTROPY or ZAP_TURBO], dict)
@@ -1972,7 +1972,8 @@ static inline int zap__k_dlits(const uint8_t *in, size_t sz, const uint8_t *chun
     return ip == ie && done == nl ? 0 : -1;
 }
 
-/* ---- encoder. A parse is a list of sequences: a literal run, then a match; the last one is literals only (ml 0). */
+/* ---- encoder. A parse is a list of sequences: a literal run, then a match; the last one is literals only (ml 0).
+   In a sampled parse (statistics only), offset 0 with ml > 0 is a gap: ml bytes not parsed. */
 typedef struct { uint32_t ll, ml, off; } zap__kseq;
 static inline unsigned zap__k_tok(size_t ll, size_t ml) { return (unsigned)((ll < 15 ? ll : 15) << 4 | (ml - 3 < 15 ? ml - 3 : 15)); }
 /* new offset -> offset symbol and the value it codes (v: near low byte, or the 3 far bytes), for the block's scale */
@@ -2005,6 +2006,7 @@ static inline unsigned zap__k_scale(const zap__kseq *q, size_t nq) {
     unsigned best = 1;
     if (!o || !h) { free(o); free(h); return 1; }
     for (size_t i = 0; i < nq && q[i].ml; i++) {
+        if (!q[i].off) { rep[0] = rep[1] = rep[2] = 0; continue; } /* a gap */
         int slot = zap__rep_slot(q[i].off, rep);
         if (slot >= 0) reps[slot]++; else o[no++] = q[i].off;
         zap__rep_push(rep, q[i].off);
@@ -2101,6 +2103,7 @@ static inline void zap__k_costs(const uint8_t *src, const zap__kseq *q, size_t n
         for (size_t k = 0; k < q[i].ll; k++) { f[16 + pl][src[pos + k]]++; pl = src[pos + k] >> 4; }
         pos += q[i].ll;
         if (!q[i].ml) break;
+        if (!q[i].off) { pos += q[i].ml; rep[0] = rep[1] = rep[2] = 0; continue; } /* a gap */
         size_t off = q[i].off, v;
         unsigned tok = zap__k_tok(q[i].ll, q[i].ml);
         f[pg][tok]++; pg = gt[tok];
@@ -2240,7 +2243,7 @@ static inline size_t zap__compress_ma(const uint8_t *src, size_t n, zap__kseq *o
             size_t pos = start + p;
             const uint32_t *me = mt->m + mt->idx[pos];
             int nm = (int)(mt->idx[pos + 1] - mt->idx[pos]); /* every match: arrivals differ in repeats */
-            for (int i = 0; i < nm; i++) { m[i].len = (me[i] & 255) + 3; m[i].off = me[i] >> 8; }
+            for (int i = 0; i < nm; i++) { m[i].len = (me[i] & 255) + 3; m[i].off = me[i] >> 8; if (m[i].len > n - pos) m[i].len = (uint32_t)(n - pos); } /* a table built for a longer span */
             if (nm && m[nm - 1].len >= ZAP__SUFF) { fl = m[nm - 1].len; fo = m[nm - 1].off; break; } /* long match: just take it */
             int cnt = na[p];
             for (int ai = 0; ai < cnt; ai++) {
@@ -2487,12 +2490,26 @@ out:
     return r;
 }
 
-/* the match table, a lazy parse over it, then optimal parses with K arrivals, each priced from the previous parse.
-   Arrivals per pass: depth 32-63: 1, 2; 64-127: 4, 4, 4; 128+: 4, 8, 8. The table's search depth is 128 or more
-   (deeper finds more, at about the same speed). */
+/* The first pass is only there for its statistics: every other 64 KB is enough (-0.03%, half the work). The
+   segments' parses are joined by gaps. */
+#define ZAP__K_SEG (64u << 10)
+static inline size_t zap__k_sampled(const uint8_t *src, size_t n, zap__kseq *out, const zap__kmt *mt, const zap__kc *cm, int K) {
+    size_t nq = 0, at = 0;
+    do { /* at least one segment, even an empty one */
+        size_t sl = n - at < ZAP__K_SEG ? n - at : ZAP__K_SEG, gap = n - at - sl < ZAP__K_SEG ? n - at - sl : ZAP__K_SEG, k;
+        zap__kmt v = { mt->idx + at, mt->m }; /* the table from here on */
+        if (!(k = zap__compress_ma(src + at, sl, out + nq, &v, cm, K))) return 0;
+        nq += k;
+        out[nq - 1].ml = (uint32_t)gap; /* the segment's trailing literals, then the skipped one (none: the end) */
+    } while ((at += 2 * ZAP__K_SEG) < n);
+    return nq;
+}
+/* the match table, a lazy parse over it, then optimal parses with K arrivals, each priced from the previous parse
+   (the first one sampled). Arrivals per pass: depth 32-47: 1, 1; 48-63: 1, 2; 64-127: 4, 4, 4; 128+: 4, 8, 8. The
+   table's search depth is 128 or more (deeper finds more, at about the same speed). */
 static inline size_t zap__k_compress(const uint8_t *src, size_t n, uint8_t *dst, size_t cap, zap_hc_state *hc, int depth, int rawpct) {
-    static const uint8_t sched[3][4] = { { 1, 2 }, { 4, 4, 4 }, { 4, 8, 8 } };
-    int lv = depth >= 128 ? 2 : depth >= 64 ? 1 : 0;
+    static const uint8_t sched[4][4] = { { 1, 1 }, { 1, 2 }, { 4, 4, 4 }, { 4, 8, 8 } };
+    int lv = depth >= 128 ? 3 : depth >= 64 ? 2 : depth >= 48 ? 1 : 0;
     size_t r = 0, nq = 0;
     zap__kseq *q = (zap__kseq *)malloc(sizeof(zap__kseq) * (n / 3 + 2));
     zap__kc *cm = (zap__kc *)malloc(sizeof *cm);
@@ -2501,7 +2518,7 @@ static inline size_t zap__k_compress(const uint8_t *src, size_t n, uint8_t *dst,
         nq = zap__k_lazy(n, &mt, q);
         for (int pass = 0; nq && pass < 4 && sched[lv][pass]; pass++) {
             zap__k_costs(src, q, nq, zap__k_scale(q, nq), cm, 24); /* sequence penalty 1.5 bits: fewer, longer sequences; ratio-neutral */
-            nq = zap__compress_ma(src, n, q, &mt, cm, sched[lv][pass]);
+            nq = pass ? zap__compress_ma(src, n, q, &mt, cm, sched[lv][pass]) : zap__k_sampled(src, n, q, &mt, cm, sched[lv][pass]);
         }
         if (nq) r = zap__k_encode(src, q, nq, zap__k_scale(q, nq), n, dst, cap, rawpct);
     }

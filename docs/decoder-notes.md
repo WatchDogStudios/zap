@@ -188,6 +188,33 @@ just outside the curve (0.93x at its ratio, -0.6% at its speed).
 - MSVC: the 6- and 8-part contextual decoders need ~20 live registers; MSVC keeps the table pointer, the index and the
   output pointers on the stack (literals 27 vs 18 Mticks, tokens 10 vs 6.6). A lower-pressure layout is the next step.
 - The copy loop: far sources and store-forwarding stalls (offsets 16-63: 10 ticks each in isolation).
-- Compression speed (one thread, same process and load): depth 32 (arrivals 1, 2) 3.328 at 0.51x Kraken level 6's
-  speed; depth 64 (4, 4, 4) 3.345 at 0.22x level 7's. The table build is ~35% of depth 32; the rest is pricing every
-  length for every arrival.
+- Compression speed at the top: depth 64 (arrivals 4, 4, 4) is 3.344 at ~0.8 MB/s per thread, a quarter of Kraken
+  level 7's speed at its ratio; level 8 (3.357) is still ahead on ratio.
+
+## Compression speed
+
+One thread, same process, best of interleaved rounds (MB/s, game pak sample):
+
+| | ratio | MB/s |
+|---|---|---|
+| Kraken level 5 | 3.222 | 7.18 |
+| Kraken level 6 | 3.300 | 4.54 |
+| zap depth 32 (arrivals 1, 1) | 3.313 | 4.66 |
+| zap depth 48 (1, 2) | 3.327 | 3.28 |
+| Kraken level 7 | 3.342 | 3.46 |
+| zap depth 64 (4, 4, 4) | 3.344 | ~0.8 |
+| Kraken level 8 | 3.357 | 1.79 |
+
+What got it there (from ~0.5 MB/s at depth 64):
+- Matches found once per block into a table instead of once per pass. The tree walks are chains of cache misses
+  (7 steps per position on average, 16 on the RGB block); walk length barely depends on the depth limit, so the
+  table searches at depth 128 for the same time as 32.
+- The table's own 2^20 tree roots instead of the hc state's 2^17: shorter walks, 10-25% faster build.
+- The first pass exists for its statistics only: it's a lazy parse over the table, then one sampled pass (every
+  other 64 KB, -0.03%). The old first parse (a byte-priced optimal parse) was both slower and a worse seed.
+- The length loops: token prices looked up once per arrival (a row by match length), the window extended once per
+  match, an early exit on the repeat loop too, single-arrival inserts without the repeat-state check: -20% per pass.
+
+Tried: hash chains for the table (worse ratio, and quadratic on long runs); lower tree "nice" lengths (walks end on
+depth or leaves, not length); only the cheapest arrival trying new offsets (-0.4%); matches at interior lengths of
+long matches skipped (-0.1%); a copy of the parse per arrival count (noise).
