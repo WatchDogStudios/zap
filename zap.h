@@ -2239,7 +2239,7 @@ static inline size_t zap__compress_ma(const uint8_t *src, size_t n, zap__kseq *o
 #define ZAP__G(l, L) gtk[zap__k_tok(l, L)]
     while (start < limit) {
         size_t last = 0, p, fl = 0, fo = 0;
-        zap__arr a0 = { 0, 0, (uint32_t)(start - anchor), { reps[0], reps[1], reps[2] }, 0, 0, (uint8_t)lastpg, start ? (uint8_t)(src[start - 1] >> 4) : 0, { 0, 0, 0 } };
+        zap__arr a0 = { 0, 0, (uint32_t)(start - anchor), { reps[0], reps[1], reps[2] }, 0, 0, (uint8_t)lastpg, (uint8_t)(start ? src[start - 1] >> 4 : 0), { 0, 0, 0 } };
         na[0] = 1; ZAP__A(0)[0] = a0; wp[0] = K == 1 ? 0 : 0xFFFFFFFFu;
         for (p = 0; p <= last && p < ZAP__OPTN && start + p < limit; p++) {
             if (!na[p]) continue;
