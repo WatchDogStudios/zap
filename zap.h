@@ -2596,6 +2596,36 @@ out:
     return r;
 }
 
+/* Regions (128 KB of output) where the parse's matches save under 1% of the region, against storing its bytes, are
+   stored: their matches become literals (which then stay raw). Near-random data (BC7 textures) otherwise keeps
+   hundreds of barely-paying 3-byte matches per region, each a sequence to decode (~20 ticks) where a memcpy would
+   do; Kraken stores such quanta. Returns the new sequence count. */
+static inline size_t zap__k_store(zap__kseq *q, size_t nq, const zap__kc *cm) {
+    size_t n = 0, nr, w = 0, carry = 0;
+    for (size_t i = 0; i < nq; i++) n += q[i].ll + q[i].ml;
+    nr = n / ZAP__K_CHUNK + 1;
+    int64_t *save = (int64_t *)calloc(nr, sizeof *save); /* 1/16 bits */
+    uint8_t gt[256];
+    if (!save) return nq;
+    zap__grp_tok(gt);
+    uint32_t rep[3] = { 0, 0, 0 };
+    unsigned pg = 0;
+    for (size_t i = 0, pos = 0; i < nq && q[i].ml; i++) {
+        pos += q[i].ll;
+        save[pos / ZAP__K_CHUNK] += 128 * (int64_t)q[i].ml - (int64_t)zap__k_lprice(cm, q[i].ml, q[i].ll, pg) - (int64_t)zap__k_oprice(cm, q[i].off, rep);
+        pg = gt[zap__k_tok(q[i].ll, q[i].ml)];
+        zap__rep_push(rep, q[i].off);
+        pos += q[i].ml;
+    }
+    for (size_t i = 0, pos = 0; i < nq; i++) {
+        size_t at = pos + q[i].ll;
+        pos = at + q[i].ml;
+        if (q[i].ml && save[at / ZAP__K_CHUNK] < (int64_t)ZAP__K_CHUNK * 128 / 100) { carry += q[i].ll + q[i].ml; continue; } /* 8 bits a byte: 1% */
+        q[w] = q[i]; q[w].ll += (uint32_t)carry; carry = 0; w++;
+    }
+    free(save);
+    return w;
+}
 /* The first pass is only there for its statistics: every other 64 KB is enough (-0.03%, half the work). The
    segments' parses are joined by gaps. */
 #define ZAP__K_SEG (64u << 10)
@@ -2627,6 +2657,7 @@ static inline size_t zap__k_compress(const uint8_t *src, size_t n, uint8_t *dst,
             zap__k_costs(src, q, nq, zap__k_scale(q, nq), cm, 24); /* sequence penalty 1.5 bits: fewer, longer sequences; ratio-neutral */
             nq = pass ? zap__compress_ma(src, n, 0, q, &mt, cm, sched[lv][pass]) : zap__k_sampled(src, n, q, &mt, cm, sched[lv][pass]);
         }
+        if (nq) nq = zap__k_store(q, nq, cm);
         if (nq) r = zap__k_encode(src, q, nq, zap__k_scale(q, nq), n, dst, cap, rawpct);
     }
     zap__kmt_free(&mt); free(q);
