@@ -116,6 +116,14 @@ fewer new offsets. The parse, not the entropy coder.
 On synthetic data (matches at L1/L2 distances, random literals) zap's decoder is 12-14% faster than Kraken's; the gap on
 real data is contextual coding and data effects.
 
+Kraken's levels on the sample (4 MB blocks, one thread): 5: 3.222 at 5.8 MB/s, 6: 3.300 at 3.5 MB/s, 7: 3.342 at
+2.9 MB/s, 8: 3.357 at 1.6 MB/s; all decode at 1.5-1.8 GB/s. Level 8 against 6, by the same header walk: the same
+5.97M literals but 178 KB fewer literal bytes (split "multi-array" streams in 51 literal chunks against 13, more delta
+literals), slightly more commands. Its option minMatchLen is 3 at level 8; forcing 4 costs it 1.0% on a mixed DXT
+block and 2.9% on a grey RGB image block. spaceSpeedTradeoffBytes (256) costs it ~0.7%. Per block, zap was 3.5% ahead
+of level 6 on one DXT5 texture and 3-4% behind on mixed DXT1/DXT5 blocks and the RGB block, where 96% of new offsets
+are multiples of 3 (the pixel) - invisible to byte-wise offset coding.
+
 ## What helped
 
 | Step | Ratio | Speed vs Kraken (clang) |
@@ -129,6 +137,9 @@ real data is contextual coding and data effects.
 | Literals per 128 KB chunk: raw, plain (own table) or contextual (the block's tables), smallest wins | +0.24% | |
 | Parse penalty (2 bits) on offsets past 256 KB | +0.0% | +1.4% |
 | Offsets < 16 as a pshufb pattern (two stores), not a byte loop | | +1-2% |
+| 3-byte matches: token match nibble counts from 3; the parse tries the nearest earlier 3 bytes (3-byte hash) below 256 KB, repeat matches from 3 bytes | +0.33% | 0 |
+| Offset scale per block: offsets divisible by S (the encoder's pick of 1..64) coded as off / S, the rest in their own symbol range | +0.34% (RGB block -4.9%) | 0 |
+| (both) | 3.329 | |
 
 Later: stack rows instead of per-part output pointers (MSVC spilled them), a table layout per ISA (length-low where
 shrx shifts by the entry, symbol-low without BMI2), BMI2 / LZCNT / SSSE3 code picked by CPUID in builds that don't
@@ -162,6 +173,14 @@ just outside the curve (0.93x at its ratio, -0.6% at its speed).
   (smaller tables): 4 groups decode 15% faster but give up 60% of the gain.
 - A Kraken-like command byte (literals 0-3, match nibble, offset kind): 7% larger than token + offset symbol on zap's parse.
 - Larger per-sequence parse penalties (fewer, longer sequences): no measurable speed, slow ratio loss.
+- Repeat matches of 2-3 bytes with the match nibble counting from 2 for repeats: -0.26% (the token alphabet mixes two
+  meanings; short repeats are rare here).
+- Delta ("sub") literals against the byte at the last offset, per 128 KB chunk: on zap's parse ~0 (4 KB); against a
+  fixed stride (3, 4, 8, 16) ~0.2%, most of it one mixed DXT block.
+- Order-0 literal tables switched per segment (k-means, 4-32 tables): 1% larger than the 16 contextual tables.
+- Stream tables per region instead of per 4 MB block: +0.15% at 1 MB regions (+2.3% on the mixed block), lost on the
+  others to table costs.
+- Extreme parse effort (16 arrivals, 6 passes, 4x match depth) on a mixed DXT block: -0.26%. The parse isn't the gap.
 
 ## What's left
 
