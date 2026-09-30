@@ -2641,10 +2641,11 @@ static inline size_t zap__k_sampled(const uint8_t *src, size_t n, zap__kseq *out
     return nq;
 }
 /* the match table, a lazy parse over it, then optimal parses with K arrivals, each priced from the previous parse
-   (the first one sampled). Arrivals per pass: depth 32-47: 1, 1; 48-63: 1, 2; 64-127: 4, 4, 4; 128+: 4, 8, 8. The
-   table's search depth is 128 or more (deeper finds more, at about the same speed). */
+   (the first one sampled). Arrivals per pass: depth 32-47: 1, 1; 48-63: 1, 2; 64-127: 1, 2, 2, 4; 128+: 1, 2, 4, 8
+   (more passes pay more than more arrivals: 1, 2, 2, 4 beats 4, 4, 4 at less work). The table's search depth is 128
+   or more (deeper finds more, at about the same speed). */
 static inline size_t zap__k_compress(const uint8_t *src, size_t n, uint8_t *dst, size_t cap, zap_hc_state *hc, int depth, int rawpct) {
-    static const uint8_t sched[4][4] = { { 1, 1 }, { 1, 2 }, { 4, 4, 4 }, { 4, 8, 8 } };
+    static const uint8_t sched[4][4] = { { 1, 1 }, { 1, 2 }, { 1, 2, 2, 4 }, { 1, 2, 4, 8 } };
     int lv = depth >= 128 ? 3 : depth >= 64 ? 2 : depth >= 48 ? 1 : 0;
     size_t r = 0, nq = 0;
     zap__kseq *q = (zap__kseq *)malloc(sizeof(zap__kseq) * (n / 3 + 2));
