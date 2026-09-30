@@ -140,6 +140,7 @@ are multiples of 3 (the pixel) - invisible to byte-wise offset coding.
 | 3-byte matches: token match nibble counts from 3; the parse tries the nearest earlier 3 bytes (3-byte hash) below 256 KB, repeat matches from 3 bytes | +0.33% | 0 |
 | Offset scale per block: offsets divisible by S (the encoder's pick of 1..64) coded as off / S, the rest in their own symbol range | +0.34% (RGB block -4.9%) | 0 |
 | (both) | 3.329 | |
+| Matches found once per block into a table (every position in order, tree depth 128) instead of per pass; the first parse is lazy over the table. The per-pass search found nothing at positions a window revisits | 3.345 | 0 |
 
 Later: stack rows instead of per-part output pointers (MSVC spilled them), a table layout per ISA (length-low where
 shrx shifts by the entry, symbol-low without BMI2), BMI2 / LZCNT / SSSE3 code picked by CPUID in builds that don't
@@ -187,5 +188,6 @@ just outside the curve (0.93x at its ratio, -0.6% at its speed).
 - MSVC: the 6- and 8-part contextual decoders need ~20 live registers; MSVC keeps the table pointer, the index and the
   output pointers on the stack (literals 27 vs 18 Mticks, tokens 10 vs 6.6). A lower-pressure layout is the next step.
 - The copy loop: far sources and store-forwarding stalls (offsets 16-63: 10 ticks each in isolation).
-- Compression speed: each 4-arrival pass costs ~2 s per 4 MB block (match finding plus pricing every length for every
-  arrival); ~0.5 MB/s per thread against Kraken's 4.
+- Compression speed (one thread, same process and load): depth 32 (arrivals 1, 2) 3.328 at 0.51x Kraken level 6's
+  speed; depth 64 (4, 4, 4) 3.345 at 0.22x level 7's. The table build is ~35% of depth 32; the rest is pricing every
+  length for every arrival.
