@@ -2141,6 +2141,7 @@ static inline uint32_t zap__k_lprice(const zap__kc *c, size_t len, size_t lit, u
 typedef struct { uint32_t price, len, off, lit, rep[3], from, pg, pl; } zap__arr;
 static inline void zap__ma_insert(zap__arr *a, uint8_t *na, int K, const zap__arr *x) {
     int n = *na;
+    if (K == 1) { if (!n || x->price < a[0].price) { a[0] = *x; *na = 1; } return; }
     for (int i = 0; i < n; i++)
         if (a[i].rep[0] == x->rep[0] && a[i].rep[1] == x->rep[1] && a[i].rep[2] == x->rep[2]) {
             if (x->price >= a[i].price) return;
@@ -2156,6 +2157,13 @@ static inline void zap__ma_insert(zap__arr *a, uint8_t *na, int K, const zap__ar
     *na = (uint8_t)n;
 }
 #define ZAP__K_H3LIM (1u << 18) /* 3-byte matches: offsets below this (farther ones don't pay for their offset) */
+#if defined(__GNUC__) || defined(__clang__)
+#define ZAP__PREFETCH(p) __builtin_prefetch(p)
+#elif defined(_MSC_VER) && ZAP__X86
+#define ZAP__PREFETCH(p) _mm_prefetch((const char *)(p), _MM_HINT_T0)
+#else
+#define ZAP__PREFETCH(p) ((void)(p))
+#endif
 /* The block's matches, found once for every pass: per position the binary tree's list (strictly increasing lengths),
    led by the nearest earlier 3 bytes when there are some (a 3-byte hash; a collision just misses one). Entries are
    offset << 8 | (length - 3); ~12 bytes per input byte. Searching every position in order also finds matches where
@@ -2174,6 +2182,11 @@ static inline int zap__kmt_build(zap__kmt *t, const uint8_t *src, size_t n, zap_
     memset(s->head, 0xFF, sizeof s->head);
     for (size_t pos = 0; pos < limit; pos++) {
         uint32_t v = zap__r32(src + pos) & 0xFFFFFF, h = (v * 2654435761u) >> 16, c = h3[h];
+        if (pos + 16 < limit) { /* the tree walks are chains of cache misses: fetch the root 8 positions ahead (-10%) */
+            uint32_t r = s->head[zap__hash(zap__r32(src + pos + 8), ZAP_HC_HLOG)];
+            ZAP__PREFETCH(&s->head[zap__hash(zap__r32(src + pos + 16), ZAP_HC_HLOG)]);
+            if (r < pos) { ZAP__PREFETCH(s->prev + 2 * (r & (sizeof s->prev / sizeof s->prev[0] / 2 - 1))); ZAP__PREFETCH(src + r); }
+        }
         int nm = zap__bt_all(s, src, src + pos, iend, NULL, depth, &next, 0, mm);
         h3[h] = (uint32_t)pos;
         t->idx[pos] = (uint32_t)cnt;
@@ -2231,6 +2244,11 @@ static inline size_t zap__compress_ma(const uint8_t *src, size_t n, zap__kseq *o
             int cnt = na[p];
             for (int ai = 0; ai < cnt; ai++) {
                 zap__arr o = ZAP__A(p)[ai];
+                size_t lt = (o.lit < 15 ? o.lit : 15) << 4;
+                const uint32_t *tr = cm->tok[o.pg] + lt; /* this arrival's token prices by match length, and groups */
+                const uint8_t *gr = gtk + lt;
+#define ZAP__LP(L) (cm->seq + ((L) < 18 ? tr[(L) - 3] : tr[15] + zap__ext_bytes((L) - 3) * cm->lenb))
+#define ZAP__LG(L) gr[(L) < 18 ? (L) - 3 : 15]
                 if (p + 1 > last) { na[p + 1] = 0; last = p + 1; }
                 zap__arr x = o;
                 x.price = o.price + cm->lit[o.pl][src[pos]] + (zap__ext_bytes(o.lit + 1) - zap__ext_bytes(o.lit)) * cm->lenb;
@@ -2243,11 +2261,11 @@ static inline size_t zap__compress_ma(const uint8_t *src, size_t n, zap__kseq *o
                     if (rl >= ZAP__SUFF) rl = ZAP__SUFF - 1;
                     uint32_t nr[3] = { o.rep[0], o.rep[1], o.rep[2] }, op_ = o.price + zap__k_oprice(cm, ro, o.rep);
                     zap__rep_push(nr, ro);
+                    while (last < p + rl) na[++last] = 0;
                     for (size_t L = 3; L <= rl; L++) {
-                        while (last < p + L) na[++last] = 0;
-                        uint32_t rp = op_ + zap__k_lprice(cm, L, o.lit, o.pg);
+                        uint32_t rp = op_ + ZAP__LP(L);
                         if (na[p + L] == K && rp >= ZAP__A(p + L)[K - 1].price) continue; /* can't place (the insert would say so too) */
-                        zap__arr y = { rp, (uint32_t)L, (uint32_t)ro, 0, { nr[0], nr[1], nr[2] }, (uint32_t)ai, ZAP__G(o.lit, L), o.pl };
+                        zap__arr y = { rp, (uint32_t)L, (uint32_t)ro, 0, { nr[0], nr[1], nr[2] }, (uint32_t)ai, ZAP__LG(L), o.pl };
                         zap__ma_insert(ZAP__A(p + L), &na[p + L], K, &y);
                     }
                 }
@@ -2255,15 +2273,17 @@ static inline size_t zap__compress_ma(const uint8_t *src, size_t n, zap__kseq *o
                     size_t lo = i ? m[i - 1].len + 1 : m[0].len < 4 ? 3 : 4;
                     uint32_t nr[3] = { o.rep[0], o.rep[1], o.rep[2] }, op_ = o.price + zap__k_oprice(cm, m[i].off, o.rep);
                     zap__rep_push(nr, m[i].off);
+                    while (last < p + m[i].len) na[++last] = 0;
                     for (size_t L = lo; L <= m[i].len; L++) {
-                        while (last < p + L) na[++last] = 0;
-                        uint32_t mp = op_ + zap__k_lprice(cm, L, o.lit, o.pg);
+                        uint32_t mp = op_ + ZAP__LP(L);
                         zap__arr *t = ZAP__A(p + L);
                         if (na[p + L] == K && mp >= t[K - 1].price) continue;
-                        zap__arr y = { mp, (uint32_t)L, m[i].off, 0, { nr[0], nr[1], nr[2] }, (uint32_t)ai, ZAP__G(o.lit, L), o.pl };
+                        zap__arr y = { mp, (uint32_t)L, m[i].off, 0, { nr[0], nr[1], nr[2] }, (uint32_t)ai, ZAP__LG(L), o.pl };
                         zap__ma_insert(t, &na[p + L], K, &y);
                     }
                 }
+#undef ZAP__LP
+#undef ZAP__LG
             }
         }
         size_t end = fl ? p : 0;
