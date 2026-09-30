@@ -2394,9 +2394,10 @@ static inline ptrdiff_t zap__k_lz(const uint8_t *lits, size_t nl, const uint8_t 
             for (; j < lim; j++) {
                 unsigned tok = tb[j];
                 size_t ll = tok >> 4, ml = tok & 15, off = O[j];
-                if (ll == 15 || ml == 15) goto slow;
+                if (ll == 15) goto slow;
                 zap__cp16(op, lp);
                 op += ll; lp += ll;
+                if (ml == 15) goto long_match;
                 if (off < 16 || off > (size_t)(op - dst)) goto slow_match;
                 zap__cp16(op, op - off); zap__cp16(op + 16, op - off + 16);
                 op += ml + 3;
@@ -2406,13 +2407,21 @@ static inline ptrdiff_t zap__k_lz(const uint8_t *lits, size_t nl, const uint8_t 
                 zap__k_short(op, off, ml + 3, oend, s3);
                 op += ml + 3;
                 continue;
+            long_match: /* 18..272 bytes from 16+ back, with room for the overcopy: 16-byte steps, the batch trimmed */
+                if (lnp < lne && *lnp < 255 && off >= 16 && off <= (size_t)(op - dst) && (size_t)(oend - op) >= 34 + (size_t)*lnp) {
+                    uint8_t *d = op, *e = op + 18 + *lnp++;
+                    do { zap__cp16(d, d - off); d += 16; } while (d < e);
+                    op = e;
+                    if (lim - j - 1 > (size_t)(oend - op) >> 6) lim = j + 1 + ((size_t)(oend - op) >> 6); /* the rest still fits */
+                    continue;
+                }
+                goto slow_len;
             slow:
-                if (ll == 15) {
-                    ll += zap__ext(&lnp, lne, &err);
-                    if (err || ll > (size_t)(le - lp) || ll > (size_t)(oend - op)) return -1;
-                    memcpy(op, lp, ll);
-                } else zap__cp16(op, lp); /* < 15 literals: inside the batch budget */
+                ll += zap__ext(&lnp, lne, &err);
+                if (err || ll > (size_t)(le - lp) || ll > (size_t)(oend - op)) return -1;
+                memcpy(op, lp, ll);
                 op += ll; lp += ll;
+            slow_len:
                 if (ml == 15) { ml += zap__ext(&lnp, lne, &err); if (err) return -1; }
                 ml += 3;
                 if (off - 1 >= (size_t)(op - dst) || ml > (size_t)(oend - op)) return -1;
