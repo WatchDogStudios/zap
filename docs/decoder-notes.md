@@ -219,8 +219,14 @@ One thread, same process, best of interleaved rounds (MB/s, game pak sample):
 | zap depth 32 (arrivals 1, 1) | 3.313 | 4.66 |
 | zap depth 48 (1, 2) | 3.327 | 3.28 |
 | Kraken level 7 | 3.342 | 3.46 |
-| zap depth 64 (4, 4, 4) | 3.344 | ~0.8 |
+| zap depth 64 (1, 2, 2, 4) | 3.366 | ~1.0 |
 | Kraken level 8 | 3.357 | 1.79 |
+| zap depth 128 (1, 2, 4, 8) | 3.372 | ~0.5 |
+
+(Ratios after delta literals and the schedules below; the speeds of depth 32 and 48 are from before delta literals,
+which cost the parse ~5%.) Arrivals per pass, ratio on the pak sample / the mixed sample: 1, 1: 3.324 / 2.150; 1, 2:
+3.343 / 2.172; 2, 2, 4: 3.361 / 2.192; 4, 4, 4: 3.362 / 2.194; 1, 2, 2, 4: 3.366 / 2.193; 4, 8, 8: 3.369 / 2.201;
+1, 2, 4, 8: 3.372 / 2.200. More passes pay more than more arrivals.
 
 What got it there (from ~0.5 MB/s at depth 64):
 - Matches found once per block into a table instead of once per pass. The tree walks are chains of cache misses

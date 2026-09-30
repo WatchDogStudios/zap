@@ -9,8 +9,8 @@
  * Entropy mode (packaging: smaller files, Huffman-coded streams, blocks >= ~16KB):
  *   size_t    zap_compress_entropy  (src, n, dst, cap, state, depth, dict);   // state: zap_state (depth 0) or zap_hc_state
  *   ptrdiff_t zap_decompress_entropy(src, n, dst, raw_size, dict, scratch, scratch_cap); // scratch may be NULL (mallocs)
- *   depth >= 32 without a dict writes entropy v3, the Kraken tier (multi-arrival parse; per thread ~4.5 MB/s at
- *   depth 32, ~3 at 48, ~0.8 at 64; ~85 MB per 4 MB block); | ZAP_FAST_DECODE keeps literal chunks raw unless
+ *   depth >= 32 without a dict writes entropy v3, the Kraken tier (multi-arrival parse; per thread ~4 MB/s at
+ *   depth 32, ~3 at 48, ~1 at 64, ~0.5 at 128; ~85 MB per 4 MB block); | ZAP_FAST_DECODE keeps literal chunks raw unless
  *   Huffman saves > 4% (~10% faster decode, ~0.6% larger). Blocks written by 1.x versions (v1, v2) still decode.
  *
  * Frames (packaging: self-describing, independent blocks, parallel decode):
