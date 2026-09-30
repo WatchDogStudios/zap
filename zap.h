@@ -2162,6 +2162,7 @@ static inline void zap__ma_insert(zap__arr *a, uint8_t *na, uint32_t *w, int K, 
     *w = n == K ? a[K - 1].price : 0xFFFFFFFFu;
 }
 #define ZAP__K_H3LIM (1u << 18) /* 3-byte matches: offsets below this (farther ones don't pay for their offset) */
+#define ZAP__K_H3LOG 20         /* their hash: 4 MB; 2^16 buckets lost 0.09% to collisions */
 #if defined(__GNUC__) || defined(__clang__)
 #define ZAP__PREFETCH(p) __builtin_prefetch(p)
 #elif defined(_MSC_VER) && ZAP__X86
@@ -2179,15 +2180,15 @@ static inline void zap__kmt_free(zap__kmt *t) { free(t->idx); free(t->m); t->idx
 static inline int zap__kmt_build(zap__kmt *t, const uint8_t *src, size_t n, zap_hc_state *s, int depth) {
     const uint8_t *iend = src + n;
     size_t limit = n >= 13 ? n - 12 : 0, cap = limit + limit / 2 + 64, cnt = 0;
-    uint32_t *h3 = (uint32_t *)malloc(sizeof(uint32_t) << 16), *heads = (uint32_t *)malloc(sizeof(uint32_t) << ZAP__K_HLOG);
+    uint32_t *h3 = (uint32_t *)malloc(sizeof(uint32_t) << ZAP__K_H3LOG), *heads = (uint32_t *)malloc(sizeof(uint32_t) << ZAP__K_HLOG);
     zap__match mm[ZAP__MAXC];
     t->idx = (uint32_t *)malloc(sizeof(uint32_t) * (limit + 1));
     t->m = (uint32_t *)malloc(sizeof(uint32_t) * cap);
     if (!h3 || !heads || !t->idx || !t->m) { free(h3); free(heads); zap__kmt_free(t); return -1; }
-    memset(h3, 0xFF, sizeof(uint32_t) << 16);
+    memset(h3, 0xFF, sizeof(uint32_t) << ZAP__K_H3LOG);
     memset(heads, 0xFF, sizeof(uint32_t) << ZAP__K_HLOG);
     for (size_t pos = 0; pos < limit; pos++) {
-        uint32_t v = zap__r32(src + pos) & 0xFFFFFF, h = (v * 2654435761u) >> 16, c = h3[h];
+        uint32_t v = zap__r32(src + pos) & 0xFFFFFF, h = (v * 2654435761u) >> (32 - ZAP__K_H3LOG), c = h3[h];
         if (pos + 16 < limit) { /* the tree walks are chains of cache misses: fetch the root 8 positions ahead */
             uint32_t r = heads[zap__hash(zap__r32(src + pos + 8), ZAP__K_HLOG)];
             ZAP__PREFETCH(&heads[zap__hash(zap__r32(src + pos + 16), ZAP__K_HLOG)]);
@@ -2198,7 +2199,7 @@ static inline int zap__kmt_build(zap__kmt *t, const uint8_t *src, size_t n, zap_
         t->idx[pos] = (uint32_t)cnt;
         if (cnt + (size_t)nm + 1 > cap) {
             uint32_t *g = (uint32_t *)realloc(t->m, sizeof(uint32_t) * (cap += cap / 2));
-            if (!g) { free(h3); zap__kmt_free(t); return -1; }
+            if (!g) { free(h3); free(heads); zap__kmt_free(t); return -1; }
             t->m = g;
         }
         if (c < pos && pos - c < ZAP__K_H3LIM && (zap__r32(src + c) & 0xFFFFFF) == v) t->m[cnt++] = (uint32_t)(pos - c) << 8;
