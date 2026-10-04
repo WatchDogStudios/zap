@@ -59,13 +59,13 @@ static void save(const char *path, const void *p, size_t n) {
 }
 
 static int usage(void) {
-    fprintf(stderr, "zap c [-e] [-x] [-l depth] [-b block_kb] [-t threads] [-D dict] in out\n"
+    fprintf(stderr, "zap c [-e | -T] [-x] [-l depth] [-b block_kb] [-t threads] [-D dict] in out\n"
                     "zap d [-t threads] [-D dict] in out\n"
                     "zap train [-s bytes] out samples...\n"
                     "zap tex [-f bc1|bc3|bc4|bc5|bc7|astc] [-r rdo] [-m] [-S] w h in.rgba out.dds|.astc\n"
                     "zap venc [-q quality] [-k keyint] [-F fps|num/den] [-t threads] [-C 601|709|601full|709full] w h in.yuv|- out.zapvid\n"
                     "zap vdec [-t threads] in.zapvid out.yuv|-|null\n"
-                    "zap pak [-e] [-x] [-l depth] [-b block_kb] [-t threads] out.zappak files/folders...\n"
+                    "zap pak [-e | -T] [-x] [-l depth] [-b block_kb] [-t threads] out.zappak files/folders...\n"
                     "zap unpak in.zappak outdir\n"
                     "zap ls file\n");
     return 1;
@@ -361,10 +361,10 @@ int main(int argc, char **argv) {
     uint32_t fps_num = 30, fps_den = 1;
     size_t bs = 4 << 20, dsize = 16384;
     float rdo = 0;
-    int entropy = 0, mips = 0, srgb = 0, fastdec = 0, color = -1;
+    int entropy = 0, turbo = 0, mips = 0, srgb = 0, fastdec = 0, color = -1;
     for (; i + 1 < argc && argv[i][0] == '-'; i += 2) {
-        if (argv[i][1] == 'e' || argv[i][1] == 'm' || argv[i][1] == 'S' || argv[i][1] == 'x') { /* flags without a value */
-            if (argv[i][1] == 'e') entropy = 1; else if (argv[i][1] == 'm') mips = 1; else if (argv[i][1] == 'x') fastdec = 1; else srgb = 1;
+        if (argv[i][1] == 'e' || argv[i][1] == 'm' || argv[i][1] == 'S' || argv[i][1] == 'x' || argv[i][1] == 'T') { /* flags without a value */
+            if (argv[i][1] == 'e') entropy = 1; else if (argv[i][1] == 'm') mips = 1; else if (argv[i][1] == 'x') fastdec = 1; else if (argv[i][1] == 'T') turbo = 1; else srgb = 1;
             i--; continue;
         }
         switch (argv[i][1]) {
@@ -395,7 +395,7 @@ int main(int argc, char **argv) {
         return i + 4 == argc ? venc(atoi(argv[i]), atoi(argv[i + 1]), quality, keyint, fps_num, fps_den, depth > 16 ? 16 : depth, threads, color, argv[i + 2], argv[i + 3]) : usage();
     if (!strcmp(mode, "vdec")) return i + 2 == argc ? vdec(argv[i], argv[i + 1], threads) : usage();
     if (!strcmp(mode, "pak"))
-        return i + 2 <= argc ? pak(argv[i], argv + i + 1, argc - i - 1, bs, depth | (entropy ? ZAP_ENTROPY : 0) | (fastdec ? ZAP_FAST_DECODE : 0), threads) : usage();
+        return i + 2 <= argc ? pak(argv[i], argv + i + 1, argc - i - 1, bs, depth | (turbo ? ZAP_TURBO : entropy ? ZAP_ENTROPY : 0) | (fastdec ? ZAP_FAST_DECODE : 0), threads) : usage();
     if (!strcmp(mode, "unpak")) return i + 2 == argc ? unpak(argv[i], argv[i + 1]) : usage();
     if (!strcmp(mode, "ls")) return i + 1 == argc ? ls(argv[i]) : usage();
 
@@ -424,7 +424,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "c")) {
         size_t cap = zap_frame_bound(n, bs ? bs : 1);
         uint8_t *out = malloc(cap);
-        size_t cn = out ? zap_frame_compress_mt(in, n, out, cap, bs, depth | (entropy ? ZAP_ENTROPY : 0) | (fastdec ? ZAP_FAST_DECODE : 0), d, threads) : 0;
+        size_t cn = out ? zap_frame_compress_mt(in, n, out, cap, bs, depth | (turbo ? ZAP_TURBO : entropy ? ZAP_ENTROPY : 0) | (fastdec ? ZAP_FAST_DECODE : 0), d, threads) : 0;
         if (!cn) { fprintf(stderr, "compress failed (bad block size or out of memory)\n"); return 1; }
         save(argv[i + 1], out, cn);
         printf("%zu -> %zu (%.3fx)\n", n, cn, (double)n / cn);

@@ -3019,7 +3019,7 @@ static inline size_t zap_dict_train(const void *samples_, size_t n, void *dict_,
     if (!freq || !pick) { free(freq); free(pick); return 0; }
 #define ZAP__HK(p) ((uint32_t)(((zap__r32(s + (p)) | ((uint64_t)zap__r32(s + (p) + 4) << 32)) * 0x9E3779B97F4A7C15ull) >> (64 - FLOG)))
     for (size_t p = 0; p + K <= n; p++) freq[ZAP__HK(p)]++;
-    size_t es = n / nseg < SEG ? SEG : n / nseg;
+    size_t es = n / nseg < SEG ? (size_t)SEG : n / nseg;
     /* ponytail: segments may straddle sample boundaries; split by sample if that hurts */
     for (size_t lo = 0; lo + SEG <= n && got < nseg; lo += es) {
         size_t hi = (lo + es < n ? lo + es : n) - SEG, best = lo;
