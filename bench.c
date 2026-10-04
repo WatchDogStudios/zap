@@ -43,7 +43,26 @@ static void e_roundtrip(const uint8_t *src, size_t n, const zap_dict *d, int dep
     free(c); free(o); free(scratch); free(f);
 }
 
+/* turbo blocks: round trip, exact-size checks, too-small cap, corrupt input (run the ASan build) */
+static void t_roundtrip(const uint8_t *src, size_t n, int depth) {
+    size_t cap = zap_bound(n) + 1024;
+    uint8_t *c = malloc(cap), *o = malloc(n + 1), *f = malloc(cap);
+    size_t cn = zap_compress_turbo(src, n, c, cap, hc, depth);
+    assert(cn > 0);
+    assert(zap_decompress_turbo(c, cn, o, n) == (ptrdiff_t)n && memcmp(src, o, n) == 0);
+    assert(zap_decompress_turbo(c, cn, o, n + 1) == -1);
+    if (n) assert(zap_decompress_turbo(c, cn, o, n - 1) == -1);
+    assert(zap_compress_turbo(src, n, c, cn - 1, hc, depth) == 0);
+    for (int i = 0; i < 300; i++) {
+        memcpy(f, c, cn);
+        for (int k = 1 + rand() % 3; k > 0; k--) f[rand() % cn] ^= (uint8_t)(1 + rand() % 255);
+        zap_decompress_turbo(f, cn - (i & 1) * (rand() % cn), o, i & 4 ? (size_t)rand() % (n + 1) : n);
+    }
+    free(c); free(o); free(f);
+}
+
 static size_t roundtrip(const uint8_t *src, size_t n, const zap_dict *d, int depth) {
+    if (!d) t_roundtrip(src, n, depth);
     e_roundtrip(src, n, d, depth);
     size_t cap = zap_bound(n);
     uint8_t *c = malloc(cap), *o = malloc(n + 1);
@@ -173,6 +192,170 @@ static void ctx_huffman_test(void) {
     free(s); free(c); free(o); free(f);
 }
 
+/* entropy v3 literal chunks: a table set built from other chunks may lack a symbol of this one; pricing must rule the
+   contextual mode out instead of charging a fixed cost (1.3-dev wrote blocks it couldn't decode that way) */
+static void k_lits_test(void) {
+    uint8_t len[16][256], s[64];
+    memset(len, 0, sizeof len);
+    for (int i = 0; i < 64; i++) { s[i] = (uint8_t)(i & 7); len[0][i & 7] = 3; }
+    assert(zap__k_bits(s, 64, (const uint8_t(*)[256])len, NULL, 8) == 24 + 8);
+    s[40] = 200;
+    assert(zap__k_bits(s, 64, (const uint8_t(*)[256])len, NULL, 8) == (size_t)-1);
+    /* chunks of three kinds (contextual-friendly, plain-friendly, near-random), each with stray bytes: every mode the
+       encoder picks must decode */
+    enum { NC = 12, CN = 6000 };
+    uint8_t *lits = malloc(NC * CN), *dls = malloc(NC * CN), *enc = malloc(2 * NC * CN + 65536), *out = malloc(NC * CN), dflag[NC], ch[4 * NC];
+    uint16_t *T = malloc(sizeof(uint16_t) * (3u << 15));
+    size_t cb[NC + 1];
+    uint32_t x = 99;
+    for (int round = 0; round < 40; round++) {
+        cb[0] = 0;
+        for (int c = 0; c < NC; c++) {
+            x = x * 1103515245u + 12345u;
+            size_t n = 300 + (x >> 8) % (CN - 300);
+            unsigned kind = (x >> 4) % 3, alpha = 2 + (x >> 12) % 60;
+            cb[c + 1] = cb[c] + n;
+            for (size_t i = cb[c]; i < cb[c + 1]; i++) {
+                x = x * 1103515245u + 12345u;
+                uint8_t p = i > cb[c] ? lits[i - 1] : 0, v = kind == 0 ? (uint8_t)((p >> 4) * 13 + (x >> 24) % alpha) : kind == 1 ? (uint8_t)(64 + (x >> 24) % alpha) : (uint8_t)(x >> 24);
+                if ((x >> 8) % 701 == 0) v = (uint8_t)(x >> 16);
+                lits[i] = v; dls[i] = (uint8_t)(v - (i >= 3 ? lits[i - 3] : 0));
+            }
+        }
+        uint8_t *e = zap__k_lits(enc, enc + 2 * NC * CN + 65536, lits, dls, cb, NC, round & 1 ? 4 : 0, dflag);
+        assert(e);
+        for (int c = 0; c < NC; c++) zap__w32(ch + 4 * c, (uint32_t)(cb[c + 1] - cb[c]) | (uint32_t)dflag[c] << 31);
+        assert(!zap__k_dlits(enc, (size_t)(e - enc), ch, NC, out, cb[NC], T, T + (2u << 14)));
+        for (int c = 0; c < NC; c++) assert(!memcmp(out + cb[c], (dflag[c] ? dls : lits) + cb[c], cb[c + 1] - cb[c]));
+    }
+    free(lits); free(dls); free(enc); free(out); free(T);
+}
+
+/* turbo table commands carry offsets >= 16 that reach only written output: hand-built blocks with offsets 0, 1 and 15
+   must fail (they used to decode, keeping whatever dst held), 16 must decode the same whatever dst held */
+static void turbo_offset_test(void) {
+    uint8_t b[256], o1[256], o2[256];
+    for (int off = 0; off <= 16; off++) {
+        size_t n = 0, lit = 2 * 16 + 40, raw = 2 * (16 + 32) + 40;
+        zap__w32(b, 2); zap__w32(b + 4, 2); zap__w32(b + 8, 0); b[12] = 1; /* 2 tokens, 2 offset bytes, 1 table entry */
+        unsigned w = 16 | 28 << 5 | 1 << 10;                              /* 16 literals, 32-byte match, 1 offset byte */
+        b[13] = (uint8_t)w; b[14] = (uint8_t)(w >> 8);
+        n = 15; b[n++] = 0; b[n++] = 0; b[n++] = (uint8_t)off; b[n++] = (uint8_t)off;
+        for (size_t i = 0; i < lit; i++) b[n++] = (uint8_t)(i * 7 + 1);
+        memset(o1, 0x11, sizeof o1); memset(o2, 0xEE, sizeof o2);
+        ptrdiff_t r1 = zap_decompress_turbo(b, n, o1, raw), r2 = zap_decompress_turbo(b, n, o2, raw);
+        if (off < 16) assert(r1 == -1 && r2 == -1);
+        else assert(r1 == (ptrdiff_t)raw && r2 == (ptrdiff_t)raw && !memcmp(o1, o2, raw));
+    }
+}
+
+/* scratch carries no alignment promise: v3 decodes with it offset by 1..15 bytes (UBSan checks the loads) */
+static void unaligned_scratch_test(void) {
+    enum { N = 100000 };
+    uint8_t *s = malloc(N), *c = malloc(zap_bound(N) + 4096), *o = malloc(N);
+    size_t sc = zap_entropy_scratch(N);
+    uint8_t *scr = malloc(sc + 16);
+    for (size_t i = 0; i < N; i++) s[i] = (uint8_t)(i % 4099 < 2000 ? i / 3 : (i * 2654435761u) >> 24); /* far and near offsets */
+    size_t cn = zap_compress_entropy(s, N, c, zap_bound(N) + 4096, hc, 32, NULL);
+    assert(cn && zap__r32(c) >> 30 == 3);
+    for (int k = 1; k < 16; k += 7) assert(zap_decompress_entropy(c, cn, o, N, NULL, scr + k, sc) == N && !memcmp(o, s, N));
+    free(s); free(c); free(o); free(scr);
+}
+
+/* x86 filter: round trips at every size and alignment (SSE2 and scalar paths), and frames pick it for code-like data */
+static void x86_filter_test(void) {
+    enum { N = 1 << 20 };
+    uint8_t *s = malloc(N), *t = malloc(N);
+    uint32_t x = 4242, fn[64];
+    for (int i = 0; i < 64; i++) { x = x * 1103515245u + 12345u; fn[i] = (x >> 8) % N; }
+    for (size_t i = 0; i < N;) { /* "code": filler instructions and calls / jumps to 64 functions */
+        x = x * 1103515245u + 12345u;
+        if (x >> 28 < 5 && i + 5 <= N) { int32_t rel = (int32_t)(fn[(x >> 16) & 63] - (uint32_t)(i + 5)); s[i] = (x >> 27) & 1 ? 0xE9 : 0xE8; zap__w32(s + i + 1, (uint32_t)rel); i += 5; }
+        else s[i++] = (uint8_t)((x >> 20) % 7 == 0 ? 0xE8 : x >> 13); /* stray E8s too */
+    }
+    for (size_t n = 0; n < 70; n++) for (size_t a = 0; a < 3; a++) { /* small sizes */
+        memcpy(t, s + a * 1000, n); zap_x86_filter(t, n, 1); zap_x86_filter(t, n, 0); assert(!memcmp(t, s + a * 1000, n));
+    }
+    memcpy(t, s, N);
+    assert(zap_x86_filter(t, N, 1) > 1000 && memcmp(t, s, N));
+    zap_x86_filter(t, N, 0);
+    assert(!memcmp(t, s, N));
+    for (int k = 0; k < 2; k++) { /* frames: filtered blocks (method bit 7) unless ZAP_NO_FILTER */
+        size_t cap = zap_frame_bound(N, 1 << 18), cn;
+        uint8_t *c = malloc(cap), *o = malloc(N);
+        cn = zap_frame_compress(s, N, c, cap, 1 << 18, 32 | ZAP_ENTROPY | (k ? ZAP_NO_FILTER : 0), NULL);
+        assert(cn && zap_frame_decode(c, cn, o, N, NULL) == N && !memcmp(o, s, N));
+        zap_frame f;
+        assert(zap_frame_open(&f, c, cn) == 0);
+        int filtered = 0;
+        for (size_t b = 0; b < f.nb; b++) filtered += (f.blocks + (b ? zap__r64le(f.table + 8 * (b - 1)) : 0))[0] >> 7;
+        assert(k ? filtered == 0 : filtered > 0);
+        free(c); free(o);
+    }
+    free(s); free(t);
+}
+
+/* v3 into too-small buffers: every cap below the block's size fails cleanly (each stream writer checks the last one) */
+static void small_cap_test(void) {
+    enum { N = 300000 };
+    uint8_t *s = malloc(N), *c = malloc(2 * N), *o = malloc(N);
+    uint32_t x = 5;
+    char words[512][9];
+    for (int w = 0; w < 512; w++) { x = x * 1103515245u + 12345u; int l = 3 + (int)(x >> 29); for (int k = 0; k < 8; k++) { x = x * 1103515245u + 12345u; words[w][k] = k < l ? (char)('a' + (x >> 27) % 26) : 0; } words[w][8] = 0; }
+    for (size_t i = 0; i < N;) { /* text of 512 words: LZ-compressible, many short sequences */
+        x = x * 1103515245u + 12345u;
+        for (const char *p = words[(x >> 16) & 511]; *p && i < N; p++) s[i++] = (uint8_t)*p;
+        if (i < N) s[i++] = ' ';
+    }
+    for (int d = 0; d < 2; d++) {
+        int depth = d ? 128 : 32;
+        size_t cn = zap_compress_entropy(s, N, c, 2 * N, hc, depth, NULL);
+        assert(cn && zap_decompress_entropy(c, cn, o, N, NULL, NULL, 0) == N && !memcmp(o, s, N));
+        for (size_t cap = 0; cap < cn; cap += cap < 64 ? (d ? 7 : 1) : cap / (d ? 3 : 8) + 1) assert(zap_compress_entropy(s, N, c, cap, hc, depth, NULL) == 0); /* depth 128: fewer (slow) */
+        assert(zap_compress_entropy(s, N, c, cn - 1, hc, depth, NULL) == 0);
+    }
+    free(s); free(c); free(o);
+}
+
+/* v3 command tokens (repeat index in the token, 2-byte repeat matches): data built from a repeat-heavy sequence
+   list, coded with both token kinds; round trips, exact sizes and corrupt input */
+static void cmd_tokens_test(void) {
+    enum { N = 1 << 20, MQ = N / 3 + 2 };
+    uint8_t *s = malloc(N), *c = malloc(2 * N + 65536), *o = malloc(N + 1), *f = malloc(2 * N + 65536);
+    zap__kseq *q = malloc(sizeof *q * MQ);
+    uint32_t x = 31337, rep[3] = { 1, 2, 3 };
+    size_t pos = 0, nq = 0;
+    while (pos < N - 600) {
+        x = x * 1103515245u + 12345u;
+        size_t ll = x >> 29 == 0 ? 20 + (x >> 20) % 300 : (x >> 26) & 3, ml = (x >> 24) & 3 ? 2 + (x >> 12) % 14 : 17 + (x >> 8) % 500;
+        for (size_t k = 0; k < ll; k++) { x = x * 1103515245u + 12345u; s[pos + k] = (uint8_t)(x >> 24); }
+        pos += ll;
+        size_t off = (x >> 18) % 4 < 3 ? rep[(x >> 16) % 3] : 16 + (x >> 4) % (pos > 70000 ? 70000 : pos - 16 > 16 ? pos - 16 : 16);
+        if (off > pos || off == 0) off = 1;
+        if (ml < 3 && zap__rep_slot(off, rep) < 0) ml = 3; /* 2-byte matches only as repeats */
+        for (size_t k = 0; k < ml; k++) s[pos + k] = s[pos + k - off];
+        q[nq].ll = (uint32_t)ll; q[nq].ml = (uint32_t)ml; q[nq].off = (uint32_t)off; nq++;
+        zap__rep_push(rep, off);
+        pos += ml;
+    }
+    q[nq].ll = (uint32_t)(N - pos); q[nq].ml = 0; q[nq].off = 0; nq++;
+    for (size_t k = pos; k < N; k++) s[k] = (uint8_t)k;
+    for (int cmd = 0; cmd < 2; cmd++) {
+        for (size_t i = 0; i + 1 < nq; i++) if (!cmd && q[i].ml < 3) goto next; /* plain tokens: matches from 3 */
+        size_t cn = zap__k_encode1(s, q, nq, 1, N, c, 2 * N + 65536, 0, cmd);
+        assert(cn && (c[23] >> 7) == cmd);
+        assert(zap_decompress_entropy(c, cn, o, N, NULL, NULL, 0) == N && !memcmp(o, s, N));
+        assert(zap_decompress_entropy(c, cn, o, N + 1, NULL, NULL, 0) == -1 && zap_decompress_entropy(c, cn, o, N - 1, NULL, NULL, 0) == -1);
+        for (int t = 0; t < 300; t++) {
+            memcpy(f, c, cn);
+            for (int k = 1 + rand() % 3; k > 0; k--) f[t < 100 ? (size_t)rand() % 64 : (size_t)rand() % cn] ^= (uint8_t)(1 + rand() % 255);
+            zap_decompress_entropy(f, cn - (t & 1) * (rand() % cn), o, N, NULL, NULL, 0);
+        }
+    next:;
+    }
+    free(s); free(c); free(o); free(f); free(q);
+}
+
 static void incompressible_test(void) {
     enum { N = 1 << 20 };
     uint8_t *src = malloc(N), *c = malloc(zap_bound(N) + 1024), *d = malloc(N);
@@ -246,8 +429,9 @@ static void selftest(void) {
     }
     /* frames: mixed compressible / raw blocks, odd tail; version 1 and version 2 (entropy) */
     for (size_t i = 0; i < N; i++) buf[i] = i < N / 2 ? (uint8_t)(i / 100 + (i % 7 == 0) * (i >> 9)) : (uint8_t)rand();
-    static const int depths[8] = { 0, 16, 32, 32 | ZAP_FAST_DECODE, ZAP_ENTROPY, 16 | ZAP_ENTROPY, 32 | ZAP_ENTROPY, 32 | ZAP_ENTROPY | ZAP_FAST_DECODE };
-    for (int di = 0; di < 8; di++) {
+    static const int depths[11] = { 0, 16, 32, 32 | ZAP_FAST_DECODE, ZAP_ENTROPY, 16 | ZAP_ENTROPY, 32 | ZAP_ENTROPY, 32 | ZAP_ENTROPY | ZAP_FAST_DECODE,
+                                    ZAP_TURBO, 16 | ZAP_TURBO, 32 | ZAP_TURBO };
+    for (int di = 0; di < 11; di++) {
         int depth = depths[di];
         size_t n = N - 123, cap = zap_frame_bound(n, 65536);
         uint8_t *c = malloc(cap), *o = malloc(n);
@@ -262,13 +446,19 @@ static void selftest(void) {
         assert(zap_frame_compress(buf, n, c2, cap, 0, depth, 0) == 0 && zap_frame_compress_mt(buf, n, c2, cap, 0, depth, 0, 4) == 0);
         assert(zap_frame_compress_mt(buf, n, c2, cn - 1, 65536, depth, 0, 4) == 0); /* too-small cap fails cleanly */
         free(c2);
-        if (depth & ZAP_ENTROPY) assert(zap__r32(c) == ZAP_FRAME_MAGIC2); else assert(zap__r32(c) == ZAP_FRAME_MAGIC);
+        if (depth & (ZAP_ENTROPY | ZAP_TURBO)) assert(zap__r32(c) == ZAP_FRAME_MAGIC2); else assert(zap__r32(c) == ZAP_FRAME_MAGIC);
         fuzz(c, cn, n, 0);
         free(c); free(o);
     }
     free(buf);
     v1_compat_test();
     ctx_huffman_test();
+    k_lits_test();
+    turbo_offset_test();
+    unaligned_scratch_test();
+    x86_filter_test();
+    small_cap_test();
+    cmd_tokens_test();
     incompressible_test();
     pak_test();
     printf("selftest ok\n");
@@ -327,7 +517,7 @@ static void bench_file(const uint8_t *src, size_t n, int threads) {
         { "fast, 256KB blocks", 256 << 10, 0 }, { "fast, 4MB blocks", 4 << 20, 0 },
         { "hc16, 4MB blocks", 4 << 20, 16 }, { "hc64, 4MB blocks", 4 << 20, 64 },
         { "fast+entropy, 4MB", 4 << 20, ZAP_ENTROPY }, { "hc16+entropy, 4MB", 4 << 20, 16 | ZAP_ENTROPY },
-        { "hc64+entropy, 4MB", 4 << 20, 64 | ZAP_ENTROPY } };
+        { "hc64+entropy, 4MB", 4 << 20, 64 | ZAP_ENTROPY }, { "hc64+turbo, 4MB", 4 << 20, 64 | ZAP_TURBO } };
     printf("\nfile: %.1f MB\n", n / 1e6);
     for (int k = 0; k < (int)(sizeof cfg / sizeof cfg[0]); k++) {
         size_t cap = zap_frame_bound(n, cfg[k].bs);
