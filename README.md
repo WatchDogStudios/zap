@@ -288,18 +288,22 @@ The formats are `ZAP_BC1`, `ZAP_BC3`, `ZAP_BC4`, `ZAP_BC5` and `ZAP_BC7`. To loa
 
 ## Benchmarks
 
-These are single runs on an AMD Ryzen 7 5800X (8 cores) with clang 18 `-O3 -march=native`, Windows 11. Expect ±30% run to run. Reproduce them with `zap_bench <file> [threads]`.
+Unless noted, these are single runs on an AMD Ryzen 7 5800X (8 cores) with clang 18 `-O3 -march=native`, Windows 11. Expect ±30% run to run. Reproduce them with `zap_bench <file> [threads]`.
 
-**Packaging:** 92.6 MB of concatenated Windows system binaries (exe/dll).
+**Packaging (zap 1.3):** `zap_bench <file> 4` on the two 32 MB samples from [the comparison below](#zap-vs-oodle-zstd-and-lz4): Linux binaries, and BC1/BC3/BC7 textures mixed with binaries. Xeon @ 2.8 GHz with 4 cores (shared, so treat these as rough), clang 18 `-march=native`. Frame compression and decode through `zap_frame_*`; "1T / 4T" is one thread / four.
 
-| Mode | Ratio | Compress 1T / 8T | Decode 1T / 8T |
-|---|---|---|---|
-| fast, 256 KB blocks | 1.74 | 447 / 1551 MB/s | 2362 / 11474 MB/s |
-| fast, 4 MB blocks | 1.77 | 359 / 1315 MB/s | 2286 / 9037 MB/s |
-| hc depth 16 (lazy parse), 4 MB blocks | 2.05 | 20 / 39 MB/s | 2460 / 9306 MB/s |
-| hc depth 64 (optimal parse), 4 MB blocks | 2.12 | 3 / 9 MB/s | 2792 / 9717 MB/s |
-| hc depth 64 + entropy, 4 MB blocks | 2.52 | 1 / 3 MB/s | 1303 / 5366 MB/s |
-| *zlib level 6, 4 MB blocks (reference)* | *2.23* | *52 MB/s (1T)* | *447 MB/s (1T)* |
+| Mode | Binaries: ratio | Compress 1T / 4T | Decode 1T / 4T | Mixed: ratio | Compress 1T / 4T | Decode 1T / 4T |
+|---|---|---|---|---|---|---|
+| fast, 256 KB blocks | 1.89 | 282 / 674 MB/s | 1363 / 4555 MB/s | 2.29 | 359 / 692 MB/s | 1637 / 6007 MB/s |
+| fast, 4 MB blocks | 1.94 | 231 / 603 MB/s | 1392 / 4322 MB/s | 2.32 | 312 / 795 MB/s | 1550 / 4738 MB/s |
+| hc depth 16 (lazy parse) | 2.34 | 8 / 23 MB/s | 1307 / 4583 MB/s | 2.68 | 8 / 17 MB/s | 1595 / 4707 MB/s |
+| hc depth 64 (optimal parse) | 2.48 | 2 / 8 MB/s | 1612 / 4660 MB/s | 2.81 | 3 / 10 MB/s | 1762 / 5452 MB/s |
+| hc depth 64 + turbo | 2.65 | 1 / 4 MB/s | **2426 / 7262 MB/s** | 2.83 | 1 / 4 MB/s | **3011 / 7309 MB/s** |
+| fast + entropy | 2.50 | 95 / 315 MB/s | 602 / 1775 MB/s | 3.00 | 128 / 333 MB/s | 612 / 1739 MB/s |
+| hc depth 16 + entropy (v2) | 2.92 | 8 / 25 MB/s | 624 / 1471 MB/s | 3.37 | 10 / 18 MB/s | 708 / 1690 MB/s |
+| hc depth 64 + entropy (v3) | **3.34** | 1 / 2 MB/s | 787 / 2342 MB/s | **3.84** | 1 / 2 MB/s | 942 / 2710 MB/s |
+
+On the Ryzen 7 5800X (zap 1.2, 92.6 MB of Windows binaries) the plain decoder ran at 2.3–3.2 GB/s on one core and 9–11 GB/s on 8. zap 1.2's entropy mode reached 2.52 there, against zlib 6's 2.23.
 
 **Networking:** 20,000 synthetic entity-update packets, averaging 85 bytes, 16 KB dictionary.
 
