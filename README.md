@@ -189,13 +189,13 @@ if (zap_pak_open(&k, buf, len) == 0) {                   /* validates the whole 
 ### Command-line tool
 
 ```sh
-zap c [-e] [-x] [-l depth] [-b block_kb] [-t threads] [-D dict] in out   # pack (depth 0 = fast, >= 32 optimal parse, default 64; -e entropy, -x faster decode)
+zap c [-e | -T] [-x] [-l depth] [-b block_kb] [-t threads] [-D dict] in out   # pack (depth 0 = fast, >= 32 optimal parse, default 64; -e entropy, -T turbo, -x faster decode)
 zap d [-t threads] [-D dict] in out                            # unpack
 zap train [-s dict_bytes] dict.bin samples...                  # train a packet dictionary
 zap tex [-f bc1|bc3|bc4|bc5|bc7|astc] [-r rdo] [-m] [-S] w h in.rgba out.dds  # raw RGBA8 -> DDS (-m mip chain, -S sRGB); -f astc writes a .astc file
 zap venc [-q quality] [-k keyint] [-F fps|num/den] [-t threads] [-C 601|709|601full|709full] w h in.yuv|- out.zapvid   # raw I420 -> .zapvid
 zap vdec [-t threads] in.zapvid out.yuv|-|null                 # .zapvid -> raw I420 (- = stdout, null = just time the decode)
-zap pak [-e] [-x] [-l depth] [-b block_kb] [-t threads] out.zappak files/folders...   # package content
+zap pak [-e | -T] [-x] [-l depth] [-b block_kb] [-t threads] out.zappak files/folders...   # package content
 zap unpak in.zappak outdir                                     # extract (names that would escape outdir are refused)
 zap ls file                                                    # describe a .zappak, .zapvid or zap frame
 ```
@@ -241,9 +241,11 @@ The view is split: drag the line to move it, zoom with the mouse wheel, pan with
 | `zap_frame_compress[_mt](...)` | Self-describing frame of independent blocks. The `_mt` version produces byte-identical output. |
 | `zap_frame_open / zap_frame_decode_block` | Validate a frame, then decode its blocks one at a time. |
 | `zap_frame_decode[_mt](...)` | Decode a whole frame. |
-| `zap_compress_entropy(src, n, dst, cap, state, depth, dict)` | Entropy-mode block. `state` is a `zap_state` when `depth` is 0, otherwise a `zap_hc_state`. Meant for blocks of about 16 KB and up. |
+| `zap_compress_entropy(src, n, dst, cap, state, depth, dict)` | Entropy-mode block. `state` is a `zap_state` when `depth` is 0, otherwise a `zap_hc_state`. Meant for blocks of about 16 KB and up. At depth 32 and up without a dictionary it writes version 3 (the Kraken tier); OR in `ZAP_FAST_DECODE` there to keep literal chunks raw unless Huffman saves more than 4% (about 10% faster decode, 0.6% larger). |
 | `zap_decompress_entropy(src, n, dst, raw_size, dict, scratch, cap)` | Decodes an entropy block. Pass `zap_entropy_scratch(raw_size)` bytes of scratch, or NULL to have it allocate. |
 | `ZAP_ENTROPY` | OR it into a frame's `depth` to get entropy blocks. The frame becomes `ZAP2`, and each block keeps whichever of raw, plain or entropy is smallest. |
+| `zap_compress_turbo(src, n, dst, cap, hc_state, depth)` / `zap_decompress_turbo(src, n, dst, raw_size)` | Turbo block: the fastest-decoding format, for data you load often. Depth 32 and up prices the parse for decode speed (`hc_state` required); 1–31 is the lazy hc parse; 0 is the fast parse (`hc_state` may be NULL). No dictionary. |
+| `ZAP_TURBO` | OR it into a frame's `depth` (instead of `ZAP_ENTROPY`) to get turbo blocks in a `ZAP2` frame; each block keeps whichever of raw or turbo is smaller. |
 | `zap_dict_train(samples, n, out, cap)` | Build a dictionary from concatenated sample packets. |
 | `zap_dict_init(&dict, data, len)` | Prepare a dictionary. The last 8 MB of `data` is used, and `data` must stay alive while the dictionary is in use. |
 
@@ -469,7 +471,33 @@ A frame looks like this (all fields little-endian):
 
 A block whose stored size equals its raw size is stored uncompressed.
 
-With `ZAP_ENTROPY`, the magic is `"ZAP2"` and each block starts with a method byte: 0 raw, 1 plain, 2 entropy. Since 1.3 an entropy block is version 2 (the top bit of its first word is set):
+With `ZAP_ENTROPY` or `ZAP_TURBO`, the magic is `"ZAP2"` and each block starts with a method byte: 0 raw, 1 plain, 2 entropy, 3 turbo.
+
+#### Entropy blocks
+
+The top two bits of an entropy block's first word give its version. zap 1.3 writes **version 3** at depth ≥ 32 without a dictionary, and **version 2** otherwise (depth < 32, or with a dictionary). Versions 1 and 2 still decode.
+
+**Version 3** (the Kraken tier):
+
+```
+u32 n_literals | 3 << 30  u32 n_sequences  u32 n_length_bytes  u32 n_near  u32 n_far  u32 n_chunks | scale << 24
+n_chunks x u32: literal count of each 128 KB chunk of output (bit 31: delta chunk)
+8 streams: literals, tokens, length bytes, offset symbols, near low bytes, far low, far mid, far high bytes
+   each: u8 method | table_bits << 4 (0 raw, 1 Huffman, 2 contextual Huffman, 15 the literal records) + u32 size + data
+   Huffman = u8 tables, tables x 128 bytes of 4-bit code lengths, u32 sizes of parts 0..W-2, W bitstreams (LSB-first);
+   part k holds symbols [k*q, (k+1)*q), q = ceil(n / W); a contextual part uses the table of its previous symbol's
+   group (group 0 at its start). Tokens: 6 parts, 16 groups. Other streams: 8 parts, one table.
+literal records: u8 sets, 16 x 128-byte contextual tables per set (bit 0: literals, bit 1: deltas), then per chunk
+   u8 mode (0 raw, 1 Huffman with its own table in 8 parts, 2 contextual in 6 parts, groups: previous byte >> 4) + u32 size + data
+```
+
+- **Sequences:** a token (literal-length nibble, match-length − 3 nibble, 15 continuing as 255-runs in the length stream), then an offset symbol. Symbols 0–2 reuse one of the three most recent offsets (which moves to the front). Otherwise the offset is a value v: near v = h << 8 | (next near low byte), far v = the next far low, mid and high bytes.
+- **Scale 1:** symbol 3 + h is near (h ≤ 250), 255 is far, and the offset is v.
+- **Scale S > 1** (strided data such as pixels and vertices): 3 + h (h < 125) and 254 give offset v · S; 128 + h (h < 125) and 255 give offset v.
+- **Delta chunks** code each literal minus the byte at the last match's offset (0 before the first match). Their contextual chunks use the second table set.
+- **End of block:** literals left over after the last sequence end the block.
+
+**Version 2** (zap 1.3 at depth < 32 or with a dictionary; the top bit of the first word is set, the next one clear):
 
 ```
 u32 n_literals | 1 << 31  u32 n_sequences  u32 n_length_bytes  u32 n_extra_bytes  u32 n_low_nibbles
@@ -485,9 +513,19 @@ offset extra bits (LSB-first)
 ```
 
 - **Tokens:** same as the plain format (4-bit literal length, 4-bit match length − 4, with 15 continuing as 255-runs in the length stream).
-- **Offset codes:** 0, 1 and 2 reuse one of the three most recent offsets, which then moves to the front. Code 3 + k is a new offset in [2^k, 2^(k+1)). For k ≥ 4 its low 4 bits come from the low-nibble stream (packed in pairs, so a mostly-zero nibble can cost under 1 bit) and the k − 4 bits above them are extra bits; otherwise it has k extra bits. Aligned game data (DXT blocks, vertex strides, PCM frames) makes the low nibbles very predictable: on the VPK sample below they cost 1.5 bits instead of 4.
+- **Offset codes:** 0, 1 and 2 reuse one of the three most recent offsets, which then moves to the front. Code 3 + k is a new offset in [2^k, 2^(k+1)). For k ≥ 4 its low 4 bits come from the low-nibble stream (packed in pairs, so a mostly-zero nibble can cost under 1 bit) and the k − 4 bits above them are extra bits; otherwise it has k extra bits.
 - **Version 1** blocks (zap 1.1–1.2: header without `n_low_nibbles`, 4 streams, one repeat offset as code 0, code c ≥ 1 an offset in [2^(c−1), 2^c) with c − 1 extra bits) still decode.
-- **End of block:** literals left over after the last sequence end the block.
+
+#### Turbo blocks
+
+```
+u32 n_tokens  u32 n_offset_bytes  u32 n_length_bytes  u8 n_table  n_table x u16: lit | (ml - 4) << 5 | kind << 10
+tokens (one byte per command), offset bytes, length bytes, literals (the rest of the block)
+```
+
+- **Commands:** a token below `n_table` is that table entry: `lit` (0–16) literals, then `ml` (4–32) bytes from an offset given by `kind`: 0 repeats the previous command's offset, 1–3 read that many bytes (little-endian) from the offset stream. Tokens 252 + kind are escapes, whose literal count and `ml − 4` come from the length stream (one byte each; from 255 up, a 255 byte and then the value − 255 in 3 bytes).
+- Each block's table holds its 252 most frequent (kind, lit, ml) commands. Offsets below 16 are always escapes, so a table command is one 16-byte literal copy and two 16-byte match copies, and no pointer depends on a loaded byte.
+- **End of block:** literals left over after the last command end the block.
 
 ### .zappak
 

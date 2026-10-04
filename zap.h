@@ -38,7 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ZAP_VERSION "1.3.0-dev"
+#define ZAP_VERSION "1.3.0"
 
 #define ZAP_HLOG 16
 #define ZAP_HC_HLOG 17
