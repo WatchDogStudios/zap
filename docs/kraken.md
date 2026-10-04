@@ -85,6 +85,32 @@ to entropy blocks at depth >= 32 when a fast entropy trial of both versions find
 the binaries it takes zap from 3.343 to 3.596: past Kraken 6 (3.513), Kraken 8 (3.581) and level with Leviathan
 (3.595). Texture and other blocks are never filtered (their trial loses). Un-filtering runs at ~3 GB/s.
 
+## Round 2: regional tables
+
+Per 4 MB block of the mixed sample, ooz Kraken 6 was 3-6% smaller on the BC texture blocks. The parse-swap test
+again put it on the coding: Kraken resets its tables every 128 KB, zap's token, length and offset streams kept one
+set per block. Shipped:
+
+| Change | Mixed sample | Binaries (no filter) | Decode |
+|---|---|---|---|
+| before | 3.841 | 3.343 | |
+| compact table headers (deflate-style code lengths; 20-60 bytes instead of 128 per table) | +0.1-0.3% per block | | |
+| regional streams: sub-streams per 256 KB of output, own tables, split only where smaller | 3.925 | 3.378 | -16% |
+| table building by doubling, from decoded symbol lists; 64-bit header reads | | | -4.7% net |
+| parse priced per region | **3.942** | **3.382** | |
+
+Per block against Kraken 6, the texture blocks went from -3..-6% to +1.1%, +0.7%, -0.4%. With the x86 filter the
+binaries reach 3.636 through frames.
+
+Tried and dropped: the offset stage with the 3 recent offsets in one SSE register (one pshufb per sequence, no
+branches): 3-7% slower than the scalar code. `ZAP_FAST_DECODE` changes little on these samples (their literal chunks
+are already raw or plain).
+
+**What's left on the mixed sample** is block 7, part of the Go binary `containerd`: Kraken 6 1,927,632 against zap's
+2,011,423. Kraken's parse is 59% repeat matches (107K of them 2 bytes); on that parse zap's token + offset symbol
+cost 53 KB more than Kraken's command + offset symbol, because the repeat index is a separate symbol. That is item 2
+below.
+
 ## Where to go next
 
 Ranked by expected value for "zap over Kraken, open source":
@@ -98,8 +124,7 @@ Ranked by expected value for "zap over Kraken, open source":
    symbol for repeat-heavy blocks, zap's token for the rest; the parse prices whichever the block uses. Rep
    sequences then decode one symbol instead of two. Expected +1-2% on executables (entropy estimate; needs a
    prototype), and faster decode on them.
-3. **Compact table headers + per-128 KB tables** for tokens, offset symbols and lengths (128 bytes per table today;
-   Kraken's are a few dozen): +0.5% (binaries) to +1% (textures) on zap's parse.
+3. ~~Compact table headers + per-region tables~~ (done, round 2: +2.6% on the mixed sample).
 4. **Multi-table arrays / tANS** for skewed streams (delta literals near zero, commands): ratio, at some decode cost.
 5. **Matches across blocks** (Kraken's window is the whole stream): frames keep blocks independent for parallel
    decode, so this would be an option for single-threaded streams only.
