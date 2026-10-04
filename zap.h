@@ -2202,6 +2202,7 @@ static inline size_t zap__k_encode1(const uint8_t *src, const zap__kseq *q, size
     size_t *cb = (size_t *)malloc(sizeof(size_t) * (maxch + 1)), lo = 0; /* lo: the last match's offset */
     zap__ksc sc;
     zap__ksc_set(&sc, S);
+    if (!cmd) for (size_t i = 0; i + 1 < nq; i++) if (q[i].ml < 3) cap = 0; /* plain tokens code matches from 3 bytes */
     if (!buf || !cb || cap < 24 + 4 * maxch) { free(buf); free(cb); return 0; }
     uint8_t *lits = buf, *dls = lits + raw, *toks = dls + raw, *offc = toks + maxseq, *nlo = offc + maxseq, *flo = nlo + maxseq,
             *fmi = flo + maxseq, *fhi = fmi + maxseq, *dfl = fhi + maxseq, *lens = dfl + maxch;
@@ -2467,6 +2468,28 @@ static inline size_t zap__k_lazy(size_t n, const zap__kmt *t, zap__kseq *out) {
     out[nq].ll = (uint32_t)(n - anchor); out[nq].ml = 0; out[nq].off = 0;
     return nq + 1;
 }
+/* the seed for command tokens: a lazy parse that prefers the repeat offsets (as Kraken's seeds do), from 2 bytes; a
+   new offset only when it is 2+ bytes longer. Seeded from zap__k_lazy, the parse rarely finds the short repeats */
+static inline size_t zap__k_lazyr(const uint8_t *src, size_t n, const zap__kmt *t, zap__kseq *out) {
+    size_t limit = n >= 13 ? n - 12 : 0, nq = 0, anchor = 0, pos = 0;
+    uint32_t rep[3] = { 0, 0, 0 };
+    while (pos < limit) {
+        size_t rl = 0, ro = 0;
+        for (int r = 0; r < 3; r++) {
+            size_t o = rep[r], l;
+            if (o && o <= pos && (l = zap__count(src + pos, src + pos - o, src + n)) > rl) { rl = l; ro = o; }
+        }
+        uint32_t b = t->idx[pos + 1];
+        size_t len = b > t->idx[pos] ? (t->m[b - 1] & 255) + 3 : 0, off = len ? t->m[b - 1] >> 8 : 0;
+        if (rl >= 2 && rl + 2 > len) { len = rl; off = ro; }
+        else if (len < 4 || (pos + 1 < limit && t->idx[pos + 2] > b && (t->m[t->idx[pos + 2] - 1] & 255) + 3 > len + 1)) { pos++; continue; }
+        out[nq].ll = (uint32_t)(pos - anchor); out[nq].ml = (uint32_t)len; out[nq].off = (uint32_t)off; nq++;
+        zap__rep_push(rep, off);
+        pos += len; anchor = pos;
+    }
+    out[nq].ll = (uint32_t)(n - anchor); out[nq].ml = 0; out[nq].off = 0;
+    return nq + 1;
+}
 /* the parse, as sequences into out (room for n / 3 + 2); returns the count, 0 = out of memory */
 static inline size_t zap__compress_ma(const uint8_t *src, size_t n, size_t base, zap__kseq *out, const zap__kmt *mt, const zap__kc *cms, int ncm, int K) {
     const zap__kc *cm = cms;
@@ -2687,8 +2710,9 @@ static inline void zap__k_short(uint8_t *op, size_t off, size_t ml, uint8_t *oen
                 if (D) zap__k_add16(op, lp, ll, Ob[j]); else zap__cp16(op, lp);                                          \
                 op += ll; lp += ll;                                                                                        \
                 if (ml == 15) goto P##long_match;                                                                          \
-                if (off < 16 || off > (size_t)(op - dst)) goto P##slow_match;                                              \
-                zap__cp16(op, op - off); zap__cp16(op + 16, op - off + 16);                                                \
+                if (off < 8 || off > (size_t)(op - dst)) goto P##slow_match;                                               \
+                zap__k_st8(op, zap__k_ld8(op - off)); zap__k_st8(op + 8, zap__k_ld8(op + 8 - off));                        \
+                zap__k_st8(op + 16, zap__k_ld8(op + 16 - off)); /* 24 bytes in 8-byte steps: offsets 8-15 too */          \
                 op += ml + (C ? 2 : 3);                                                                                    \
                 continue;                                                                                                  \
             P##slow_match:                                                                                                 \
@@ -2884,11 +2908,13 @@ static inline size_t zap__k_sampled(const uint8_t *src, size_t n, zap__kseq *out
     return nq;
 }
 /* the match table, a lazy parse over it, then optimal parses with K arrivals, each priced from the previous parse
-   (the first one sampled). Arrivals per pass: depth 32-47: 1, 1; 48-63: 1, 2; 64-127: 1, 2, 2, 4; 128+: 1, 2, 4, 8
-   (more passes pay more than more arrivals: 1, 2, 2, 4 beats 4, 4, 4 at less work). The table's search depth is 128
-   or more (deeper finds more, at about the same speed). */
+   (the first one sampled). Arrivals per pass: depth 32-47: 1, 1; 48-63: 1, 2; 64-127: 1, 2, 2, 4 (more passes pay
+   more than more arrivals: 1, 2, 2, 4 beats 4, 4, 4 at less work). Depth 128+ parses for command tokens from a seed
+   that prefers repeat offsets, with no sequence penalty, in passes of 1, 2, 4, 8, 16 arrivals: Kraken 8's ratio, at
+   about 2.5x the time and -5..-20% decode speed. The table's search depth is 128 or more (deeper finds more, at about
+   the same speed). */
 static inline size_t zap__k_compress(const uint8_t *src, size_t n, uint8_t *dst, size_t cap, zap_hc_state *hc, int depth, int rawpct) {
-    static const uint8_t sched[4][4] = { { 1, 1 }, { 1, 2 }, { 1, 2, 2, 4 }, { 1, 2, 4, 8 } };
+    static const uint8_t sched[4][5] = { { 1, 1 }, { 1, 2 }, { 1, 2, 2, 4 }, { 1, 2, 4, 8, 16 } };
     int lv = depth >= 128 ? 3 : depth >= 64 ? 2 : depth >= 48 ? 1 : 0;
     size_t r = 0, nq = 0;
     zap__kseq *q = (zap__kseq *)malloc(sizeof(zap__kseq) * (n / 3 + 2));
@@ -2899,12 +2925,11 @@ static inline size_t zap__k_compress(const uint8_t *src, size_t n, uint8_t *dst,
     zap__kmt mt = { NULL, NULL };
     if (cm) { cm->dreg = NULL; cm->nreg = 0; }
     if (q && cm && !zap__kmt_build(&mt, src, n, hc, depth < 128 ? 128 : depth)) {
-        int cmd = 0; /* priced for plain tokens until a full parse says command tokens code smaller */
-        nq = zap__k_lazy(n, &mt, q);
-        for (int pass = 0; nq && pass < 4 && sched[lv][pass]; pass++) {
-            if (pass == 2 && depth >= 128) { uint8_t *t = (uint8_t *)malloc(cap); if (t) zap__k_encode(src, q, nq, zap__k_scale(q, nq), n, t, cap, rawpct, &cmd); free(t); }
-            zap__k_costs(src, q, nq, zap__k_scale(q, nq), cm, ncm, cmd ? 8 : 24, cmd); /* sequence penalty 1.5 bits (command tokens: 0.5, */
-            if (cmd) for (int r_ = 0; r_ < ncm; r_++) cm[r_].pfar = 0;                  /* no far penalty; Kraken's settings, for repeat-heavy code) */
+        int cmd = lv == 3; /* the parse is priced for the tokens the block will most likely use */
+        nq = cmd ? zap__k_lazyr(src, n, &mt, q) : zap__k_lazy(n, &mt, q);
+        for (int pass = 0; nq && pass < 5 && sched[lv][pass]; pass++) {
+            zap__k_costs(src, q, nq, zap__k_scale(q, nq), cm, ncm, cmd ? 0 : 24, cmd); /* sequence penalty 1.5 bits (command tokens: */
+            if (cmd) for (int r_ = 0; r_ < ncm; r_++) cm[r_].pfar = 0;                 /* none, and no far penalty: the ratio level) */
             nq = pass ? zap__compress_ma(src, n, 0, q, &mt, cm, ncm, sched[lv][pass]) : zap__k_sampled(src, n, q, &mt, cm, ncm, sched[lv][pass]);
         }
         if (nq) nq = zap__k_store(q, nq, cm, ncm);

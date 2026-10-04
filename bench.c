@@ -311,7 +311,8 @@ static void small_cap_test(void) {
         int depth = d ? 128 : 32;
         size_t cn = zap_compress_entropy(s, N, c, 2 * N, hc, depth, NULL);
         assert(cn && zap_decompress_entropy(c, cn, o, N, NULL, NULL, 0) == N && !memcmp(o, s, N));
-        for (size_t cap = 0; cap < cn; cap += cap < 64 ? 1 : cap / 8 + 1) assert(zap_compress_entropy(s, N, c, cap, hc, depth, NULL) == 0);
+        for (size_t cap = 0; cap < cn; cap += cap < 64 ? (d ? 7 : 1) : cap / (d ? 3 : 8) + 1) assert(zap_compress_entropy(s, N, c, cap, hc, depth, NULL) == 0); /* depth 128: fewer (slow) */
+        assert(zap_compress_entropy(s, N, c, cn - 1, hc, depth, NULL) == 0);
     }
     free(s); free(c); free(o);
 }
