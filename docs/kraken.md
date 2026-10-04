@@ -111,6 +111,32 @@ are already raw or plain).
 cost 53 KB more than Kraken's command + offset symbol, because the repeat index is a separate symbol. That is item 2
 below.
 
+## Round 3: command tokens (depth 128)
+
+Item 2 of the old roadmap, built. A v3 block may set bit 7 of its scale byte and code **command tokens**: Kraken's
+command byte (literal run 0-2 | match - 2 nibble | repeat index or "new"), with the offset symbol stream holding new
+offsets only. Repeat matches may then be 2 bytes long. The parse prices them through `oc[symbol][token group]`: the
+repeat index is priced given the command's group, as it is coded. In command mode the parse uses Kraken-like settings
+(0.5-bit sequence penalty, no far-source penalty). The encoder decides after the second pass whether the block codes
+smaller with command tokens, and the final encode keeps whichever kind is smaller.
+
+| | Mixed | Binaries (raw API) | Binaries (frames, x86 filter) |
+|---|---|---|---|
+| zap depth 64 | 3.942 (1000 MB/s) | 3.382 | 3.636 (697 MB/s) |
+| **zap depth 128, command tokens** | **3.971** (945 MB/s) | **3.467** (720 MB/s) | **3.724** (608 MB/s) |
+| ooz Kraken 6 | 3.962 | 3.513 | |
+| ooz Kraken 8 | 4.019 | 3.581 | |
+| ooz Leviathan 6 | 4.073 | 3.595 | |
+
+Command tokens decode 12-15% slower on executable blocks (the repeat index costs a branch in the copy loop), so
+they are only tried at depth 128; depth 64 output is unchanged. Tried and dropped along the way: decoding command
+tokens back to plain tokens in a pre-pass (28% of decode time), and unpacking every sequence into arrays first
+(slower than the inline decode).
+
+**Where zap stands against Kraken now:** ahead of Kraken 8 and Leviathan on executables (through frames), ahead of
+Kraken 8 on the game pak (real Oodle 2.8), ahead of Kraken 6 on the mixed sample, but 1.2% behind Kraken 8 there.
+Decode speed against real Oodle (0.88x on the pak sample) is the other open axis.
+
 ## Where to go next
 
 Ranked by expected value for "zap over Kraken, open source":
@@ -120,10 +146,8 @@ Ranked by expected value for "zap over Kraken, open source":
    - Minimum offset 8 (the encoder never emits 1-7) to drop the short-offset path from the copy loop.
    - Plain (order-0) per-128 KB tables instead of contextual block tables where ratio allows: the plain 8-part
      decoder is ~2.3x faster per symbol than the contextual ones.
-2. **A Kraken-style command per block** (format, binaries): literal run 0-2 / match length / repeat index in one
-   symbol for repeat-heavy blocks, zap's token for the rest; the parse prices whichever the block uses. Rep
-   sequences then decode one symbol instead of two. Expected +1-2% on executables (entropy estimate; needs a
-   prototype), and faster decode on them.
+2. ~~A Kraken-style command per block~~ (done at depth 128, round 3: +0.7% mixed, +2.5% binaries). Making it cheap
+   enough to decode for depth 64 is still open.
 3. ~~Compact table headers + per-region tables~~ (done, round 2: +2.6% on the mixed sample).
 4. **Multi-table arrays / tANS** for skewed streams (delta literals near zero, commands): ratio, at some decode cost.
 5. **Matches across blocks** (Kraken's window is the whole stream): frames keep blocks independent for parallel

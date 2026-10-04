@@ -295,6 +295,66 @@ static void x86_filter_test(void) {
     free(s); free(t);
 }
 
+/* v3 into too-small buffers: every cap below the block's size fails cleanly (each stream writer checks the last one) */
+static void small_cap_test(void) {
+    enum { N = 300000 };
+    uint8_t *s = malloc(N), *c = malloc(2 * N), *o = malloc(N);
+    uint32_t x = 5;
+    char words[512][9];
+    for (int w = 0; w < 512; w++) { x = x * 1103515245u + 12345u; int l = 3 + (int)(x >> 29); for (int k = 0; k < 8; k++) { x = x * 1103515245u + 12345u; words[w][k] = k < l ? (char)('a' + (x >> 27) % 26) : 0; } words[w][8] = 0; }
+    for (size_t i = 0; i < N;) { /* text of 512 words: LZ-compressible, many short sequences */
+        x = x * 1103515245u + 12345u;
+        for (const char *p = words[(x >> 16) & 511]; *p && i < N; p++) s[i++] = (uint8_t)*p;
+        if (i < N) s[i++] = ' ';
+    }
+    for (int d = 0; d < 2; d++) {
+        int depth = d ? 128 : 32;
+        size_t cn = zap_compress_entropy(s, N, c, 2 * N, hc, depth, NULL);
+        assert(cn && zap_decompress_entropy(c, cn, o, N, NULL, NULL, 0) == N && !memcmp(o, s, N));
+        for (size_t cap = 0; cap < cn; cap += cap < 64 ? 1 : cap / 8 + 1) assert(zap_compress_entropy(s, N, c, cap, hc, depth, NULL) == 0);
+    }
+    free(s); free(c); free(o);
+}
+
+/* v3 command tokens (repeat index in the token, 2-byte repeat matches): data built from a repeat-heavy sequence
+   list, coded with both token kinds; round trips, exact sizes and corrupt input */
+static void cmd_tokens_test(void) {
+    enum { N = 1 << 20, MQ = N / 3 + 2 };
+    uint8_t *s = malloc(N), *c = malloc(2 * N + 65536), *o = malloc(N + 1), *f = malloc(2 * N + 65536);
+    zap__kseq *q = malloc(sizeof *q * MQ);
+    uint32_t x = 31337, rep[3] = { 1, 2, 3 };
+    size_t pos = 0, nq = 0;
+    while (pos < N - 600) {
+        x = x * 1103515245u + 12345u;
+        size_t ll = x >> 29 == 0 ? 20 + (x >> 20) % 300 : (x >> 26) & 3, ml = (x >> 24) & 3 ? 2 + (x >> 12) % 14 : 17 + (x >> 8) % 500;
+        for (size_t k = 0; k < ll; k++) { x = x * 1103515245u + 12345u; s[pos + k] = (uint8_t)(x >> 24); }
+        pos += ll;
+        size_t off = (x >> 18) % 4 < 3 ? rep[(x >> 16) % 3] : 16 + (x >> 4) % (pos > 70000 ? 70000 : pos - 16 > 16 ? pos - 16 : 16);
+        if (off > pos || off == 0) off = 1;
+        if (ml < 3 && zap__rep_slot(off, rep) < 0) ml = 3; /* 2-byte matches only as repeats */
+        for (size_t k = 0; k < ml; k++) s[pos + k] = s[pos + k - off];
+        q[nq].ll = (uint32_t)ll; q[nq].ml = (uint32_t)ml; q[nq].off = (uint32_t)off; nq++;
+        zap__rep_push(rep, off);
+        pos += ml;
+    }
+    q[nq].ll = (uint32_t)(N - pos); q[nq].ml = 0; q[nq].off = 0; nq++;
+    for (size_t k = pos; k < N; k++) s[k] = (uint8_t)k;
+    for (int cmd = 0; cmd < 2; cmd++) {
+        for (size_t i = 0; i + 1 < nq; i++) if (!cmd && q[i].ml < 3) goto next; /* plain tokens: matches from 3 */
+        size_t cn = zap__k_encode1(s, q, nq, 1, N, c, 2 * N + 65536, 0, cmd);
+        assert(cn && (c[23] >> 7) == cmd);
+        assert(zap_decompress_entropy(c, cn, o, N, NULL, NULL, 0) == N && !memcmp(o, s, N));
+        assert(zap_decompress_entropy(c, cn, o, N + 1, NULL, NULL, 0) == -1 && zap_decompress_entropy(c, cn, o, N - 1, NULL, NULL, 0) == -1);
+        for (int t = 0; t < 300; t++) {
+            memcpy(f, c, cn);
+            for (int k = 1 + rand() % 3; k > 0; k--) f[t < 100 ? (size_t)rand() % 64 : (size_t)rand() % cn] ^= (uint8_t)(1 + rand() % 255);
+            zap_decompress_entropy(f, cn - (t & 1) * (rand() % cn), o, N, NULL, NULL, 0);
+        }
+    next:;
+    }
+    free(s); free(c); free(o); free(f); free(q);
+}
+
 static void incompressible_test(void) {
     enum { N = 1 << 20 };
     uint8_t *src = malloc(N), *c = malloc(zap_bound(N) + 1024), *d = malloc(N);
@@ -396,6 +456,8 @@ static void selftest(void) {
     turbo_offset_test();
     unaligned_scratch_test();
     x86_filter_test();
+    small_cap_test();
+    cmd_tokens_test();
     incompressible_test();
     pak_test();
     printf("selftest ok\n");
