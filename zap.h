@@ -1879,10 +1879,11 @@ static inline int zap__k_dstream(int m, int L, const uint8_t *in, size_t sz, uin
 }
 
 /* ---- literals per chunk: raw, plain (own table), or contextual (the block's 16 tables), whichever is smallest */
+/* coded bytes of s[0..n) in W parts, or (size_t)-1 if a symbol has no code (a table set built from other chunks) */
 static inline size_t zap__k_bits(const uint8_t *s, size_t n, const uint8_t (*len)[256], const uint8_t *grp, int W) {
     uint64_t b = 0;
     size_t q = (n + W - 1) / W;
-    for (size_t i = 0; i < n; i++) { unsigned g = grp && i % q ? grp[s[i - 1]] : 0; b += len[g][s[i]] ? len[g][s[i]] : 64; }
+    for (size_t i = 0; i < n; i++) { unsigned g = grp && i % q ? grp[s[i - 1]] : 0; if (!len[g][s[i]]) return (size_t)-1; b += len[g][s[i]]; }
     return (size_t)((b + 7) / 8) + (size_t)W;
 }
 /* plain-chunk bytes of s[0..n), its code lengths in lp ((size_t)-1: too short to pay) */
@@ -1890,7 +1891,7 @@ static inline size_t zap__k_pcost(const uint8_t *s, size_t n, uint8_t lp[1][256]
     uint32_t fp[256] = { 0 };
     for (size_t i = 0; i < n; i++) fp[s[i]]++;
     zap__hlens_l(fp, lp[0], 11);
-    return n >= 64 ? zap__k_bits(s, n, (const uint8_t(*)[256])lp, NULL, 8) + 128 + 28 : (size_t)-1;
+    return n >= 64 ? zap__k_bits(s, n, (const uint8_t(*)[256])lp, NULL, 8) + 128 + 28 : (size_t)-1; /* own table: every symbol has a code */
 }
 /* Each chunk is raw, plain (own table) or contextual (a block table set), of its literals or of their deltas (dls:
    literal - the byte at the last match offset; strided data - heightmaps, vertices, nav meshes - makes those small).
@@ -1922,7 +1923,8 @@ static inline uint8_t *zap__k_lits(uint8_t *op, uint8_t *oend, const uint8_t *li
             int bm = 0, bd = 0;
             for (int d = 0; d < 2; d++) {
                 const uint8_t *t = (d ? dls : lits) + cb[c];
-                size_t pen = n / 100 + (size_t)d * n / 512, sp = zap__k_pcost(t, n, lp), sc = n >= 256 ? zap__k_bits(t, n, (const uint8_t(*)[256])lc[d], glit, 6) + 20 : (size_t)-1;
+                size_t pen = n / 100 + (size_t)d * n / 512, sp = zap__k_pcost(t, n, lp), sc = n >= 256 ? zap__k_bits(t, n, (const uint8_t(*)[256])lc[d], glit, 6) : (size_t)-1;
+                if (sc != (size_t)-1) sc += 20;
                 if (sp != (size_t)-1 && sp + pen < np) np = sp + pen;
                 if (sp != (size_t)-1 && sp + pen < best) { best = sp + pen; bm = 1; bd = d; }
                 if (sc != (size_t)-1 && sc + pen + n / 200 < best) { best = sc + pen + n / 200; bm = 2; bd = d; }

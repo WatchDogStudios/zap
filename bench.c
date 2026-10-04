@@ -192,6 +192,45 @@ static void ctx_huffman_test(void) {
     free(s); free(c); free(o); free(f);
 }
 
+/* entropy v3 literal chunks: a table set built from other chunks may lack a symbol of this one; pricing must rule the
+   contextual mode out instead of charging a fixed cost (1.3-dev wrote blocks it couldn't decode that way) */
+static void k_lits_test(void) {
+    uint8_t len[16][256], s[64];
+    memset(len, 0, sizeof len);
+    for (int i = 0; i < 64; i++) { s[i] = (uint8_t)(i & 7); len[0][i & 7] = 3; }
+    assert(zap__k_bits(s, 64, (const uint8_t(*)[256])len, NULL, 8) == 24 + 8);
+    s[40] = 200;
+    assert(zap__k_bits(s, 64, (const uint8_t(*)[256])len, NULL, 8) == (size_t)-1);
+    /* chunks of three kinds (contextual-friendly, plain-friendly, near-random), each with stray bytes: every mode the
+       encoder picks must decode */
+    enum { NC = 12, CN = 6000 };
+    uint8_t *lits = malloc(NC * CN), *dls = malloc(NC * CN), *enc = malloc(2 * NC * CN + 65536), *out = malloc(NC * CN), dflag[NC], ch[4 * NC];
+    uint16_t *T = malloc(sizeof(uint16_t) * (3u << 15));
+    size_t cb[NC + 1];
+    uint32_t x = 99;
+    for (int round = 0; round < 40; round++) {
+        cb[0] = 0;
+        for (int c = 0; c < NC; c++) {
+            x = x * 1103515245u + 12345u;
+            size_t n = 300 + (x >> 8) % (CN - 300);
+            unsigned kind = (x >> 4) % 3, alpha = 2 + (x >> 12) % 60;
+            cb[c + 1] = cb[c] + n;
+            for (size_t i = cb[c]; i < cb[c + 1]; i++) {
+                x = x * 1103515245u + 12345u;
+                uint8_t p = i > cb[c] ? lits[i - 1] : 0, v = kind == 0 ? (uint8_t)((p >> 4) * 13 + (x >> 24) % alpha) : kind == 1 ? (uint8_t)(64 + (x >> 24) % alpha) : (uint8_t)(x >> 24);
+                if ((x >> 8) % 701 == 0) v = (uint8_t)(x >> 16);
+                lits[i] = v; dls[i] = (uint8_t)(v - (i >= 3 ? lits[i - 3] : 0));
+            }
+        }
+        uint8_t *e = zap__k_lits(enc, enc + 2 * NC * CN + 65536, lits, dls, cb, NC, round & 1 ? 4 : 0, dflag);
+        assert(e);
+        for (int c = 0; c < NC; c++) zap__w32(ch + 4 * c, (uint32_t)(cb[c + 1] - cb[c]) | (uint32_t)dflag[c] << 31);
+        assert(!zap__k_dlits(enc, (size_t)(e - enc), ch, NC, out, cb[NC], T, T + (2u << 14)));
+        for (int c = 0; c < NC; c++) assert(!memcmp(out + cb[c], (dflag[c] ? dls : lits) + cb[c], cb[c + 1] - cb[c]));
+    }
+    free(lits); free(dls); free(enc); free(out); free(T);
+}
+
 static void incompressible_test(void) {
     enum { N = 1 << 20 };
     uint8_t *src = malloc(N), *c = malloc(zap_bound(N) + 1024), *d = malloc(N);
@@ -289,6 +328,7 @@ static void selftest(void) {
     free(buf);
     v1_compat_test();
     ctx_huffman_test();
+    k_lits_test();
     incompressible_test();
     pak_test();
     printf("selftest ok\n");
