@@ -133,9 +133,57 @@ they are only tried at depth 128; depth 64 output is unchanged. Tried and droppe
 tokens back to plain tokens in a pre-pass (28% of decode time), and unpacking every sequence into arrays first
 (slower than the inline decode).
 
-**Where zap stands against Kraken now:** ahead of Kraken 8 and Leviathan on executables (through frames), ahead of
-Kraken 8 on the game pak (real Oodle 2.8), ahead of Kraken 6 on the mixed sample, but 1.2% behind Kraken 8 there.
-Decode speed against real Oodle (0.88x on the pak sample) is the other open axis.
+At that point depth 128 was ahead of Kraken 8 and Leviathan on executables (through frames) and of Kraken 6 on the
+mixed sample, but 1.2% behind Kraken 8 there.
+
+## Round 4: the seed parse (depth 128 past Kraken 8)
+
+Per 4 MB block of the mixed sample, zap depth 128 trailed Kraken 8 by 101 KB in all, 61 KB of it on block 7 (the
+Go executable). Coding Kraken 8's own parse of block 7 (dumped from ooz's decoder) with zap's coder gave 1,937,417
+bytes against zap's own 1,976,207, so most of the gap was the parse. The two parses differ in short repeats:
+
+| Block 7 | Sequences | Literals | Repeat matches | ... of 2 bytes | ... of 3 bytes |
+|---|---|---|---|---|---|
+| zap depth 128 (before) | 307,547 | 1,981,395 | 143,469 | 23,231 | 44,631 |
+| Kraken 8 | 418,140 | 1,719,121 | 269,277 | 102,781 | 88,880 |
+
+zap's parse and prices weren't the problem: started from Kraken 8's parse, zap's own passes take block 7 down to
+1,924,111, under Kraken's coding of that parse plus 0.5%. Started from zap's lazy parse (no repeat offsets; plain
+tokens until pass 2), the passes never find the short repeats: an unused token or repeat index is priced at 11-13
+bits, so the parse keeps not using it. More passes only creep toward them (about -5 KB a pass on block 7), and
+fractional (entropy) prices change nothing.
+
+The fix is Kraken's: seed with a lazy parse that prefers the repeat offsets (`zap__k_lazyr`: repeats from 2 bytes; a
+new offset only when 2+ bytes longer), and price for command tokens from the first pass. Every block of both samples
+got smaller, block 7 by 51 KB. Then:
+
+| Depth 128, mixed sample | Total bytes | Ratio |
+|---|---|---|
+| before (round 3) | 8,450,504 | 3.971 |
+| repeat-favoring seed, command tokens from pass 0 | 8,362,475 | 4.013 |
+| + a fifth pass (1, 2, 4, 8, 8 arrivals) | 8,357,662 | 4.015 |
+| + no sequence penalty | 8,353,940 | 4.017 |
+| + 16 arrivals in the last pass (1, 2, 4, 8, 16) | **8,344,404** | **4.021** |
+| ooz Kraken 8 | 8,348,848 | 4.019 |
+
+Per block against Kraken 8 the result is now -4.8 KB, +6.2, -0.4, +6.6, +1.3, -26.5, +7.7 and +5.6 KB: textures
+level or close, the executable 0.3% behind, block 5 3.6% ahead. On the binaries (raw API) depth
+128 goes from 3.467 to 3.534, and through frames with the x86 filter from 3.724 to 3.792.
+
+Tried and not taken: 128 KB regions (+0.1%: table headers cost more than they save), a sequence penalty of 0.25 or
+1 bit (+0.02% / +0.12%), a 3-byte minimum or 1-byte margin in the seed (noise), the x86 filter on block 7 at depth 128
+(+0.15%: the repeat-heavy parse already finds what the filter would align).
+
+**Decode.** The repeat-heavy parse has up to 50% more sequences (block 7: 464,283), a third of them with offsets
+below 16 on block 7. The copy loop's fast path took offsets from 16 up; it now copies 24 bytes in 8-byte steps for
+any offset from 8 (+2-5% decode on v3 blocks, old encodings included). Depth 128 still decodes about 19% slower than
+before on the mixed sample and 6% on the binaries: it is now the ratio level, and depth 64 (unchanged) the balanced
+one. Compression at depth 128 is about 2.5x slower than before (~0.1 MB/s per thread).
+
+**Still open from this round:** Kraken's coder is 1-2% smaller than zap's on identical parses of texture blocks. On
+block 3 (BC textures), Kraken 8's parse costs 958 KB in Kraken and 977 KB in zap, the difference mostly in offsets:
+Kraken switches its offset coding per 128 KB chunk (scaling by 8, 16 and other strides, with a second array for the
+low part) and codes 18 of its arrays as multi-arrays (several Huffman tables inside one array).
 
 ## Where to go next
 
@@ -146,10 +194,13 @@ Ranked by expected value for "zap over Kraken, open source":
    - Minimum offset 8 (the encoder never emits 1-7) to drop the short-offset path from the copy loop.
    - Plain (order-0) per-128 KB tables instead of contextual block tables where ratio allows: the plain 8-part
      decoder is ~2.3x faster per symbol than the contextual ones.
-2. ~~A Kraken-style command per block~~ (done at depth 128, round 3: +0.7% mixed, +2.5% binaries). Making it cheap
-   enough to decode for depth 64 is still open.
-3. ~~Compact table headers + per-region tables~~ (done, round 2: +2.6% on the mixed sample).
-4. **Multi-table arrays / tANS** for skewed streams (delta literals near zero, commands): ratio, at some decode cost.
-5. **Matches across blocks** (Kraken's window is the whole stream): frames keep blocks independent for parallel
+2. ~~A Kraken-style command per block~~ (done at depth 128, rounds 3 and 4: +2.0% mixed, +4.5% binaries over
+   depth 64; past Kraken 8 on the mixed sample, and on the binaries through frames). Making it cheap enough to decode for depth 64 is still open; the repeat-favoring seed alone
+   with plain tokens gives depth 64 +0.18% on the mixed sample (not taken yet: unmeasured decode cost).
+3. **Per-chunk offset scaling and multi-table arrays** (Kraken's edge on textures, round 4): about 1-2% on texture
+   blocks at Kraken's parse.
+4. ~~Compact table headers + per-region tables~~ (done, round 2: +2.6% on the mixed sample).
+5. **tANS** for skewed streams (delta literals near zero, commands): ratio, at some decode cost.
+6. **Matches across blocks** (Kraken's window is the whole stream): frames keep blocks independent for parallel
    decode, so this would be an option for single-threaded streams only.
-6. More filters beyond x86: ARM64 BL/ADRP, and stride-delta for vertex / index buffers.
+7. More filters beyond x86: ARM64 BL/ADRP, and stride-delta for vertex / index buffers.
