@@ -18,6 +18,7 @@
  *   zap_frame_open + zap_frame_decode_block(f, i, dst, dict)  -> call from your job system
  *   zap_frame_decode(...)  single thread
  *   #define ZAP_THREADS for zap_frame_compress_mt / zap_frame_decode_mt (pthreads, or C11 threads on Windows)
+ *   x86 code: entropy frames (depth >= 32) filter E8/E9 branches per block when a trial says so; | ZAP_NO_FILTER: never
  *
  * Dictionaries (networking: small packets):
  *   zap_dict_train(samples, n, dict_out, cap)  -> bytes; then zap_dict_init(&d, dict_out, size) on both ends.
@@ -80,9 +81,11 @@ static inline uint32_t zap__hash(uint32_t v, int hlog) { return (v * 2654435761u
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 static inline int zap__log2(uint32_t v) { unsigned long i; _BitScanReverse(&i, v); return (int)i; } /* v > 0 */
+static inline unsigned zap__ctz32(uint32_t v) { unsigned long i; _BitScanForward(&i, v); return (unsigned)i; } /* v > 0 */
 static inline unsigned zap__nb(uint64_t x) { unsigned long i; _BitScanForward64(&i, x); return (unsigned)i >> 3; }
 #else
 static inline int zap__log2(uint32_t v) { return 31 - __builtin_clz(v); } /* v > 0 */
+static inline unsigned zap__ctz32(uint32_t v) { return (unsigned)__builtin_ctz(v); } /* v > 0 */
 #if defined(ZAP_BIG_ENDIAN)
 static inline unsigned zap__nb(uint64_t x) { return (unsigned)__builtin_clzll(x) >> 3; }
 #else
@@ -2670,6 +2673,37 @@ static inline size_t zap__k_compress(const uint8_t *src, size_t n, uint8_t *dst,
     return r;
 }
 
+/* ---------------- x86 branch filter (executables): an E8 (call) or E9 (jmp) byte whose rel32's top byte is 00 or FF
+ * gets rel32 + (its end's offset in the buffer) instead, wrapped to 25 bits and sign-extended (so the top byte is 00 or
+ * FF again). Calls to one function then repeat byte for byte. After every E8 / E9, converted or not, the next 4 bytes
+ * are skipped, so no later conversion changes a byte an earlier decision read: decode makes the same decisions.
+ * encode 1 filters, 0 restores; in place; returns the conversions. Frames apply it per block on their own (below). */
+static inline size_t zap_x86_filter(void *buf, size_t n, int encode) {
+    uint8_t *s = (uint8_t *)buf;
+    size_t i = 0, cnt = 0;
+    if (n < 5) return 0;
+    while (i < n - 4) {
+#if ZAP__X86
+        if (i + 16 <= n - 4) { /* skip to the next E8 / E9, 16 bytes at a time */
+            __m128i v = _mm_and_si128(_mm_loadu_si128((const __m128i *)(const void *)(s + i)), _mm_set1_epi8((char)0xFE));
+            unsigned mk = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8((char)0xE8)));
+            if (!mk) { i += 16; continue; }
+            i += zap__ctz32(mk);
+        }
+#endif
+        if ((s[i] & 0xFE) != 0xE8) { i++; continue; }
+        { /* branch-free: whether it converts is data, ~50/50 in code */
+            uint32_t v = zap__r32(s + i + 1), p = (uint32_t)(i + 5), t = encode ? v + p : v - p, ok = (uint32_t)((uint8_t)(s[i + 4] + 1) <= 1);
+            t = (t & 0x01FFFFFFu) | (0u - (t & 0x01000000u));
+            zap__w32(s + i + 1, ok ? t : v);
+            cnt += ok;
+        }
+        i += 5;
+    }
+    return cnt;
+}
+#define ZAP_NO_FILTER (1 << 19) /* OR into a frame's depth: never apply the x86 filter */
+
 /* ---------------- frames: [magic][block_size u32][raw_size u64][end offset u64 per block][blocks]
  * "ZAP1": a block whose stored size equals its raw size is stored uncompressed, else it's a plain block.
  * "ZAP2" (written when depth has ZAP_ENTROPY or ZAP_TURBO): each block starts with a method byte: 0 raw, 1 plain, 2 entropy, 3 turbo. */
@@ -2693,8 +2727,9 @@ static inline size_t zap__block(const uint8_t *src, size_t len, uint8_t *dst, si
    no dictionary). 0 = no room or out of memory. */
 static inline size_t zap__block2(const uint8_t *src, size_t len, uint8_t *dst, size_t lim, void *st, int depth, const zap_dict *d) {
     size_t lcap = zap_bound(len), ln = 0, en = 0, best = len;
-    int m = 0, hc = depth & 0xFFFF;
-    uint8_t *lz = (uint8_t *)malloc(lcap), *e = (uint8_t *)malloc(len + 1);
+    int m = 0, fl = 0, hc = depth & 0xFFFF; /* fl: 0x80 when the block is x86-filtered */
+    const uint8_t *src0 = src;
+    uint8_t *lz = (uint8_t *)malloc(lcap), *e = (uint8_t *)malloc(len + 1), *fsrc = NULL;
     if (!lz || !e) { free(lz); free(e); return 0; }
     if (len >= 2 && (depth & ZAP_TURBO) && !d) {
         ln = hc >= ZAP_OPT_DEPTH ? zap__t_parse(src, len, lz, lcap, (zap_hc_state *)st, hc)
@@ -2702,6 +2737,19 @@ static inline size_t zap__block2(const uint8_t *src, size_t len, uint8_t *dst, s
         if (ln && best > 1) en = zap__t_encode(lz, ln, e, best - 1);
         if (en && en < best) { best = en; m = 3; }
     } else if (len >= 2 && !d && hc >= ZAP_OPT_DEPTH) {
+        /* x86 code: the filtered block, when a fast entropy trial of both finds it > 0.5% smaller */
+        if (!(depth & ZAP_NO_FILTER) && len >= 4096 && (fsrc = (uint8_t *)malloc(len))) {
+            size_t cand = 0;
+            for (size_t i = 0; i + 5 <= len; i++) if ((src[i] & 0xFE) == 0xE8) { cand += (uint8_t)(src[i + 4] + 1) <= 1; i += 4; }
+            if (cand > len / 2048) { /* > 0.05% of the bytes */
+                zap_state *fs = (zap_state *)(void *)((zap_hc_state *)st)->prev;
+                memcpy(fsrc, src, len);
+                zap_x86_filter(fsrc, len, 1);
+                size_t a = zap_compress_entropy(src, len, e, len, fs, 0, NULL), b = a ? zap_compress_entropy(fsrc, len, e, len, fs, 0, NULL) : 0;
+                if (b && b < a - a / 200) { src = fsrc; fl = 0x80; }
+            }
+        }
+        depth &= ~ZAP_NO_FILTER;
         /* v3 parses on its own: the plain parse (~15% of the time) only runs as a fallback, or on small blocks where
            v3's stream headers can lose to it */
         en = zap_compress_entropy(src, len, e, len - 1, st, depth, NULL);
@@ -2711,6 +2759,7 @@ static inline size_t zap__block2(const uint8_t *src, size_t len, uint8_t *dst, s
             if (ln && ln < best) { best = ln; m = 1; }
         }
     } else if (len >= 2) {
+        depth &= ~ZAP_NO_FILTER;
         ln = hc ? zap_compress_hc(src, len, lz, lcap, (zap_hc_state *)st, d, depth) : zap_compress(src, len, lz, lcap, (zap_state *)st, d);
         if (ln && ln < best) { best = ln; m = 1; }
         if ((depth & 0xFFFF) >= ZAP_OPT_DEPTH && best > 1) en = zap_compress_entropy(src, len, e, best - 1, st, depth, d); /* its own, entropy-priced parse */
@@ -2718,8 +2767,9 @@ static inline size_t zap__block2(const uint8_t *src, size_t len, uint8_t *dst, s
         if (en && en < best) { best = en; m = 2; }
     }
     size_t r = 0;
-    if (lim >= best + 1) { dst[0] = (uint8_t)m; memcpy(dst + 1, m == 0 ? src : m == 1 ? lz : e, best); r = best + 1; }
-    free(lz); free(e);
+    if (!m) { src = src0; fl = 0; } /* stored blocks stay unfiltered */
+    if (lim >= best + 1) { dst[0] = (uint8_t)(m | fl); memcpy(dst + 1, m == 0 ? src : m == 1 ? lz : e, best); r = best + 1; }
+    free(lz); free(e); free(fsrc);
     return r;
 }
 
@@ -2780,6 +2830,15 @@ static inline int zap_frame_open(zap_frame *f, const void *src_, size_t n) {
     return 0;
 }
 
+/* one block's payload by its method (frames: 0 raw, 1 plain, 2 entropy, 3 turbo). 0 ok, -1 corrupt */
+static inline int zap__frame_block(int m, const uint8_t *p, size_t sz, uint8_t *o, size_t len, const zap_dict *d, void *scratch, size_t scratch_cap) {
+    if (m == 0) { if (sz != len) return -1; memcpy(o, p, len); return 0; }
+    if (m == 1) return zap_decompress(p, sz, o, len, d) == (ptrdiff_t)len ? 0 : -1;
+    if (m == 2) return zap_decompress_entropy(p, sz, o, len, d, scratch, scratch_cap) == (ptrdiff_t)len ? 0 : -1;
+    if (m == 3) return zap__t_decode(p, sz, o, len) == (ptrdiff_t)len ? 0 : -1;
+    return -1;
+}
+
 /* decode block i into dst (the whole raw_size output buffer). Thread-safe: call from any job. 0 ok, -1 corrupt.
  * scratch: zap_entropy_scratch(block_size) bytes reused across calls for entropy blocks, or NULL to malloc. */
 static inline int zap_frame_decode_block_ex(const zap_frame *f, size_t i, void *dst, const zap_dict *d, void *scratch, size_t scratch_cap) {
@@ -2788,13 +2847,11 @@ static inline int zap_frame_decode_block_ex(const zap_frame *f, size_t i, void *
     size_t len = i == f->nb - 1 ? f->raw - i * f->bs : f->bs, sz = end - start;
     const uint8_t *p = f->blocks + start;
     uint8_t *o = (uint8_t *)dst + i * f->bs;
-    int m = sz == len ? 0 : 1;
-    if (f->v == 2) { m = *p++; sz--; }
-    if (m == 0) { if (sz != len) return -1; memcpy(o, p, len); return 0; }
-    if (m == 1) return zap_decompress(p, sz, o, len, d) == (ptrdiff_t)len ? 0 : -1;
-    if (m == 2) return zap_decompress_entropy(p, sz, o, len, d, scratch, scratch_cap) == (ptrdiff_t)len ? 0 : -1;
-    if (m == 3) return zap__t_decode(p, sz, o, len) == (ptrdiff_t)len ? 0 : -1;
-    return -1;
+    int m = sz == len ? 0 : 1, fl = 0;
+    if (f->v == 2) { m = *p++; sz--; fl = m & 0x80; m &= 0x7F; } /* method bit 7: the block is x86-filtered */
+    int r = zap__frame_block(m, p, sz, o, len, d, scratch, scratch_cap);
+    if (!r && fl) zap_x86_filter(o, len, 0);
+    return r;
 }
 
 static inline int zap_frame_decode_block(const zap_frame *f, size_t i, void *dst, const zap_dict *d) {

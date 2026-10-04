@@ -262,6 +262,39 @@ static void unaligned_scratch_test(void) {
     free(s); free(c); free(o); free(scr);
 }
 
+/* x86 filter: round trips at every size and alignment (SSE2 and scalar paths), and frames pick it for code-like data */
+static void x86_filter_test(void) {
+    enum { N = 1 << 20 };
+    uint8_t *s = malloc(N), *t = malloc(N);
+    uint32_t x = 4242, fn[64];
+    for (int i = 0; i < 64; i++) { x = x * 1103515245u + 12345u; fn[i] = (x >> 8) % N; }
+    for (size_t i = 0; i < N;) { /* "code": filler instructions and calls / jumps to 64 functions */
+        x = x * 1103515245u + 12345u;
+        if (x >> 28 < 5 && i + 5 <= N) { int32_t rel = (int32_t)(fn[(x >> 16) & 63] - (uint32_t)(i + 5)); s[i] = (x >> 27) & 1 ? 0xE9 : 0xE8; zap__w32(s + i + 1, (uint32_t)rel); i += 5; }
+        else s[i++] = (uint8_t)((x >> 20) % 7 == 0 ? 0xE8 : x >> 13); /* stray E8s too */
+    }
+    for (size_t n = 0; n < 70; n++) for (size_t a = 0; a < 3; a++) { /* small sizes */
+        memcpy(t, s + a * 1000, n); zap_x86_filter(t, n, 1); zap_x86_filter(t, n, 0); assert(!memcmp(t, s + a * 1000, n));
+    }
+    memcpy(t, s, N);
+    assert(zap_x86_filter(t, N, 1) > 1000 && memcmp(t, s, N));
+    zap_x86_filter(t, N, 0);
+    assert(!memcmp(t, s, N));
+    for (int k = 0; k < 2; k++) { /* frames: filtered blocks (method bit 7) unless ZAP_NO_FILTER */
+        size_t cap = zap_frame_bound(N, 1 << 18), cn;
+        uint8_t *c = malloc(cap), *o = malloc(N);
+        cn = zap_frame_compress(s, N, c, cap, 1 << 18, 32 | ZAP_ENTROPY | (k ? ZAP_NO_FILTER : 0), NULL);
+        assert(cn && zap_frame_decode(c, cn, o, N, NULL) == N && !memcmp(o, s, N));
+        zap_frame f;
+        assert(zap_frame_open(&f, c, cn) == 0);
+        int filtered = 0;
+        for (size_t b = 0; b < f.nb; b++) filtered += (f.blocks + (b ? zap__r64le(f.table + 8 * (b - 1)) : 0))[0] >> 7;
+        assert(k ? filtered == 0 : filtered > 0);
+        free(c); free(o);
+    }
+    free(s); free(t);
+}
+
 static void incompressible_test(void) {
     enum { N = 1 << 20 };
     uint8_t *src = malloc(N), *c = malloc(zap_bound(N) + 1024), *d = malloc(N);
@@ -362,6 +395,7 @@ static void selftest(void) {
     k_lits_test();
     turbo_offset_test();
     unaligned_scratch_test();
+    x86_filter_test();
     incompressible_test();
     pak_test();
     printf("selftest ok\n");

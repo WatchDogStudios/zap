@@ -286,6 +286,8 @@ Tried on that block and others (depth 64 unless noted):
   are a point further along the same ratio/decode dial, and still 4% short of Kraken 6 on binaries.
 - Costlier arrivals trying repeat matches at full length only: 3-14% faster compression, -0.2% to +0.1% ratio.
 
-What's left for executables is the parse's equilibrium, not the coder: a parse that starts match-heavy and holds it
-(Kraken-like cheap short repeats, an x86 call/jump filter, or a literal cost that tracks the literals the parse will
-leave rather than the ones it left last pass).
+**Correction (later in the same round):** the parse isn't the gap. Kraken's exact parse coded by zap's v3 coder is
+1,357,489 bytes, no smaller than zap's own parse; on identical commands zap's commands, lengths and offsets take 9.8%
+more than Kraken's (the repeat index is a separate symbol, and tables span the block instead of 128 KB). The x86
+branch filter closes the executable gap instead. See [kraken.md](kraken.md) for the analysis, the experiments and
+the roadmap.
