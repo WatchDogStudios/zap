@@ -679,9 +679,10 @@ static inline void zap__hcodes(const uint8_t len[256], uint16_t code[256]) {
     for (int l = 1, c = 0; l < 16; l++) { c = (c + count[l - 1]) << 1; next[l] = c; }
     for (int i = 0; i < 256; i++) {
         if (!len[i]) continue;
-        int c = next[len[i]]++, r = 0;
-        for (int b = 0; b < len[i]; b++) r |= ((c >> b) & 1) << (len[i] - 1 - b);
-        code[i] = (uint16_t)r;
+        unsigned c = (unsigned)next[len[i]]++; /* reverse 16 bits, keep the top len */
+        c = (c >> 1 & 0x5555u) | (c & 0x5555u) << 1; c = (c >> 2 & 0x3333u) | (c & 0x3333u) << 2;
+        c = (c >> 4 & 0x0F0Fu) | (c & 0x0F0Fu) << 4; c = (c >> 8 & 0x00FFu) | (c & 0x00FFu) << 8;
+        code[i] = (uint16_t)(c >> (16 - len[i]));
     }
 }
 
