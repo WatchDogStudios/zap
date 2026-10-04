@@ -302,7 +302,7 @@ Unless noted, these are single runs on an AMD Ryzen 7 5800X (8 cores) with clang
 | hc depth 64 + turbo | 2.65 | 1 / 4 MB/s | **2426 / 7262 MB/s** | 2.83 | 1 / 4 MB/s | **3011 / 7309 MB/s** |
 | fast + entropy | 2.50 | 95 / 315 MB/s | 602 / 1775 MB/s | 3.00 | 128 / 333 MB/s | 612 / 1739 MB/s |
 | hc depth 16 + entropy (v2) | 2.92 | 8 / 25 MB/s | 624 / 1471 MB/s | 3.37 | 10 / 18 MB/s | 708 / 1690 MB/s |
-| hc depth 64 + entropy (v3) | **3.34** | 1 / 2 MB/s | 787 / 2342 MB/s | **3.84** | 1 / 2 MB/s | 942 / 2710 MB/s |
+| hc depth 64 + entropy (v3; binaries x86-filtered by trial) | **3.64** | 1 / 2 MB/s | 612 / 1930 MB/s | **3.94** | 1 / 2 MB/s | 894 / 2362 MB/s |
 
 On the Ryzen 7 5800X (zap 1.2, 92.6 MB of Windows binaries) the plain decoder ran at 2.3–3.2 GB/s on one core and 9–11 GB/s on 8. zap 1.2's entropy mode reached 2.52 there, against zlib 6's 2.23.
 
