@@ -477,11 +477,16 @@ The top two bits of an entropy block's first word give its version. zap 1.3 writ
 u32 n_literals | 3 << 30  u32 n_sequences  u32 n_length_bytes  u32 n_near  u32 n_far  u32 n_chunks | scale << 24
 n_chunks x u32: literal count of each 128 KB chunk of output (bit 31: delta chunk)
 8 streams: literals, tokens, length bytes, offset symbols, near low bytes, far low, far mid, far high bytes
-   each: u8 method | table_bits << 4 (0 raw, 1 Huffman, 2 contextual Huffman, 15 the literal records) + u32 size + data
-   Huffman = u8 tables, tables x 128 bytes of 4-bit code lengths, u32 sizes of parts 0..W-2, W bitstreams (LSB-first);
-   part k holds symbols [k*q, (k+1)*q), q = ceil(n / W); a contextual part uses the table of its previous symbol's
-   group (group 0 at its start). Tokens: 6 parts, 16 groups. Other streams: 8 parts, one table.
-literal records: u8 sets, 16 x 128-byte contextual tables per set (bit 0: literals, bit 1: deltas), then per chunk
+   each: u8 method | table_bits << 4 (0 raw, 1 Huffman, 2 contextual Huffman, 4 regional, 15 the literal records)
+   + u32 size + data
+   regional = sub-streams back to back, each [u32 symbol count][stream record] with its own tables; the encoder
+   splits a stream at 256 KB-of-output boundaries (into 1, 2, 4, ... pieces) when that's smaller
+   Huffman = code lengths (below), u32 sizes of parts 0..W-2, W bitstreams (LSB-first); part k holds symbols
+   [k*q, (k+1)*q), q = ceil(n / W); a contextual part uses the table of its previous symbol's group (group 0 at its
+   start). Tokens: 6 parts, 16 groups. Other streams: 8 parts, one table.
+   code lengths of t tables = u8 t, 14 x 3 bits: lengths of a code over 0..11 (a code length), 12 (3-10 zeros, 3 extra
+   bits), 13 (11-138 zeros, 7 extra bits); then the t x 256 lengths in that code, LSB-first, padded to a byte
+literal records: u8 sets, 16 contextual tables per set (bit 0: literals, bit 1: deltas), then per chunk
    u8 mode (0 raw, 1 Huffman with its own table in 8 parts, 2 contextual in 6 parts, groups: previous byte >> 4) + u32 size + data
 ```
 

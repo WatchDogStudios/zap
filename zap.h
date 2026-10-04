@@ -1561,18 +1561,19 @@ static inline ptrdiff_t zap_decompress_turbo(const void *src, size_t n, void *ds
  * Block (tag 3 in the top two bits of the first word; v2 blocks have 2, v1 blocks 0 or 1):
  *   u32 n_lits | 3 << 30, u32 n_seq, u32 n_len, u32 n_near, u32 n_far, u32 n_chunks | scale << 24,
  *   n_chunks x u32 literal counts (bit 31: delta chunk), 8 streams, each u8 method | L << 4 (0 raw, 1 plain Huffman, 2 contextual Huffman;
- *   15 the literal records), u32 size, data: literals, tokens, length bytes, offset symbols, near low bytes, far low,
- *   far mid, far high bytes.
+ *   4 regional; 15 the literal records), u32 size, data: literals, tokens, length bytes, offset symbols, near low
+ *   bytes, far low, far mid, far high bytes. Regional (any stream but the literals): sub-streams [u32 count][stream
+ *   record] back to back, each with its own tables; the encoder splits at 256 KB-of-output boundaries when it pays.
  * Sequence i: token = literal nibble | (match - 3) nibble, 15 continuing as 255-runs in the length stream; offset
  * symbol 0-2 = repeat offset 0-2 (move-to-front), else a new offset from a value v: near v = h << 8 | (next near low
  * byte), far v = next far low | mid << 8 | high << 16. Scale 1: symbol 3 + h near (h <= 250), 255 far, offset v.
  * Scale S > 1 (strided data: pixels, vertices): 3 + h near (h < 125) and 254 far give offset v * S; 128 + h near
  * (h < 125) and 255 far give offset v. Leftover literals end the block.
- * Huffman data: [u8 ntables][ntables x 128 bytes of 4-bit code lengths][u32 sizes of parts 0..W-2][W parts]; part
+ * Huffman data: [compact code lengths (zap__k_tw)][u32 sizes of parts 0..W-2][W parts]; part
  * k holds symbols [k q, (k + 1) q), q = ceil(n / W), LSB-first; contextual: a part's table is the group of its
  * previous symbol (group 0 at its start). Tokens: 6 parts, 16 groups (zap__grp_tok), L11. Plain streams: 8 parts, L11.
- * Literal stream: [u8 sets][16 x 128 contextual tables, L10, per set: bit 0 literals, bit 1 deltas] then per chunk
- * [u8 mode][u32 bytes][payload]: mode 0 raw, 1 plain [128-byte table][u32 x 7][8 parts], 2 contextual [u32 x 5][6
+ * Literal stream: [u8 sets][16 contextual tables (compact), L10, per set: bit 0 literals, bit 1 deltas] then per chunk
+ * [u8 mode][u32 bytes][payload]: mode 0 raw, 1 plain [compact table][u32 x 7][8 parts], 2 contextual [u32 x 5][6
  * parts] (groups: previous symbol >> 4). A delta chunk's symbols are literal - the byte at the last match's offset
  * (0 before the first match); its contextual chunks take the second set. Chunks start at sequences: a literal run
  * is in one chunk. */
@@ -1667,10 +1668,73 @@ static inline int zap__k_x(void) { return zap__k_cpu() & 1; } /* use the X decod
 #define ZAP__K_NEAR (251u << 8)   /* scale 1: offsets below are near (high byte in the offset symbol) */
 #define ZAP__K_N 512              /* sequences per offset-stage batch */
 
-/* ---- Huffman streams in parts */
-static inline void zap__k_head(uint8_t *o, const uint8_t (*len)[256], int nt) {
-    *o++ = (uint8_t)nt;
-    for (int g = 0; g < nt; g++) for (int i = 0; i < 128; i++) *o++ = (uint8_t)(len[g][2 * i] | len[g][2 * i + 1] << 4);
+/* ---- Huffman streams in parts
+ * Code lengths (nt tables x 256, 0..11) are sent compactly, like deflate's: u8 nt, 14 x 3-bit lengths of a code over
+ * 0..11 (a length), 12 (3-10 zeros, 3 extra bits) and 13 (11-138 zeros, 7 extra bits), then those symbols, LSB-first,
+ * padded to a byte. A table costs ~20-60 bytes instead of 128. */
+static inline size_t zap__k_tw(uint8_t *o, uint8_t *oe, const uint8_t (*len)[256], int nt) { /* bytes, 0 = no room */
+    uint32_t f[256] = { 0 };
+    uint8_t cl[256];
+    uint16_t cc[256];
+    size_t n = (size_t)nt * 256, i, p = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t acc = 0;
+        int nb = 0;
+        if (pass) { /* header: nt, then the 14 code lengths (3 bits each) */
+            zap__hlens_l(f, cl, 7);
+            zap__hcodes(cl, cc);
+            if (oe - o < 7) return 0;
+            o[p++] = (uint8_t)nt;
+            for (int k = 0; k < 14; k++) { acc |= (uint64_t)cl[k] << nb; nb += 3; }
+        }
+#define ZAP__TWB(v, b) do { acc |= (uint64_t)(v) << nb; nb += (b); while (nb >= 8) { if (o + p >= oe) return 0; o[p++] = (uint8_t)acc; acc >>= 8; nb -= 8; } } while (0)
+#define ZAP__TWS(s_) do { if (pass) ZAP__TWB(cc[s_], cl[s_]); else f[s_]++; } while (0)
+        for (i = 0; i < n;) {
+            unsigned l = len[i >> 8][i & 255];
+            size_t r = 1;
+            if (!l) while (i + r < n && !len[(i + r) >> 8][(i + r) & 255] && r < 138) r++;
+            if (!l && r >= 11) { ZAP__TWS(13); if (pass) ZAP__TWB(r - 11, 7); i += r; }
+            else if (!l && r >= 3) { ZAP__TWS(12); if (pass) ZAP__TWB(r - 3, 3); i += r; }
+            else { ZAP__TWS(l); i++; }
+        }
+        if (pass) { while (nb > 0) { if (o + p >= oe) return 0; o[p++] = (uint8_t)acc; acc >>= 8; nb -= 8; } }
+#undef ZAP__TWS
+#undef ZAP__TWB
+    }
+    return p;
+}
+/* a decoded table header: its symbols with a code, in symbol order, and their lengths */
+typedef struct { int n; uint8_t sym[256], len[256]; } zap__ktl;
+/* reads nt tables' code lengths into tl[0..nt); returns the bytes read, or -1 */
+static inline ptrdiff_t zap__k_tr(const uint8_t *in, size_t n, int nt, zap__ktl *tl) {
+    uint8_t cl[256] = { 0 }, st[128];
+    uint16_t cc[256];
+    size_t p = 1, i = 0, total = (size_t)nt * 256;
+    uint64_t acc = 0;
+    int nb = 0;
+    if (n < 7 || in[0] != nt) return -1;
+    for (int g = 0; g < nt; g++) tl[g].n = 0;
+#define ZAP__TRN(k) do { if (nb < (k)) { if (p + 8 <= n) { acc |= zap__r64(in + p) << nb; p += (size_t)(63 - nb) >> 3; nb |= 56; } \
+                                      else while (nb < (k)) { if (p >= n) return -1; acc |= (uint64_t)in[p++] << nb; nb += 8; } } } while (0)
+    for (int k = 0; k < 14; k++) { ZAP__TRN(3); cl[k] = (uint8_t)(acc & 7); acc >>= 3; nb -= 3; }
+    uint32_t kraft = 0;
+    for (int k = 0; k < 14; k++) if (cl[k]) kraft += 1u << (7 - cl[k]);
+    if (!kraft || kraft > 128) return -1;
+    zap__hcodes(cl, cc);
+    memset(st, 0xFF, sizeof st);
+    for (int k = 0; k < 14; k++) if (cl[k]) for (unsigned j = cc[k]; j < 128; j += 1u << cl[k]) st[j] = (uint8_t)(k | cl[k] << 4);
+    while (i < total) {
+        ZAP__TRN(7);
+        unsigned e = st[acc & 127];
+        if (e == 0xFF) return -1;
+        acc >>= e >> 4; nb -= (int)(e >> 4);
+        unsigned k = e & 15;
+        if (k == 12) { ZAP__TRN(3); i += 3 + (acc & 7); acc >>= 3; nb -= 3; if (i > total) return -1; }
+        else if (k == 13) { ZAP__TRN(7); i += 11 + (acc & 127); acc >>= 7; nb -= 7; if (i > total) return -1; }
+        else { zap__ktl *t = tl + (i >> 8); if (k) { t->sym[t->n] = (uint8_t)i; t->len[t->n++] = (uint8_t)k; } i++; }
+    }
+#undef ZAP__TRN
+    return (ptrdiff_t)(p - (size_t)nb / 8); /* whole bytes read ahead go back; the last byte's padding stays read */
 }
 /* [u32 sizes of parts 0..W-2][W parts] of s[0..n); grp: chain context (NULL = one table). NULL if it doesn't fit */
 static inline uint8_t *zap__k_parts(uint8_t *o, uint8_t *oe, const uint8_t *s, size_t n, int W, const uint8_t *grp, const uint8_t (*len)[256]) {
@@ -1712,12 +1776,12 @@ static inline uint8_t *zap__k_stream(uint8_t *op, uint8_t *oend, const uint8_t *
     if (!op || oend - op < 5) return NULL;
     uint8_t *o = NULL;
     int nt = grp ? 16 : 1;
-    if (n >= 64 && (size_t)(oend - op) > 5 + 1 + 128 * (size_t)nt + 32) {
+    if (n >= 64 && (size_t)(oend - op) > 5 + 32) {
         uint8_t (*len)[256] = (uint8_t(*)[256])malloc(256 * (size_t)nt);
         if (len) {
             zap__k_lens(s, n, grp ? 6 : 8, grp, grp ? L : 11, len);
-            zap__k_head(op + 5, (const uint8_t(*)[256])len, nt);
-            o = zap__k_parts(op + 6 + 128 * nt, oend, s, n, grp ? 6 : 8, grp, (const uint8_t(*)[256])len);
+            size_t hl = zap__k_tw(op + 5, oend, (const uint8_t(*)[256])len, nt);
+            if (hl) o = zap__k_parts(op + 5 + hl, oend, s, n, grp ? 6 : 8, grp, (const uint8_t(*)[256])len);
             free(len);
         }
         if (o && (size_t)(o - op - 5) >= n - n / 100) o = NULL;
@@ -1727,28 +1791,72 @@ static inline uint8_t *zap__k_stream(uint8_t *op, uint8_t *oend, const uint8_t *
     op[0] = 0; zap__w32(op + 1, (uint32_t)n); memcpy(op + 5, s, n);
     return op + 5 + n;
 }
+/* a stream split at region boundaries bd[0..nr] (symbol indices; bd[0] = 0, bd[nr] = n) into 1, 2, 4, ... groups of
+   regions, each with its own tables (method 4: [u32 count][stream record] per group); the smallest split is kept */
+#define ZAP__K_REG (256u << 10) /* regions: output bytes */
+static inline uint8_t *zap__k_rsplit(uint8_t *op, uint8_t *oend, const uint8_t *s, size_t n, const uint8_t *grp, int L, const size_t *bd, int nr, int g) {
+    if (g <= 1) return zap__k_stream(op, oend, s, n, grp, L);
+    if (oend - op < 5) return NULL;
+    uint8_t *o = op + 5;
+    for (int k = 0; k < g && o; k++) {
+        size_t lo = bd[(size_t)nr * k / g], hi = bd[(size_t)nr * (k + 1) / g];
+        if (lo == hi) continue;
+        if (oend - o < 4) return NULL;
+        zap__w32(o, (uint32_t)(hi - lo));
+        o = zap__k_stream(o + 4, oend, s + lo, hi - lo, grp, L);
+    }
+    if (!o) return NULL;
+    op[0] = 4; zap__w32(op + 1, (uint32_t)(o - op - 5));
+    return o;
+}
+static inline uint8_t *zap__k_rstream(uint8_t *op, uint8_t *oend, const uint8_t *s, size_t n, const uint8_t *grp, int L, const size_t *bd, int nr) {
+    int best = 1;
+    size_t bsz = (size_t)-1;
+    for (int g = 1; g <= nr; g *= 2) {
+        uint8_t *e = zap__k_rsplit(op, oend, s, n, grp, L, bd, nr, g);
+        if (e && (size_t)(e - op) < bsz) { bsz = (size_t)(e - op); best = g; }
+        if (n < 4096) break; /* small streams: one table */
+    }
+    return zap__k_rsplit(op, oend, s, n, grp, L, bd, nr, best);
+}
 /* table entries: X len | group << 4 | sym << 8 (shrx shifts by the entry itself); B sym | len << 8 | group << 12 (the
    symbol stores straight from the entry; shifts go through CL anyway) */
 #define ZAP__KENTRY(x, s, l, g) ((x) ? ((l) | (g) << 4 | (s) << 8) : ((s) | (l) << 8 | (g) << 12))
 #define ZAP__KSYM(x, e) ((uint8_t)((x) ? (e) >> 8 : (e)))
 #define ZAP__KLEN(x, e) ((x) ? (e) & 15 : (e) >> 8 & 15)
 #define ZAP__KGRP(x, e) ((x) ? (e) >> 4 & 15 : (e) >> 12)
-/* decode tables from nt x 128 nibbles (group = grp[sym], 0 without grp) */
-static inline int zap__k_tables(const uint8_t *in, int nt, const uint8_t *grp, int L, uint16_t *T, int x) {
+/* decode tables from nt decoded headers (group = grp[sym], 0 without grp). Built by doubling (as libdeflate does):
+   with LSB-first codes, a table for codes up to l bits is two copies of the one for l - 1 bits plus the l-bit codes'
+   own entries, so the work is one memcpy of 2^L entries and one store per symbol; canonical codes are assigned in
+   (length, symbol) order on the way */
+static inline int zap__k_tables(const zap__ktl *tl, int nt, const uint8_t *grp, int L, uint16_t *T, int x) {
     for (int g = 0; g < nt; g++) {
-        uint8_t len[256];
-        uint16_t code[256];
+        const zap__ktl *h = tl + g;
+        uint8_t byl[256];
+        int cnt[16] = { 0 }, at[17];
         uint32_t kraft = 0;
-        for (int i = 0; i < 128; i++) { len[2 * i] = in[128 * g + i] & 15; len[2 * i + 1] = in[128 * g + i] >> 4; }
-        for (int i = 0; i < 256; i++) { if (len[i] > L) return -1; if (len[i]) kraft += 1u << (L - len[i]); }
+        for (int i = 0; i < h->n; i++) cnt[h->len[i]]++;
+        for (int l = 1; l < 16; l++) { if (l > L && cnt[l]) return -1; kraft += (uint32_t)cnt[l] << (L - (l > L ? L : l)); }
         if (kraft > 1u << L) return -1;
-        zap__hcodes(len, code);
+        at[1] = 0;
+        for (int l = 1; l < 16; l++) at[l + 1] = at[l] + cnt[l];
+        for (int i = 0; i < h->n; i++) byl[at[h->len[i]]++] = h->sym[i]; /* symbols by length, then symbol */
         uint16_t *t = T + ((size_t)g << L);
-        memset(t, 0, sizeof(uint16_t) << L);
-        for (int s = 0; s < 256; s++) {
-            unsigned c = grp ? grp[s] : 0;
-            if (c >= (unsigned)nt) return -1;
-            if (len[s]) for (int j = code[s]; j < 1 << L; j += 1 << len[s]) t[j] = (uint16_t)ZAP__KENTRY(x, s, len[s], c);
+        size_t size = 1, k = 0;
+        unsigned c = 0; /* the next canonical code (MSB-first) */
+        t[0] = 0;
+        for (int l = 1; l <= L; l++) {
+            memcpy(t + size, t, size * sizeof *t);
+            size *= 2;
+            for (int e = (int)k + cnt[l]; (int)k < e; k++, c++) {
+                int s_ = byl[k];
+                unsigned gr = grp ? grp[s_] : 0, r = c; /* r: c reversed in l bits */
+                if (gr >= (unsigned)nt) return -1;
+                r = (r >> 1 & 0x5555u) | (r & 0x5555u) << 1; r = (r >> 2 & 0x3333u) | (r & 0x3333u) << 2;
+                r = (r >> 4 & 0x0F0Fu) | (r & 0x0F0Fu) << 4; r = (r >> 8 & 0x00FFu) | (r & 0x00FFu) << 8;
+                t[(r >> (16 - l)) & (size - 1)] = (uint16_t)ZAP__KENTRY(x, s_, l, gr);
+            }
+            c <<= 1;
         }
     }
     return 0;
@@ -1876,10 +1984,13 @@ ZAP__KDEC6(zap__k_c6lB, 1, 11, B, )
 /* a whole stream (tokens, lengths, offset bytes): method from the header byte, tables into T */
 static inline int zap__k_dstream(int m, int L, const uint8_t *in, size_t sz, uint8_t *out, size_t cnt, const uint8_t *grp, uint16_t *T) {
     int nt = m == 2 ? 16 : 1;
-    if ((m != 1 && m != 2) || L != 11 || !cnt || (m == 2 && !grp) || sz < 1 + 128 * (size_t)nt || in[0] != nt) return -1;
+    zap__ktl tl[16];
+    if ((m != 1 && m != 2) || L != 11 || !cnt || (m == 2 && !grp)) return -1;
+    ptrdiff_t h = zap__k_tr(in, sz, nt, tl);
     int x = zap__k_x();
-    if (zap__k_tables(in + 1, nt, m == 2 ? grp : NULL, L, T, x)) return -1;
-    return m == 2 ? ZAP__KCALL(x, zap__k_c6l)(in + 1 + 128 * nt, sz - 1 - 128 * nt, out, cnt, T) : ZAP__KCALL(x, zap__k_p8)(in + 1 + 128 * nt, sz - 1 - 128 * nt, out, cnt, T);
+    if (h < 0 || zap__k_tables(tl, nt, m == 2 ? grp : NULL, L, T, x)) return -1;
+    in += h; sz -= (size_t)h;
+    return m == 2 ? ZAP__KCALL(x, zap__k_c6l)(in, sz, out, cnt, T) : ZAP__KCALL(x, zap__k_p8)(in, sz, out, cnt, T);
 }
 
 /* ---- literals per chunk: raw, plain (own table), or contextual (the block's 16 tables), whichever is smallest */
@@ -1895,7 +2006,10 @@ static inline size_t zap__k_pcost(const uint8_t *s, size_t n, uint8_t lp[1][256]
     uint32_t fp[256] = { 0 };
     for (size_t i = 0; i < n; i++) fp[s[i]]++;
     zap__hlens_l(fp, lp[0], 11);
-    return n >= 64 ? zap__k_bits(s, n, (const uint8_t(*)[256])lp, NULL, 8) + 128 + 28 : (size_t)-1; /* own table: every symbol has a code */
+    if (n < 64) return (size_t)-1;
+    uint8_t hb[512];
+    size_t h = zap__k_tw(hb, hb + sizeof hb, (const uint8_t(*)[256])lp, 1), b = zap__k_bits(s, n, (const uint8_t(*)[256])lp, NULL, 8); /* own table: every symbol has a code */
+    return b + (h ? h : 128) + 28;
 }
 /* Each chunk is raw, plain (own table) or contextual (a block table set), of its literals or of their deltas (dls:
    literal - the byte at the last match offset; strided data - heightmaps, vertices, nav meshes - makes those small).
@@ -1909,6 +2023,7 @@ static inline uint8_t *zap__k_lits(uint8_t *op, uint8_t *oend, const uint8_t *li
     uint8_t (*lc)[16][256] = (uint8_t(*)[16][256])malloc(2 * 16 * 256);
     uint8_t *o = NULL;
     int64_t gain[2] = { 0, 0 };
+    size_t sh[2] = { 16 * 128, 16 * 128 }; /* each table set's header bytes */
     zap__grp_lit(glit);
     if (!mode || !fq || !lc || !op || oend - op < 1) goto done;
     for (size_t c = 0; c < nch; c++) { mode[c] = 2; dflag[c] = 2; } /* first round: both sets from every chunk */
@@ -1937,7 +2052,8 @@ static inline uint8_t *zap__k_lits(uint8_t *op, uint8_t *oend, const uint8_t *li
             if (bm == 2) gain[bd] += (int64_t)np - (int64_t)best;
         }
     }
-    for (size_t c = 0; c < nch; c++) if (mode[c] == 2 && gain[dflag[c]] <= 16 * 128) { /* a set that costs more than it saves: raw or plain */
+    for (int d = 0; d < 2; d++) { uint8_t *hb = (uint8_t *)malloc(8192); sh[d] = hb ? zap__k_tw(hb, hb + 8192, (const uint8_t(*)[256])lc[d], 16) : 0; if (!sh[d]) sh[d] = 16 * 128; free(hb); }
+    for (size_t c = 0; c < nch; c++) if (mode[c] == 2 && gain[dflag[c]] <= (int64_t)sh[dflag[c]]) { /* a set that costs more than it saves: raw or plain */
         size_t n = cb[c + 1] - cb[c], best = n - n * (size_t)rawpct / 100;
         mode[c] = 0; dflag[c] = 0;
         for (int d = 0; d < 2; d++) {
@@ -1947,10 +2063,11 @@ static inline uint8_t *zap__k_lits(uint8_t *op, uint8_t *oend, const uint8_t *li
     }
     o = op;
     {
-        int sets = (gain[0] > 16 * 128) | (gain[1] > 16 * 128) << 1;
-        if ((size_t)(oend - o) < 1 + (size_t)((sets & 1) + (sets >> 1)) * 16 * 128) { o = NULL; goto done; }
+        int sets = (gain[0] > (int64_t)sh[0]) | (gain[1] > (int64_t)sh[1]) << 1;
+        if (oend - o < 1) { o = NULL; goto done; }
         *o++ = (uint8_t)sets;
-        for (int d = 0; d < 2; d++) if (sets >> d & 1) for (int g = 0; g < 16; g++) for (int i = 0; i < 128; i++) *o++ = (uint8_t)(lc[d][g][2 * i] | lc[d][g][2 * i + 1] << 4);
+        for (int d = 0; d < 2 && o; d++) if (sets >> d & 1) { size_t h = zap__k_tw(o, oend, (const uint8_t(*)[256])lc[d], 16); o = h ? o + h : NULL; }
+        if (!o) goto done;
     }
     for (size_t c = 0; c < nch && o; c++) {
         size_t n = cb[c + 1] - cb[c];
@@ -1961,9 +2078,8 @@ static inline uint8_t *zap__k_lits(uint8_t *op, uint8_t *oend, const uint8_t *li
         if (mode[c] == 0) { if ((size_t)(oend - o) < n) { o = NULL; break; } memcpy(o, t, n); o += n; }
         else if (mode[c] == 1) {
             zap__k_pcost(t, n, lp);
-            if (oend - o < 128) { o = NULL; break; }
-            for (int i = 0; i < 128; i++) *o++ = (uint8_t)(lp[0][2 * i] | lp[0][2 * i + 1] << 4);
-            o = zap__k_parts(o, oend, t, n, 8, NULL, (const uint8_t(*)[256])lp);
+            size_t h = zap__k_tw(o, oend, (const uint8_t(*)[256])lp, 1);
+            o = h ? zap__k_parts(o + h, oend, t, n, 8, NULL, (const uint8_t(*)[256])lp) : NULL;
         } else o = zap__k_parts(o, oend, t, n, 6, glit, (const uint8_t(*)[256])lc[dflag[c]]);
         if (o) { rec[0] = mode[c]; zap__w32(rec + 1, (uint32_t)(o - rec - 5)); }
     }
@@ -1980,9 +2096,11 @@ static inline int zap__k_dlits(const uint8_t *in, size_t sz, const uint8_t *chun
     if (sz < 1 || in[0] > 3) return -1;
     int sets = in[0];
     ip = in + 1;
+    zap__ktl tl[16];
     for (int d = 0; d < 2; d++) if (sets >> d & 1) { /* literal and delta table sets */
-        if ((size_t)(ie - ip) < 16 * 128 || zap__k_tables(ip, 16, glit, 10, Tc + ((size_t)d << 14), x)) return -1;
-        ip += 16 * 128;
+        ptrdiff_t h = zap__k_tr(ip, (size_t)(ie - ip), 16, tl);
+        if (h < 0 || zap__k_tables(tl, 16, glit, 10, Tc + ((size_t)d << 14), x)) return -1;
+        ip += h;
     }
     for (size_t c = 0; c < nch; c++) {
         size_t w = zap__r32(chunks + 4 * c), n = w & 0x7FFFFFFFu, d = w >> 31;
@@ -1993,7 +2111,10 @@ static inline int zap__k_dlits(const uint8_t *in, size_t sz, const uint8_t *chun
         if (rs > (size_t)(ie - ip)) return -1;
         if (m == 0) { if (rs != n) return -1; memcpy(out + done, ip, n); }
         else if (!n) return -1;
-        else if (m == 1) { if (rs < 128 || zap__k_tables(ip, 1, NULL, 11, Tp, x) || ZAP__KCALL(x, zap__k_p8)(ip + 128, rs - 128, out + done, n, Tp)) return -1; }
+        else if (m == 1) {
+            ptrdiff_t h = zap__k_tr(ip, rs, 1, tl);
+            if (h < 0 || zap__k_tables(tl, 1, NULL, 11, Tp, x) || ZAP__KCALL(x, zap__k_p8)(ip + h, rs - (size_t)h, out + done, n, Tp)) return -1;
+        }
         else if (m == 2) { if (!(sets >> d & 1) || ZAP__KCALL(x, zap__k_c6)(ip, rs, out + done, n, Tc + (d << 14))) return -1; }
         else return -1;
         ip += rs; done += n;
@@ -2074,8 +2195,15 @@ static inline size_t zap__k_encode(const uint8_t *src, const zap__kseq *q, size_
     if (!buf || !cb || cap < 24 + 4 * maxch) { free(buf); free(cb); return 0; }
     uint8_t *lits = buf, *dls = lits + raw, *toks = dls + raw, *offc = toks + maxseq, *nlo = offc + maxseq, *flo = nlo + maxseq,
             *fmi = flo + maxseq, *fhi = fmi + maxseq, *dfl = fhi + maxseq, *lens = dfl + maxch;
+    enum { MAXR = 64 }; /* regions per block for the split streams (more: the last one takes the rest) */
+    size_t bs[MAXR + 1], bl[MAXR + 1], bn[MAXR + 1], bf[MAXR + 1]; /* region starts: sequences, length bytes, near, far */
+    int nr = (int)((raw + ZAP__K_REG - 1) / ZAP__K_REG), cr = 0;
+    if (nr < 1) nr = 1;
+    if (nr > MAXR) nr = MAXR;
+    bs[0] = bl[0] = bn[0] = bf[0] = 0;
     for (size_t i = 0; i < nq; i++) {
         if (!nch || pos >= cend) { cb[nch++] = nl; cend = (pos / ZAP__K_CHUNK + 1) * ZAP__K_CHUNK; }
+        while (cr + 1 < nr && pos + q[i].ll >= (size_t)(cr + 1) * ZAP__K_REG) { cr++; bs[cr] = ns; bl[cr] = nlen; bn[cr] = nn; bf[cr] = nf; }
         size_t ll = q[i].ll, ml = q[i].ml, off = q[i].off, v;
         for (size_t t = 0; t < ll; t++) { lits[nl + t] = src[pos + t]; dls[nl + t] = (uint8_t)(src[pos + t] - (lo ? src[pos + t - lo] : 0)); }
         nl += ll; pos += ll;
@@ -2107,13 +2235,14 @@ static inline size_t zap__k_encode(const uint8_t *src, const zap__kseq *q, size_
         for (size_t c = 0; c < nch; c++) zap__w32(ls - 4 * nch + 4 * c, (uint32_t)(cb[c + 1] - cb[c]) | (uint32_t)dfl[c] << 31);
     }
     zap__grp_tok(gtok);
-    op = zap__k_stream(op, oend, toks, ns, gtok, 11);
-    op = zap__k_stream(op, oend, lens, nlen, NULL, 11);
-    op = zap__k_stream(op, oend, offc, ns, NULL, 11);
-    op = zap__k_stream(op, oend, nlo, nn, NULL, 11);
-    op = zap__k_stream(op, oend, flo, nf, NULL, 11);
-    op = zap__k_stream(op, oend, fmi, nf, NULL, 11);
-    op = zap__k_stream(op, oend, fhi, nf, NULL, 11);
+    while (++cr <= nr) { bs[cr] = ns; bl[cr] = nlen; bn[cr] = nn; bf[cr] = nf; } /* the rest, and the ends */
+    op = zap__k_rstream(op, oend, toks, ns, gtok, 11, bs, nr);
+    op = zap__k_rstream(op, oend, lens, nlen, NULL, 11, bl, nr);
+    op = zap__k_rstream(op, oend, offc, ns, NULL, 11, bs, nr);
+    op = zap__k_rstream(op, oend, nlo, nn, NULL, 11, bn, nr);
+    op = zap__k_rstream(op, oend, flo, nf, NULL, 11, bf, nr);
+    op = zap__k_rstream(op, oend, fmi, nf, NULL, 11, bf, nr);
+    op = zap__k_rstream(op, oend, fhi, nf, NULL, 11, bf, nr);
     free(buf); free(cb);
     return op ? (size_t)(op - dst) : 0;
 }
@@ -2134,8 +2263,11 @@ static inline uint64_t zap__k_hbits(const uint32_t *h) {
     for (int i = 0; i < 256; i++) b += (uint64_t)h[i] * len[i];
     return b;
 }
-static inline void zap__k_costs(const uint8_t *src, const zap__kseq *q, size_t nq, unsigned S, zap__kc *c, uint32_t seq) {
-    uint32_t (*f)[256] = (uint32_t(*)[256])calloc(54, sizeof *f); /* 16 tok, 16 lit, oc, nlo, flo, fmi, fhi, -, 16 delta */
+/* prices per region of ZAP__K_REG output bytes (the coder's tables are per region too): c[0..nr), each from its
+   region's counts plus the block's at 1 / (2 nr) weight (a prior for sparse regions) */
+static inline void zap__k_costs(const uint8_t *src, const zap__kseq *q, size_t nq, unsigned S, zap__kc *c, int nr, uint32_t seq) {
+    enum { NT = 54 }; /* 16 tok, 16 lit, oc, nlo, flo, fmi, fhi, -, 16 delta */
+    uint32_t (*f)[NT][256] = (uint32_t(*)[NT][256])calloc((size_t)nr + 1, sizeof *f), (*fg)[256]; /* f[nr]: the block */
     uint8_t len[256], gt[256];
     size_t n = 0;
     for (size_t i = 0; i < nq; i++) n += q[i].ll + q[i].ml;
@@ -2143,6 +2275,7 @@ static inline void zap__k_costs(const uint8_t *src, const zap__kseq *q, size_t n
     uint8_t *dreg = (uint8_t *)realloc(c->dreg, n / ZAP__K_CHUNK + 1);
     if (!f || !h || !dreg) { free(f); free(h); return; }
     c->dreg = dreg; c->nreg = n / ZAP__K_CHUNK + 1;
+    fg = f[nr];
     zap__grp_tok(gt);
     zap__ksc_set(&c->sc, S);
     uint32_t rep[3] = { 0, 0, 0 };
@@ -2151,34 +2284,44 @@ static inline void zap__k_costs(const uint8_t *src, const zap__kseq *q, size_t n
         for (size_t k = 0; k < q[i].ll; k++) { size_t p = pos + k; h[p / ZAP__K_CHUNK][0][src[p]]++; h[p / ZAP__K_CHUNK][1][(uint8_t)(src[p] - (lo ? src[p - lo] : 0))]++; }
     for (size_t r = 0; r < c->nreg; r++) { uint64_t br = zap__k_hbits(h[r][0]); dreg[r] = zap__k_hbits(h[r][1]) + br / 80 < br; } /* deltas 1.2% smaller */
     free(h);
+#define ZAP__KRG(p) ((size_t)(p) / ZAP__K_REG < (size_t)nr ? (size_t)(p) / ZAP__K_REG : (size_t)nr - 1)
     for (size_t i = 0, pos = 0, lo = 0; i < nq; i++) {
         for (size_t k = 0; k < q[i].ll; k++) {
             size_t p = pos + k;
             unsigned v = dreg[p / ZAP__K_CHUNK] ? (uint8_t)(src[p] - (lo ? src[p - lo] : 0)) : src[p];
-            f[dreg[p / ZAP__K_CHUNK] ? 38 + pl : 16 + pl][v]++; pl = v >> 4;
+            f[ZAP__KRG(p)][dreg[p / ZAP__K_CHUNK] ? 38 + pl : 16 + pl][v]++; pl = v >> 4;
         }
         pos += q[i].ll;
         if (!q[i].ml) break;
         if (!q[i].off) { pos += q[i].ml; rep[0] = rep[1] = rep[2] = 0; lo = 0; continue; } /* a gap */
         lo = q[i].off;
         size_t off = q[i].off, v;
+        uint32_t (*fr)[256] = f[ZAP__KRG(pos)];
         unsigned tok = zap__k_tok(q[i].ll, q[i].ml);
-        f[pg][tok]++; pg = gt[tok];
+        fr[pg][tok]++; pg = gt[tok];
         int slot = zap__rep_slot(off, rep);
-        if (slot >= 0) f[32][slot]++;
+        if (slot >= 0) fr[32][slot]++;
         else {
             unsigned s = zap__k_ocls(&c->sc, off, &v);
-            f[32][s]++;
-            if (s < 254) f[33][v & 255]++; else { f[34][v & 255]++; f[35][(v >> 8) & 255]++; f[36][(v >> 16) & 255]++; }
+            fr[32][s]++;
+            if (s < 254) fr[33][v & 255]++; else { fr[34][v & 255]++; fr[35][(v >> 8) & 255]++; fr[36][(v >> 16) & 255]++; }
         }
         zap__rep_push(rep, off);
         pos += q[i].ml;
     }
-#define ZAP__KL(fr, to) do { zap__hlens(fr, len); for (int i_ = 0; i_ < 256; i_++) (to)[i_] = 16u * (len[i_] ? len[i_] : ZAP__HMAX + 2); } while (0)
-    for (int g = 0; g < 16; g++) { ZAP__KL(f[g], c->tok[g]); ZAP__KL(f[16 + g], c->lit[g]); ZAP__KL(f[38 + g], c->dlit[g]); }
-    ZAP__KL(f[32], c->oc); ZAP__KL(f[33], c->nlo); ZAP__KL(f[34], c->flo); ZAP__KL(f[35], c->fmi); ZAP__KL(f[36], c->fhi);
+#undef ZAP__KRG
+    for (int r = 0; r < nr; r++) for (int t = 0; t < NT; t++) for (int i = 0; i < 256; i++) fg[t][i] += f[r][t][i];
+    for (int r = 0; r < nr; r++) {
+        zap__kc *cr = c + r;
+        uint32_t (*fr)[256] = f[r], hb[256];
+#define ZAP__KL(t_, to) do { for (int i_ = 0; i_ < 256; i_++) hb[i_] = 2u * (uint32_t)nr * fr[t_][i_] + fg[t_][i_]; zap__hlens(hb, len); \
+                             for (int i_ = 0; i_ < 256; i_++) (to)[i_] = 16u * (len[i_] ? len[i_] : ZAP__HMAX + 2); } while (0)
+        for (int g = 0; g < 16; g++) { ZAP__KL(g, cr->tok[g]); ZAP__KL(16 + g, cr->lit[g]); ZAP__KL(38 + g, cr->dlit[g]); }
+        ZAP__KL(32, cr->oc); ZAP__KL(33, cr->nlo); ZAP__KL(34, cr->flo); ZAP__KL(35, cr->fmi); ZAP__KL(36, cr->fhi);
 #undef ZAP__KL
-    c->lenb = 16 * 7; c->seq = seq; c->pfar = 32; c->farat = 256u << 10; /* ~2 bits against far (cache-missing) sources */
+        cr->lenb = 16 * 7; cr->seq = seq; cr->pfar = 32; cr->farat = 256u << 10; /* ~2 bits against far (cache-missing) sources */
+        if (r) { cr->dreg = c->dreg; cr->nreg = c->nreg; cr->sc = c->sc; } /* shared: c[0] owns dreg */
+    }
     free(f);
 }
 /* the offset's part of a match price (repeat slot or new offset), and the length / token part */
@@ -2281,7 +2424,8 @@ static inline size_t zap__k_lazy(size_t n, const zap__kmt *t, zap__kseq *out) {
     return nq + 1;
 }
 /* the parse, as sequences into out (room for n / 3 + 2); returns the count, 0 = out of memory */
-static inline size_t zap__compress_ma(const uint8_t *src, size_t n, size_t base, zap__kseq *out, const zap__kmt *mt, const zap__kc *cm, int K) {
+static inline size_t zap__compress_ma(const uint8_t *src, size_t n, size_t base, zap__kseq *out, const zap__kmt *mt, const zap__kc *cms, int ncm, int K) {
+    const zap__kc *cm = cms;
     const uint8_t *iend = src + n;
     uint8_t gtk[256];
     size_t slots = ZAP__OPTN + ZAP__SUFF + 2, anchor = 0, start = 0, limit = n >= 13 ? n - 12 : 0, nq = 0;
@@ -2296,7 +2440,8 @@ static inline size_t zap__compress_ma(const uint8_t *src, size_t n, size_t base,
 #define ZAP__A(p) (arr + (size_t)(p) * (size_t)K)
 #define ZAP__G(l, L) gtk[zap__k_tok(l, L)]
     while (start < limit) {
-        size_t last = 0, p, fl = 0, fo = 0;
+        size_t last = 0, p, fl = 0, fo = 0, cr_ = (base + start) / ZAP__K_REG;
+        cm = cms + (cr_ < (size_t)ncm ? cr_ : (size_t)ncm - 1); /* this window's region's prices */
         zap__arr a0 = { 0, 0, (uint32_t)(start - anchor), { reps[0], reps[1], reps[2] }, 0, 0, (uint8_t)lastpg, (uint8_t)(start ? src[start - 1] >> 4 : 0), { 0, 0, 0 } };
         na[0] = 1; ZAP__A(0)[0] = a0; wp[0] = K == 1 ? 0 : 0xFFFFFFFFu;
         for (p = 0; p <= last && p < ZAP__OPTN && start + p < limit; p++) {
@@ -2584,6 +2729,22 @@ static inline ptrdiff_t zap__k_decompress(const uint8_t *ip, size_t n, uint8_t *
         else if (m == 0) {
             if (L || sz != cnt[k]) goto out;
             if (k == 4) { memcpy(w, ip, sz); st[k] = w; w += cnt[k] + pad; } else st[k] = ip; /* near low bytes are read past their end */
+        } else if (m == 4) { /* regional: sub-streams [u32 count][stream record], each with its own tables */
+            const uint8_t *sp = ip, *se = ip + sz;
+            size_t done = 0;
+            if (L) goto out;
+            while (sp < se) {
+                if (se - sp < 9) goto out;
+                size_t c = zap__r32(sp), ss = zap__r32(sp + 5);
+                int sm = sp[4] & 15, sL = sp[4] >> 4;
+                sp += 9;
+                if (ss > (size_t)(se - sp) || !c || c > cnt[k] - done) goto out;
+                if (sm == 0) { if (sL || ss != c) goto out; memcpy(w + done, sp, c); }
+                else if (sm > 2 || zap__k_dstream(sm, sL, sp, ss, w + done, c, k == 1 ? gtok : NULL, tab)) goto out;
+                done += c; sp += ss;
+            }
+            if (done != cnt[k]) goto out;
+            st[k] = w; w += cnt[k] + (k == 4 ? pad : 0);
         } else {
             if (zap__k_dstream(m, L, ip, sz, w, cnt[k], k == 1 ? gtok : NULL, tab)) goto out;
             st[k] = w; w += cnt[k] + (k == 4 ? pad : 0);
@@ -2606,7 +2767,7 @@ out:
    stored: their matches become literals (which then stay raw). Near-random data (BC7 textures) otherwise keeps
    hundreds of barely-paying 3-byte matches per region, each a sequence to decode (~20 ticks) where a memcpy would
    do; Kraken stores such quanta. Returns the new sequence count. */
-static inline size_t zap__k_store(zap__kseq *q, size_t nq, const zap__kc *cm) {
+static inline size_t zap__k_store(zap__kseq *q, size_t nq, const zap__kc *cms, int ncm) {
     size_t n = 0, nr, w = 0, carry = 0;
     for (size_t i = 0; i < nq; i++) n += q[i].ll + q[i].ml;
     nr = n / ZAP__K_CHUNK + 1;
@@ -2618,6 +2779,7 @@ static inline size_t zap__k_store(zap__kseq *q, size_t nq, const zap__kc *cm) {
     unsigned pg = 0;
     for (size_t i = 0, pos = 0; i < nq && q[i].ml; i++) {
         pos += q[i].ll;
+        const zap__kc *cm = cms + (pos / ZAP__K_REG < (size_t)ncm ? pos / ZAP__K_REG : (size_t)ncm - 1);
         save[pos / ZAP__K_CHUNK] += 128 * (int64_t)q[i].ml - (int64_t)zap__k_lprice(cm, q[i].ml, q[i].ll, pg) - (int64_t)zap__k_oprice(cm, q[i].off, rep);
         pg = gt[zap__k_tok(q[i].ll, q[i].ml)];
         zap__rep_push(rep, q[i].off);
@@ -2635,12 +2797,12 @@ static inline size_t zap__k_store(zap__kseq *q, size_t nq, const zap__kc *cm) {
 /* The first pass is only there for its statistics: every other 64 KB is enough (-0.03%, half the work). The
    segments' parses are joined by gaps. */
 #define ZAP__K_SEG (64u << 10)
-static inline size_t zap__k_sampled(const uint8_t *src, size_t n, zap__kseq *out, const zap__kmt *mt, const zap__kc *cm, int K) {
+static inline size_t zap__k_sampled(const uint8_t *src, size_t n, zap__kseq *out, const zap__kmt *mt, const zap__kc *cm, int ncm, int K) {
     size_t nq = 0, at = 0;
     do { /* at least one segment, even an empty one */
         size_t sl = n - at < ZAP__K_SEG ? n - at : ZAP__K_SEG, gap = n - at - sl < ZAP__K_SEG ? n - at - sl : ZAP__K_SEG, k;
         zap__kmt v = { mt->idx + at, mt->m }; /* the table from here on */
-        if (!(k = zap__compress_ma(src + at, sl, at, out + nq, &v, cm, K))) return 0;
+        if (!(k = zap__compress_ma(src + at, sl, at, out + nq, &v, cm, ncm, K))) return 0;
         nq += k;
         out[nq - 1].ml = (uint32_t)gap; /* the segment's trailing literals, then the skipped one (none: the end) */
     } while ((at += 2 * ZAP__K_SEG) < n);
@@ -2655,16 +2817,19 @@ static inline size_t zap__k_compress(const uint8_t *src, size_t n, uint8_t *dst,
     int lv = depth >= 128 ? 3 : depth >= 64 ? 2 : depth >= 48 ? 1 : 0;
     size_t r = 0, nq = 0;
     zap__kseq *q = (zap__kseq *)malloc(sizeof(zap__kseq) * (n / 3 + 2));
-    zap__kc *cm = (zap__kc *)malloc(sizeof *cm);
+    int ncm = (int)((n + ZAP__K_REG - 1) / ZAP__K_REG);
+    if (ncm < 1) ncm = 1;
+    if (ncm > 64) ncm = 64; /* as the coder: the last region takes the rest */
+    zap__kc *cm = (zap__kc *)malloc(sizeof *cm * (size_t)ncm);
     zap__kmt mt = { NULL, NULL };
     if (cm) { cm->dreg = NULL; cm->nreg = 0; }
     if (q && cm && !zap__kmt_build(&mt, src, n, hc, depth < 128 ? 128 : depth)) {
         nq = zap__k_lazy(n, &mt, q);
         for (int pass = 0; nq && pass < 4 && sched[lv][pass]; pass++) {
-            zap__k_costs(src, q, nq, zap__k_scale(q, nq), cm, 24); /* sequence penalty 1.5 bits: fewer, longer sequences; ratio-neutral */
-            nq = pass ? zap__compress_ma(src, n, 0, q, &mt, cm, sched[lv][pass]) : zap__k_sampled(src, n, q, &mt, cm, sched[lv][pass]);
+            zap__k_costs(src, q, nq, zap__k_scale(q, nq), cm, ncm, 24); /* sequence penalty 1.5 bits: fewer, longer sequences; ratio-neutral */
+            nq = pass ? zap__compress_ma(src, n, 0, q, &mt, cm, ncm, sched[lv][pass]) : zap__k_sampled(src, n, q, &mt, cm, ncm, sched[lv][pass]);
         }
-        if (nq) nq = zap__k_store(q, nq, cm);
+        if (nq) nq = zap__k_store(q, nq, cm, ncm);
         if (nq) r = zap__k_encode(src, q, nq, zap__k_scale(q, nq), n, dst, cap, rawpct);
     }
     zap__kmt_free(&mt); free(q);
