@@ -4,7 +4,7 @@ Single-header C compression for games:
 
 | Header | What it does |
 |---|---|
-| `zap.h` | Fast LZ77 compressor for **asset packaging** and **network packets**, with an optional Huffman-coded **entropy mode** |
+| `zap.h` | Fast LZ77 compressor for **asset packaging** and **network packets**, with a Kraken-class Huffman **entropy mode** and a Selkie-class **turbo** format |
 | `zap_tex.h` | GPU texture block compression (**BC1/BC3/BC4/BC5/BC7**, **BC6H** for HDR, and **ASTC 4×4** for mobile) with rate-distortion optimisation tuned for `zap.h`, and **mipmap** generation |
 | `zap_video.h` | Fast-decoding **video codec** for cutscenes and UI video, with the seekable **.zapvid** file format. Decodes 2–6× faster than H.264 on one thread and 2–3× faster on all threads (multi-threaded SSE2 decoder) |
 | `zap_pak.h` | **.zappak** archives: many named files, one zap frame each, with a sorted table of contents |
@@ -39,7 +39,8 @@ Fractal zooms are close to worst-case content for zap. Here zap needs about 4× 
 - **One header, no dependencies.** Drop `zap.h` into your project.
 - **Fast decode.** About 2.3–3.2 GB/s per core (3.6 GB/s with `ZAP_FAST_DECODE`), and 9–11 GB/s across 8 threads on packaged data.
 - **Two compressors, one format.** `fast` runs at hundreds of MB/s for runtime use. `hc` is slower but gives smaller files for offline packaging. At depth 32 and up it runs an optimal parser, which picks the cheapest set of matches for the whole block rather than the best match at each position. That gives smaller files *and* faster decoding. The same decoder reads all of them.
-- **Entropy mode.** It re-codes the matches as Huffman streams, with a repeat-offset code. With the optimal parser (two passes, the second priced with the first's Huffman code lengths) it reaches ratio 2.52 at 1.3 GB/s decode, ahead of zstd 9 (2.47 at the same speed).
+- **Entropy mode (Kraken tier).** At depth 32 and up it runs a multi-arrival optimal parse priced exactly as the block is coded: three repeat offsets, byte-coded offsets with a per-block stride, contextual Huffman tokens, and literals coded per 128 KB chunk (raw, Huffman, contextual or as deltas). On game data it compresses smaller than Oodle Kraken level 8 and decodes at 0.88× Kraken's speed. On executables Kraken is still about 5% smaller. See [the comparison](#zap-vs-oodle-zstd-and-lz4).
+- **Turbo blocks.** One token byte per command, indexing the block's own table of its most common commands, so no decode step waits on a byte it just loaded. On game data it decodes faster than Oodle Selkie at the same ratio.
 - **Safe on untrusted input.** Every read and write in the decoder is bounds-checked, and it only writes inside the output buffer you give it. It's fuzzed under AddressSanitizer and UBSan in CI.
 - **Packet dictionaries.** Train a shared dictionary once, then compress 50–200 byte packets that would otherwise barely shrink.
 - **Parallel frames.** Packaging frames hold independent blocks. Compress or decode them on built-in threads, or hand single blocks to your own job system.
@@ -57,8 +58,8 @@ Fractal zooms are close to worst-case content for zap. Here zap needs about 4× 
 size_t cap = zap_frame_bound(n, 4 << 20);
 void  *out = malloc(cap);
 size_t size = zap_frame_compress_mt(asset, n, out, cap, 4 << 20 /* block */, 64 /* hc depth, 0 = fast */, NULL, 8);
-/* depth >= 32 = optimal parse.  | ZAP_ENTROPY: ~20% smaller, ~40% of the decode speed (version-2 frame, same decode calls)
-   | ZAP_FAST_DECODE: fewer, longer matches -> ~15% faster decode, ~3.5% bigger (plain format) */
+/* depth >= 32 = optimal parse.  | ZAP_ENTROPY: ~25% smaller, ~55% of the decode speed (version-2 frame, same decode calls)
+   | ZAP_TURBO: ~1-7% smaller than plain, ~1.85x its decode speed   | ZAP_FAST_DECODE: faster decode, a little bigger */
 
 /* decompress (at runtime) */
 zap_frame f;
@@ -388,65 +389,52 @@ These are single runs on an AMD Ryzen 7 5800X (8 cores) with clang 18 `-O3 -marc
 - **Encoding:** on 16 threads zap encoded the 720p pan clip at 193 fps and x264 `medium` at 70 fps.
 - **Quality:** H.264 is far better per bit: 8 dB higher PSNR at the same bitrate. zap buys speed and a small, hardened decoder with bitrate. Hardware H.264 decoders (DXVA, NVDEC and friends) weren't compared.
 
-### zap vs LZ4 vs zstd
+### zap vs Oodle, zstd and LZ4
 
-(Measured with zap 1.2; 1.3's entropy version 2 is smaller and somewhat slower to decode, see the Oodle comparison below.) These results use the same 92.6 MB binary corpus, split into 4 MB blocks, on one thread, taking the best of several runs, with only light background load. Reproduce them with [`tools/compare.c`](tools/compare.c). zstd 1.5.2 was built from source without its x64 assembly Huffman decoder, which may cost its decompressor some speed.
+All on one thread with 4 MB blocks, compression timed once and decoding the best of interleaved rounds. Reproduce them with [`tools/compare.c`](tools/compare.c) (`zap_compare --oodle <dll>` on Windows).
 
-| Codec | Ratio | Compress | Decompress |
+**Game data against Oodle 2.8.** A 32 MB sample of a Source-engine VPK (Portal Revolution `pak01_010.vpk`: 8 evenly spaced 4 MB pieces, mostly DXT textures), Oodle loaded in-process from the game's DLL. Ryzen 7 5800X, clang 18 `-march=native`, Windows 11.
+
+| Codec | Ratio | Compress | Decode |
 |---|---|---|---|
-| lz4 1.9.4 | 1.62 | 814 MB/s | 4863 MB/s |
-| lz4hc 12 | 2.02 | 15 MB/s | 4711 MB/s |
-| zap fast | 1.77 | 412 MB/s | 2441 MB/s |
-| zap hc16 | 2.05 | 25 MB/s | 2734 MB/s |
-| zap hc64 | 2.12 | 4 MB/s | 3155 MB/s |
-| zap hc64 `ZAP_FAST_DECODE` | 2.05 | 4 MB/s | 3645 MB/s |
-| zstd 1 | 2.02 | 558 MB/s | 1294 MB/s |
-| zstd 3 | 2.26 | 257 MB/s | 1290 MB/s |
-| zstd 9 | 2.47 | 80 MB/s | 1327 MB/s |
-| zstd 19 | 2.73 | 6 MB/s | 1057 MB/s |
-| zap fast + entropy | 2.10 | 218 MB/s | 1165 MB/s |
-| zap hc16 + entropy | 2.38 | 24 MB/s | 1303 MB/s |
-| **zap hc64 + entropy** | **2.52** | 2 MB/s | **1311 MB/s** |
+| Oodle Selkie | 2.600 | | 6.2–6.4 GB/s |
+| **zap turbo (`ZAP_TURBO`, depth 64)** | **2.607** | | **6.6–6.8 GB/s** |
+| Oodle Kraken level 5 | 3.222 | 7.2 MB/s | |
+| Oodle Kraken level 6 (Optimal2) | 3.300 | 4.5 MB/s | ~2.06 GB/s |
+| zap entropy, depth 32 | 3.313 | 4.7 MB/s | |
+| zap entropy, depth 48 | 3.327 | 3.3 MB/s | |
+| Oodle Kraken level 7 | 3.342 | 3.5 MB/s | |
+| Oodle Kraken level 8 | 3.357 | 1.8 MB/s | |
+| **zap entropy, depth 64** | **3.364** | ~1.0 MB/s | 0.88× Kraken 6 (0.98× with `ZAP_FAST_DECODE`) |
+| zap entropy, depth 128 | 3.372 | ~0.5 MB/s | |
+| Oodle Leviathan | 3.358 | | 1.2 GB/s |
 
-- **Entropy mode:** it compresses smaller than zstd 9 at the same decode speed. zstd 19 still compresses smaller (2.73), because zap has no FSE/ANS entropy coder and no larger-scale parsing yet. zap's compressor is also much slower than zstd's at similar ratios.
-- **Plain format:** it compresses a little smaller than LZ4-HC, and LZ4 decodes about 1.3–1.5× faster. At matched ratio (`ZAP_FAST_DECODE`, 2.05 vs lz4hc 12's 2.02), zap decodes at about 78% of LZ4's speed.
-- **What's left of the plain gap:** an LZ4-format decoder written in zap's style runs about 14% slower than LZ4's own decoder on the same data. That's what zap's decoder hardening costs (every copy is bounds-checked and output is exact-size). The rest comes from zap's 8 MB match window and its 2- or 3-byte offsets.
-- **Oodle, zap 1.3 (entropy version 2):** a 32 MB sample of the same VPK (8 evenly spaced 4 MB pieces), 4 MB blocks, one thread, measured with `zap_compare --oodle` (`tools/compare.c`, built by CMake on Windows). Oodle 2.8 at Optimal2 (level 6).
+- **Turbo** decodes faster than Selkie at a slightly better ratio. Compression speeds for depths 32 and 48 were measured before delta literals, which cost the parse about 5%.
+- **Entropy v3** matches Kraken level 6 at depth 32, compressing at the same speed. At depth 64 and up it is smaller than Kraken level 8, and even Leviathan. On a second, mixed sample (BC7 textures, an executable, a heightmap, a nav mesh, Lua) depth 64 reaches 2.193 and depth 128 2.200, against Kraken 2.135 (level 6), 2.172 (level 7) and 2.197 (level 8).
+- **Decode speed** is the gap left: 0.88× Kraken on the pak sample (0.98× with `ZAP_FAST_DECODE` at 3.285) and 0.78× on the mixed sample. These decode ratios were measured before delta literals; [docs/decoder-notes.md](docs/decoder-notes.md) has the breakdown.
 
-  | Codec | Ratio | Decode |
-  |---|---|---|
-  | zap hc64 (1.2) | 2.528 | 2.5 GB/s |
-  | lz4hc 12 | 2.565 | 5.0 GB/s |
-  | Oodle Selkie | 2.600 | 5.8 GB/s |
-  | **zap hc64 (1.3)** | **2.616** | not yet re-measured |
-  | zap hc64 + entropy (1.2) | 2.876 | 1.6 GB/s |
-  | zap hc64 + entropy (1.3, entropy v2 only) | 3.045 | 1.3 GB/s |
-  | Oodle Mermaid | 3.054 | 3.2 GB/s |
-  | zstd 19 | 3.074 | 0.9 GB/s |
-  | **zap hc64 + entropy (1.3)** | **3.232** | not yet re-measured |
-  | Oodle Kraken | 3.300 | 1.8 GB/s |
-  | Oodle Leviathan | 3.358 | 1.2 GB/s |
+**Other data, against ooz.** Oodle itself only runs on the Windows box above, so this release was also measured on Linux against [ooz](https://github.com/zao/ooz), an open-source implementation of Kraken, Mermaid, Selkie and Leviathan. ooz's compressors are close to Oodle's. Its decoder is not Oodle's, so treat its decode column as a floor for Oodle. Two 32 MB samples: Linux binaries (`/usr/bin`, `/usr/lib`), and a mix of BC1/BC3/BC7 textures (screenshots) with binaries. Xeon @ 2.8 GHz (4 cores, shared), clang 18 `-march=native`. ooz was patched locally so its Huffman length limiter handles 4 MB blocks.
 
-  - Entropy version 2 (three repeat offsets tracked by the optimal parser, low offset bits entropy coded): +5.9% on this data.
-  - A binary-tree match finder for the optimal parser (hc depth ≥ 32) instead of hash chains: +2.5% plain, +1.8% entropy, and faster compression. Hash chains stop after `depth` candidates, newest first; the tree walks straight to the positions sharing the longest prefix.
-  - Longer matches priced exactly (up to 256 bytes instead of 64) and a second re-pricing pass in entropy mode: another +0.9% plain, +1.1% entropy.
-  - Plain zap now compresses slightly smaller than Selkie (2.616 vs 2.600) and entropy mode passes Mermaid's ratio (3.232 vs 3.054; low offset nibbles are Huffman coded in pairs, +0.8%, and literals and tokens use contextual Huffman, +2.3%). Kraken is still 2.1% smaller, Oodle decodes much faster, and zap's optimal parser compresses several times slower than Oodle's (about 0.5–1.5 MB/s against 2–4 MB/s here, one thread). Decode speeds with the new parse are pending a measurement on an idle machine: the machine these ran on was fully loaded, which made timing noise larger than the effects being measured.
-  - The remaining decode gap, from AMD uProf counters: store-to-load forwarding stalls and misaligned loads in the sequence loop, and Huffman-decoding literals that barely compress on this data (7.7 bits per 8).
-- **Oodle, zap 1.2:** measured with `zap_viewer`'s Package tab on a 225 MB Source-engine VPK from Portal Revolution (uncompressed game data: textures, models, sounds), 4 MB blocks, with Oodle 2.8 (`oo2ext_8_win64.dll`) as shipped by a game. Ratios are exact. Decode speeds are single-thread and were measured while other work was running, so treat them as rough.
+| Codec | Binaries: ratio | compress | decode | Mixed: ratio | compress | decode |
+|---|---|---|---|---|---|---|
+| lz4hc 12 | 2.253 | 6 MB/s | 2597 MB/s | 2.719 | 7 MB/s | 3028 MB/s |
+| zap hc64 (plain) | 2.479 | 3 MB/s | 1593 MB/s | 2.807 | 3 MB/s | 2012 MB/s |
+| zap turbo (depth 64) | 2.653 | 1 MB/s | 2947 MB/s | 2.830 | 2 MB/s | 3746 MB/s |
+| ooz Selkie 6 | 2.726 | 2 MB/s | 3026 MB/s | 2.891 | 2 MB/s | 3285 MB/s |
+| ooz Mermaid 6 | 3.169 | 2 MB/s | 1577 MB/s | 3.567 | 2 MB/s | 1535 MB/s |
+| zstd 19 | 3.341 | 2 MB/s | 623 MB/s | 3.680 | 3 MB/s | 787 MB/s |
+| zap entropy, depth 32 | 3.252 | 2 MB/s | 899 MB/s | 3.744 | 3 MB/s | 1111 MB/s |
+| **zap entropy, depth 64** | **3.343** | 1 MB/s | **889 MB/s** | **3.841** | 1 MB/s | **1069 MB/s** |
+| zap entropy, depth 128 | 3.360 | <1 MB/s | 907 MB/s | 3.852 | <1 MB/s | 1075 MB/s |
+| ooz Kraken 5 | 3.468 | 3 MB/s | 582 MB/s | 3.894 | 4 MB/s | 670 MB/s |
+| ooz Kraken 6 | 3.513 | 1 MB/s | 584 MB/s | 3.962 | 1 MB/s | 685 MB/s |
+| ooz Kraken 8 | 3.581 | 1 MB/s | 566 MB/s | 4.019 | 1 MB/s | 691 MB/s |
+| ooz Leviathan 6 | 3.595 | 1 MB/s | 457 MB/s | 4.073 | 1 MB/s | 561 MB/s |
 
-  | Codec | Ratio | Decode (1 thread) |
-  |---|---|---|
-  | zap hc64 | 2.48 | 1.5 GB/s |
-  | zap hc64 `-x` | 2.41 | 1.8 GB/s |
-  | zap hc64 + entropy | 2.86 | 0.7 GB/s |
-  | lz4hc 12 | 2.49 | 2.3 GB/s |
-  | zstd 19 | 3.06 | 0.45 GB/s |
-  | Oodle Selkie (Optimal2) | 2.55 | 3.1 GB/s |
-  | Oodle Mermaid (Optimal2) | 3.02 | 1.6 GB/s |
-  | Oodle Kraken (Optimal2) | 3.27 | 0.6 GB/s |
-  | Oodle Leviathan (Optimal2) | 3.34 | 0.6 GB/s |
-
-  Oodle is ahead on this data. Selkie beats plain zap on both ratio and decode speed, and Mermaid decodes as fast as plain zap at a 3.02 ratio, 22% smaller than zap hc64. zap's entropy mode is closer to Kraken's ratio (2.86 vs 3.27) but not its speed class. Oodle is proprietary, so zap doesn't ship it; the Package tab loads your own DLL.
+- **Turbo vs Selkie** here: ooz's Selkie is 2–3% smaller. Turbo decodes 14% faster on the mixed sample and 3% slower on the binaries.
+- **Executables are Kraken's ground.** On these samples Kraken compresses 5% (binaries) and 3% (mixed) smaller than zap's depth 64, whose ratio there is level with zstd 19. zap decodes 1.5× faster than ooz's Kraken decoder.
+- **Where the gap comes from.** On a 4 MB block of binaries, Kraken leaves 33% fewer literals than zap: 40% of its commands are repeat-offset matches, many of them 2 and 3 bytes long, and it uses about twice as many 4-byte new matches. zap's contextual literals cost 5.9 bits against Kraken's 7.2, so zap's parse, re-priced from its own statistics pass by pass, settles on a literal-heavy parse. Details in [docs/decoder-notes.md](docs/decoder-notes.md).
+- **Plain format:** a little smaller than LZ4-HC, which decodes about 1.3–1.6× faster. With `ZAP_FAST_DECODE` the gap narrows, at a cost of about 3% in ratio.
 
 ## Format
 
@@ -580,9 +568,9 @@ On Windows, CMake builds `zap_viewer` and fetches Dear ImGui v1.92.7, LZ4 1.10.0
 
 ## Limitations
 
-- **Compression ratio:** entropy mode uses Huffman coding and an optimal parser, but there's no finite-state entropy coding (FSE/ANS) and no long-range matching yet. It beats zstd 9 and falls short of zstd 19.
-- **Decode speed:** the plain decoder is about 1.3–1.5× slower than LZ4 (see the comparison above).
-- **hc speed:** the optimal parser compresses at about 3 MB/s per core (1 MB/s with entropy mode's two passes). It's meant for offline builds. Blocks of 512 KB and up that three fast-compressor samples find incompressible (already-compressed audio, images, archives) skip the hc search and use the fast parse, which is 10–100× quicker on that data and gives up at most about 1.6% (the probe's threshold). The `_mt` variant helps, though with 32 MB of match-finder state per thread it's limited by memory bandwidth.
+- **Compression ratio:** entropy mode uses Huffman coding only (no FSE/ANS) and has no long-range matching beyond the block. It beats Oodle Kraken on texture-heavy game data, but Kraken is 3–5% smaller on executables and mixed binary data, where zap's depth 64 is level with zstd 19.
+- **Decode speed:** the plain decoder is about 1.3–1.6× slower than LZ4, and entropy v3 decodes at 0.78–0.88× of Oodle Kraken on game data (see the comparison above). Turbo is the fast-decode format.
+- **hc speed:** the optimal parser compresses at about 3 MB/s per core; entropy mode runs at about 2–5 MB/s at depth 32 and 0.5–1 MB/s at depth 64, with ~85 MB of match tables per 4 MB block. It's meant for offline builds. Blocks of 512 KB and up that three fast-compressor samples find incompressible (already-compressed audio, images, archives) skip the hc search and use the fast parse, which is 10–100× quicker on that data and gives up at most about 1.6% (the probe's threshold). The `_mt` variant helps, though with 32 MB of match-finder state per thread it's limited by memory bandwidth.
 - **Match distance:** matches reach at most 8 MB back. Blocks can be up to 2 GB.
 - **No stored sizes:** the raw block API doesn't record sizes, so store them yourself. Frames do record them.
 - **MSVC:** `ZAP_THREADS` needs MSVC 17.8+ for `<threads.h>`. You can skip it and use `zap_frame_decode_block` from your own threads instead.

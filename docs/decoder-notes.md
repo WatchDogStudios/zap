@@ -241,3 +241,51 @@ What got it there (from ~0.5 MB/s at depth 64):
 Tried: hash chains for the table (worse ratio, and quadratic on long runs); lower tree "nice" lengths (walks end on
 depth or leaves, not length); only the cheapest arrival trying new offsets (-0.4%); matches at interior lengths of
 long matches skipped (-0.1%); a copy of the parse per arrival count (noise).
+
+# 1.3.0 release audit
+
+## Fixed
+
+- **v3 encoder wrote undecodable blocks.** `zap__k_lits` chose each literal chunk's mode against table sets built
+  from the previous round's contextual chunks, and priced a symbol missing from them at 64 bits instead of ruling the
+  mode out. A chunk that turned contextual in the last round could carry a (group, symbol) pair with no code; the
+  encoder wrote nothing for it. Seen on one 4 MB block of Linux binaries at depth 64 (the game samples never hit it).
+- **Fuzzing** (libFuzzer + ASan/UBSan, ~2M executions per build: runtime CPUID, `-march=native`, and forced non-BMI2
+  decoders; every v3/turbo/frame header field at boundary values): no out-of-bounds access. Turbo table commands
+  accepted offsets 0-15, so a corrupt block could decode "successfully" with bytes dst held before. Now refused. v3's
+  far-offset array was aligned relative to the scratch pointer (misaligned with unaligned scratch). Now absolute.
+- `zap__hcodes` reversed codes one bit at a time: 2.2% of v3 decode instructions (~50 tables per 4 MB block). Now a
+  branch-free reverse: about +4% decode on mixed data, same output.
+- Frames with `ZAP_ENTROPY` at depth >= 32 ran the plain optimal parse before v3's own (15-18% of compression time).
+  It now runs only as a fallback and for blocks under 64 KB: 16% faster `zap c -e`, same output.
+
+## Against Kraken on executables (ooz)
+
+ooz (an open-source Kraken implementation; its Huffman length limiter needed a local fix for counts past 64K to
+compress 4 MB blocks) on 32 MB of Linux binaries: Kraken 6 3.513, Kraken 8 3.581 against zap depth 64's 3.343
+(zstd 19: 3.341). Decoding, zap is 1.5x ooz's decoder. One 4 MB block, by stream:
+
+| | zap depth 64 | Kraken 6 | Kraken 8 |
+|---|---|---|---|
+| total | 1,353,530 | 1,273,573 | 1,244,902 |
+| literals | 856,271 -> 632,516 B (5.9 bits) | 573,582 -> 518,692 B (7.2) | 513,492 -> 452,788 B (7.1) |
+| sequences | 317,957, 29% repeats | 395,356, 40% repeats | 426,218 |
+| everything else | 721 KB | 755 KB | 792 KB |
+
+Kraken covers ~280K more bytes with matches: twice zap's 4-byte new matches (59K vs 33K), and repeats of 2 bytes
+(29K; zap can't code them) and 3 bytes (26K vs 10K). zap codes each literal and each sequence cheaper. Its passes
+re-price from the previous parse, and cheap contextual literals keep the parse literal-heavy.
+
+Tried on that block and others (depth 64 unless noted):
+- Repeat matches from 2 bytes (match nibble counting from 2): -0.3% to +0.05%. Not the missing piece by itself.
+- No penalties (sequence 1.5 bits, far offsets 2 bits, stored regions), depth 32: +1.4% on the binaries block; the
+  sequence penalty is most of it (+0.8%); store never triggered there.
+- Tree depth 2048 instead of 128: identical parse.
+- Literals priced 1 bit dearer in every pass but the last: binaries +0.8%, mixed +0.15%, textures +0.5%; decode 1.5-5%
+  slower. With the sequence penalty halved as well: +1.1% / +0.3% / +0.6%, decode 4-7% slower. Neither shipped: they
+  are a point further along the same ratio/decode dial, and still 4% short of Kraken 6 on binaries.
+- Costlier arrivals trying repeat matches at full length only: 3-14% faster compression, -0.2% to +0.1% ratio.
+
+What's left for executables is the parse's equilibrium, not the coder: a parse that starts match-heavy and holds it
+(Kraken-like cheap short repeats, an x86 call/jump filter, or a literal cost that tracks the literals the parse will
+leave rather than the ones it left last pass).

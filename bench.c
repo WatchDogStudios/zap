@@ -420,7 +420,7 @@ static void bench_file(const uint8_t *src, size_t n, int threads) {
         { "fast, 256KB blocks", 256 << 10, 0 }, { "fast, 4MB blocks", 4 << 20, 0 },
         { "hc16, 4MB blocks", 4 << 20, 16 }, { "hc64, 4MB blocks", 4 << 20, 64 },
         { "fast+entropy, 4MB", 4 << 20, ZAP_ENTROPY }, { "hc16+entropy, 4MB", 4 << 20, 16 | ZAP_ENTROPY },
-        { "hc64+entropy, 4MB", 4 << 20, 64 | ZAP_ENTROPY } };
+        { "hc64+entropy, 4MB", 4 << 20, 64 | ZAP_ENTROPY }, { "hc64+turbo, 4MB", 4 << 20, 64 | ZAP_TURBO } };
     printf("\nfile: %.1f MB\n", n / 1e6);
     for (int k = 0; k < (int)(sizeof cfg / sizeof cfg[0]); k++) {
         size_t cap = zap_frame_bound(n, cfg[k].bs);
