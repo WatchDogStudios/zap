@@ -1466,8 +1466,8 @@ static inline void zap__cp16(uint8_t *d, const uint8_t *s) { uint8_t t[16]; memc
         memcpy(op, lp, 16);                                                                                          \
         op += ll; lp += ll;                                                                                          \
         uintptr_t m = (uintptr_t)op - off; /* integer math: the check reuses the address the copy needs */           \
-        if (m < (uintptr_t)dst) return -1;                                                                           \
-        zap__cp16(op, (const uint8_t *)m); /* off < 16 only in a corrupt block: may overlap */                       \
+        if (off < 16 || off > (size_t)(op - dst)) return -1; /* table commands carry offsets >= 16 */             \
+        zap__cp16(op, (const uint8_t *)m);                                                                           \
         zap__cp16(op + 16, (const uint8_t *)m + 16);                                                                 \
         op += (e >> 8) & 0xFF;                                                                                       \
     } while (0)
@@ -2552,7 +2552,7 @@ static inline ptrdiff_t zap__k_lz(const uint8_t *lits, size_t nl, const uint8_t 
 
 static inline ptrdiff_t zap__k_decompress(const uint8_t *ip, size_t n, uint8_t *dst, size_t raw_size, void *scratch, size_t scratch_cap) {
     const uint8_t *iend = ip + n;
-    if (n < 24) return -1;
+    if (n < 24 || raw_size > SIZE_MAX / 8) return -1; /* scratch arithmetic stays in range on 32-bit hosts */
     size_t nl = zap__r32(ip) & 0x3FFFFFFFu, ns = zap__r32(ip + 4), nlen = zap__r32(ip + 8), nn = zap__r32(ip + 12), nf = zap__r32(ip + 16),
            nch = zap__r32(ip + 20) & 0xFFFFFF, S = ip[23];
     ip += 24;
@@ -2567,7 +2567,7 @@ static inline ptrdiff_t zap__k_decompress(const uint8_t *ip, size_t n, uint8_t *
     if (!mem || scratch_cap < need) { if (!(mem = own = (uint8_t *)malloc(need))) return -1; }
     const uint8_t *st[8] = { NULL };
     uint8_t *w = mem;
-    uint32_t *FAR = (uint32_t *)(void *)(mem + ((bytes + 15) & ~(size_t)15));
+    uint32_t *FAR = (uint32_t *)(void *)(mem + bytes + ((16 - ((uintptr_t)(mem + bytes) & 15)) & 15)); /* scratch may be unaligned */
     uint8_t *tb = (uint8_t *)(FAR + nf + pad);
     uint16_t *tab = (uint16_t *)(void *)(tb + ((16 - ((uintptr_t)tb & 15)) & 15)), *tab2 = tab + (1u << 15);
     ptrdiff_t r = -1;
@@ -2783,6 +2783,7 @@ static inline int zap_frame_open(zap_frame *f, const void *src_, size_t n) {
 /* decode block i into dst (the whole raw_size output buffer). Thread-safe: call from any job. 0 ok, -1 corrupt.
  * scratch: zap_entropy_scratch(block_size) bytes reused across calls for entropy blocks, or NULL to malloc. */
 static inline int zap_frame_decode_block_ex(const zap_frame *f, size_t i, void *dst, const zap_dict *d, void *scratch, size_t scratch_cap) {
+    if (i >= f->nb) return -1;
     size_t start = i ? (size_t)zap__r64le(f->table + 8 * (i - 1)) : 0, end = (size_t)zap__r64le(f->table + 8 * i);
     size_t len = i == f->nb - 1 ? f->raw - i * f->bs : f->bs, sz = end - start;
     const uint8_t *p = f->blocks + start;

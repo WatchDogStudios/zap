@@ -231,6 +231,37 @@ static void k_lits_test(void) {
     free(lits); free(dls); free(enc); free(out); free(T);
 }
 
+/* turbo table commands carry offsets >= 16 that reach only written output: hand-built blocks with offsets 0, 1 and 15
+   must fail (they used to decode, keeping whatever dst held), 16 must decode the same whatever dst held */
+static void turbo_offset_test(void) {
+    uint8_t b[256], o1[256], o2[256];
+    for (int off = 0; off <= 16; off++) {
+        size_t n = 0, lit = 2 * 16 + 40, raw = 2 * (16 + 32) + 40;
+        zap__w32(b, 2); zap__w32(b + 4, 2); zap__w32(b + 8, 0); b[12] = 1; /* 2 tokens, 2 offset bytes, 1 table entry */
+        unsigned w = 16 | 28 << 5 | 1 << 10;                              /* 16 literals, 32-byte match, 1 offset byte */
+        b[13] = (uint8_t)w; b[14] = (uint8_t)(w >> 8);
+        n = 15; b[n++] = 0; b[n++] = 0; b[n++] = (uint8_t)off; b[n++] = (uint8_t)off;
+        for (size_t i = 0; i < lit; i++) b[n++] = (uint8_t)(i * 7 + 1);
+        memset(o1, 0x11, sizeof o1); memset(o2, 0xEE, sizeof o2);
+        ptrdiff_t r1 = zap_decompress_turbo(b, n, o1, raw), r2 = zap_decompress_turbo(b, n, o2, raw);
+        if (off < 16) assert(r1 == -1 && r2 == -1);
+        else assert(r1 == (ptrdiff_t)raw && r2 == (ptrdiff_t)raw && !memcmp(o1, o2, raw));
+    }
+}
+
+/* scratch carries no alignment promise: v3 decodes with it offset by 1..15 bytes (UBSan checks the loads) */
+static void unaligned_scratch_test(void) {
+    enum { N = 100000 };
+    uint8_t *s = malloc(N), *c = malloc(zap_bound(N) + 4096), *o = malloc(N);
+    size_t sc = zap_entropy_scratch(N);
+    uint8_t *scr = malloc(sc + 16);
+    for (size_t i = 0; i < N; i++) s[i] = (uint8_t)(i % 4099 < 2000 ? i / 3 : (i * 2654435761u) >> 24); /* far and near offsets */
+    size_t cn = zap_compress_entropy(s, N, c, zap_bound(N) + 4096, hc, 32, NULL);
+    assert(cn && zap__r32(c) >> 30 == 3);
+    for (int k = 1; k < 16; k += 7) assert(zap_decompress_entropy(c, cn, o, N, NULL, scr + k, sc) == N && !memcmp(o, s, N));
+    free(s); free(c); free(o); free(scr);
+}
+
 static void incompressible_test(void) {
     enum { N = 1 << 20 };
     uint8_t *src = malloc(N), *c = malloc(zap_bound(N) + 1024), *d = malloc(N);
@@ -329,6 +360,8 @@ static void selftest(void) {
     v1_compat_test();
     ctx_huffman_test();
     k_lits_test();
+    turbo_offset_test();
+    unaligned_scratch_test();
     incompressible_test();
     pak_test();
     printf("selftest ok\n");
