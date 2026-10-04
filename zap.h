@@ -2701,6 +2701,15 @@ static inline size_t zap__block2(const uint8_t *src, size_t len, uint8_t *dst, s
                                  : hc ? zap_compress_hc(src, len, lz, lcap, (zap_hc_state *)st, NULL, hc) : zap_compress(src, len, lz, lcap, (zap_state *)st, NULL);
         if (ln && best > 1) en = zap__t_encode(lz, ln, e, best - 1);
         if (en && en < best) { best = en; m = 3; }
+    } else if (len >= 2 && !d && hc >= ZAP_OPT_DEPTH) {
+        /* v3 parses on its own: the plain parse (~15% of the time) only runs as a fallback, or on small blocks where
+           v3's stream headers can lose to it */
+        en = zap_compress_entropy(src, len, e, len - 1, st, depth, NULL);
+        if (en) { best = en; m = 2; }
+        if (!en || len < (64u << 10)) {
+            ln = zap_compress_hc(src, len, lz, lcap, (zap_hc_state *)st, NULL, depth);
+            if (ln && ln < best) { best = ln; m = 1; }
+        }
     } else if (len >= 2) {
         ln = hc ? zap_compress_hc(src, len, lz, lcap, (zap_hc_state *)st, d, depth) : zap_compress(src, len, lz, lcap, (zap_state *)st, d);
         if (ln && ln < best) { best = ln; m = 1; }
